@@ -170,6 +170,44 @@ enum class Source : int8_t {
 
 bool is_ai(Source s) { return s == Source::AiFresh || s == Source::AiStale; }
 
+// ---- AI input bridge shader (additive, Part B) --------------------------------------------
+// Compiled inline via D3DCompile (NOT routed through native/cmake/embed_shader.cmake's
+// present.hlsl pipeline -- that file is promoted/validated code and stays untouched). Ported
+// verbatim from spikes/spike3_nv12_interop/src/interop.cpp's validated kShaderSrc: a
+// point-sampled fullscreen triangle that does an exact 1:1 texel identity copy (no filtering,
+// no colour conversion -- this is purely a format-reinterpretation blit, see the plane-SRV-
+// override technique documented in docs/spike3_nv12_interop.md).
+const char* kAiInputBlitShaderSrc = R"HLSL(
+Texture2D    tex   : register(t0);
+SamplerState samp0 : register(s0);
+
+struct VSOut
+{
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut VSMain(uint vid : SV_VertexID)
+{
+    float2 pos[3] = { float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0) };
+    float2 uv[3]  = { float2(0.0, 1.0),   float2(0.0, -1.0), float2(2.0, 1.0) };
+    VSOut o;
+    o.pos = float4(pos[vid], 0.0, 1.0);
+    o.uv = uv[vid];
+    return o;
+}
+
+float PSMain_Y(VSOut i) : SV_Target
+{
+    return tex.Sample(samp0, i.uv).r;
+}
+
+float2 PSMain_UV(VSOut i) : SV_Target
+{
+    return tex.Sample(samp0, i.uv).rg;
+}
+)HLSL";
+
 } // namespace
 
 // ---------------------------------------------------------------------------------------
@@ -216,6 +254,7 @@ public:
         create_ring_resources();
         create_landing_texture();
         register_landing_with_cuda();
+        create_ai_input_bridge();
 
         pt_tag_.assign(kRingCapacity, -1);
         ai_tag_.assign(kRingCapacity, -1);
@@ -264,6 +303,11 @@ public:
         if (present_thread_.joinable()) present_thread_.join();
 
         if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
+        // AI input bridge teardown (additive, Part B) -- mirrors cu_res_'s cleanup above,
+        // must also happen before the primary context itself is released.
+        if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
+        if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
+        if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
         if (cu_ctx_) { cuCtxSetCurrent(nullptr); cuDevicePrimaryCtxRelease(cu_dev_); cu_ctx_ = nullptr; }
 
         decoder_.close();
@@ -434,6 +478,165 @@ public:
                 static_cast<unsigned long>(removed));
             throw std::runtime_error(buf);
         }
+    }
+
+    // ---- AI input bridge (additive, Part B) -----------------------------------------------
+    //
+    // Reverse direction of push_ai_frame(): decoder-produced D3D11 NV12 (already landed in
+    // pt_ring_tex_ by decode_loop()/seek(), unmodified) -> CUDA, for Python's AI-consumer
+    // thread to pull frames by number. Productionizes the technique validated in
+    // spikes/spike3_nv12_interop (see docs/spike3_nv12_interop.md) and follows that spike's
+    // own sumu_core API recommendation: keep this bridge and the colour-convert step separate
+    // (colour-convert -- `_nv12_to_bgr_hwc_gpu`, python/sumu/ai/utils/video_utils.py -- is
+    // NOT done here), and expose a frame-number-indexed, non-blocking API rather than a bare
+    // "next decoded frame" (I5's ready-map contract).
+    //
+    // Genuine simplification vs. spike3: spike3 blitted directly off the DECODER's own
+    // hw_frames_ctx texture, which FFmpeg's d3d11va hwaccel allocates at the macroblock-
+    // padded CODED size (not the display size) -- that spike had to lazily probe the real
+    // texture size via GetDesc() before sizing its plane targets, to avoid a silent vertical-
+    // stretch bug (see spike3's "macroblock-padded decode texture" writeup). Player's own
+    // pt_ring_tex_ has ALREADY been cropped to src_width_/src_height_ (display size) by
+    // decode_loop()'s/seek()'s own CopySubresourceRegion calls (existing, unmodified code) --
+    // so sourcing this bridge's identity blit from pt_ring_tex_'s existing per-slot SRVs
+    // (pt_srv_y_/pt_srv_uv_, already created in create_ring_resources()) instead of the raw
+    // decoder texture sidesteps that whole bug class, and lets the plane targets here be
+    // created EAGERLY at open() time (create_ai_input_bridge()) rather than lazily.
+    //
+    // Never blocks present (I1/I2/I9): a cache miss (decode hasn't reached frame_num yet, or
+    // it already fell out of the ~1s ring) returns {"ready": False} immediately without ever
+    // touching d3d_mutex_. A cache hit takes d3d_mutex_ for a brief blit + CUDA map/copy/
+    // unmap, joining the SAME already-accepted contention pattern push_ai_frame's CUDA path
+    // already has with decode_loop/seek/present (see the file header: "Decode/push threads
+    // are the ones who may occasionally wait a fraction of a frame for this lock, never the
+    // reverse" -- this method is now one more member of that "occasionally waits" set).
+    //
+    // Returns a raw dict (dev_ptr as a plain uint64 CUdeviceptr, no __cuda_array_interface__/
+    // DLPack machinery in C++ -- that wrapping is done Python-side, see
+    // python/sumu/ai/utils/video_utils.py / the dlpack helper, per the same "avoid
+    // __cuda_array_interface__/DLPack entirely in the native layer" preference spike 1 and
+    // spike 3 both followed). The destination buffer (`ai_in_cu_buf_`) is a SINGLE persistent,
+    // tightly-packed NV12-stacked-layout buffer reused on every call (mirrors push_ai_frame's
+    // single persistent landing_tex_ in the reverse direction) -- callers must finish
+    // consuming/copying it (e.g. via the ported `_nv12_to_bgr_hwc_gpu`) before the next call
+    // to this method, since that call will overwrite the same memory.
+    py::dict get_cuda_nv12_by_frame(int64_t frame_num)
+    {
+        require_open();
+        UINT slot = wrap_slot(frame_num);
+
+        // Phase 1: fast, lock-minimal cache check. On a miss -- expected to be the common
+        // case whenever the AI consumer is behind decode/present (e.g. still warming up, or
+        // slower than realtime) -- return immediately WITHOUT ever touching d3d_mutex_, so a
+        // cold/lagging AI consumer never adds contention to decode/present/push_ai_frame.
+        {
+            std::lock_guard<std::mutex> lk(ready_mutex_);
+            if (pt_tag_[slot] != frame_num) {
+                py::dict miss;
+                miss["ready"] = false;
+                miss["frame_num"] = frame_num;
+                return miss;
+            }
+        }
+
+        // Phase 2: only reached after a phase-1 hit. Acquire d3d_mutex_, then re-check the
+        // tag: between phase 1 and acquiring the lock, this slot could have been overwritten
+        // (decode_loop advancing a full ring lap, or a seek()) -- both of those writers also
+        // take d3d_mutex_ before touching pt_ring_tex_, so once we hold d3d_mutex_ no
+        // concurrent writer can be modifying this slot's texture contents; the re-check only
+        // guards against having already lost that race before we got here.
+        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        {
+            std::lock_guard<std::mutex> lk(ready_mutex_);
+            if (pt_tag_[slot] != frame_num) {
+                py::dict miss;
+                miss["ready"] = false;
+                miss["frame_num"] = frame_num;
+                return miss;
+            }
+        }
+
+        try {
+            // Identity blit: pt_ring_tex_'s existing per-slot SRVs -> our persistent,
+            // CUDA-registered plane targets (see create_ai_input_bridge()).
+            D3D11_VIEWPORT vp_y{ 0.0f, 0.0f, static_cast<float>(src_width_), static_cast<float>(src_height_), 0.0f, 1.0f };
+            context_->RSSetViewports(1, &vp_y);
+            ID3D11RenderTargetView* rtv_y[] = { ai_in_y_rtv_.Get() };
+            context_->OMSetRenderTargets(1, rtv_y, nullptr);
+            context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context_->VSSetShader(ai_in_vs_.Get(), nullptr, 0);
+            context_->PSSetShader(ai_in_ps_y_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* srv_y[] = { pt_srv_y_[slot].Get() };
+            context_->PSSetShaderResources(0, 1, srv_y);
+            ID3D11SamplerState* samplers[] = { ai_in_sampler_.Get() };
+            context_->PSSetSamplers(0, 1, samplers);
+            context_->Draw(3, 0);
+
+            D3D11_VIEWPORT vp_uv{ 0.0f, 0.0f, static_cast<float>(src_width_ / 2), static_cast<float>(src_height_ / 2), 0.0f, 1.0f };
+            context_->RSSetViewports(1, &vp_uv);
+            ID3D11RenderTargetView* rtv_uv[] = { ai_in_uv_rtv_.Get() };
+            context_->OMSetRenderTargets(1, rtv_uv, nullptr);
+            context_->PSSetShader(ai_in_ps_uv_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* srv_uv[] = { pt_srv_uv_[slot].Get() };
+            context_->PSSetShaderResources(0, 1, srv_uv);
+            context_->Draw(3, 0);
+
+            context_->Flush();
+
+            // Called from whatever OS thread Python's AI-consumer thread is -- driver-API
+            // calls issued directly here do not get an implicit context attach (same reason
+            // push_ai_frame does this).
+            check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (get_cuda_nv12_by_frame)");
+
+            CUgraphicsResource res[2] = { ai_in_cu_res_y_, ai_in_cu_res_uv_ };
+            check_cu(cuGraphicsMapResources(2, res, 0), "cuGraphicsMapResources(ai_in)");
+
+            CUarray cu_arr_y = nullptr, cu_arr_uv = nullptr;
+            check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_y, ai_in_cu_res_y_, 0, 0),
+                "cuGraphicsSubResourceGetMappedArray(ai_in y)");
+            check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_uv, ai_in_cu_res_uv_, 0, 0),
+                "cuGraphicsSubResourceGetMappedArray(ai_in uv)");
+
+            // Stacked NV12 layout matching PyAV's to_ndarray('nv12') / lada's
+            // _nv12_to_bgr_hwc_gpu contract: rows [0,h) = luma, rows [h, h*3/2) = interleaved
+            // chroma, both at row-pitch ai_in_cu_buf_pitch_ (== src_width_, tightly packed).
+            CUDA_MEMCPY2D cp_y{};
+            cp_y.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            cp_y.srcArray = cu_arr_y;
+            cp_y.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            cp_y.dstDevice = ai_in_cu_buf_;
+            cp_y.dstPitch = ai_in_cu_buf_pitch_;
+            cp_y.WidthInBytes = static_cast<size_t>(src_width_); // R8_UNORM: 1 byte/texel
+            cp_y.Height = static_cast<size_t>(src_height_);
+            check_cu(cuMemcpy2D(&cp_y), "cuMemcpy2D (ai_in Y: array -> device)");
+
+            CUDA_MEMCPY2D cp_uv{};
+            cp_uv.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            cp_uv.srcArray = cu_arr_uv;
+            cp_uv.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            cp_uv.dstDevice = ai_in_cu_buf_ + static_cast<size_t>(src_height_) * ai_in_cu_buf_pitch_;
+            cp_uv.dstPitch = ai_in_cu_buf_pitch_;
+            cp_uv.WidthInBytes = static_cast<size_t>(src_width_); // R8G8_UNORM: 2 B/texel * (w/2) texels/row == w bytes
+            cp_uv.Height = static_cast<size_t>(src_height_) / 2;
+            check_cu(cuMemcpy2D(&cp_uv), "cuMemcpy2D (ai_in UV: array -> device)");
+
+            check_cu(cuGraphicsUnmapResources(2, res, 0), "cuGraphicsUnmapResources(ai_in)");
+        } catch (const std::exception& e) {
+            HRESULT removed = device_ ? device_->GetDeviceRemovedReason() : S_OK;
+            char buf[768];
+            snprintf(buf, sizeof(buf), "%s [device_removed_reason=0x%08lx]", e.what(),
+                static_cast<unsigned long>(removed));
+            throw std::runtime_error(buf);
+        }
+
+        py::dict out;
+        out["ready"] = true;
+        out["dev_ptr"] = static_cast<uint64_t>(ai_in_cu_buf_);
+        out["width"] = src_width_;
+        out["height"] = src_height_;
+        out["pitch_bytes"] = ai_in_cu_buf_pitch_;
+        out["frame_num"] = frame_num;
+        return out;
     }
 
     // ---- introspection -------------------------------------------------------------------
@@ -715,6 +918,79 @@ private:
             "cuGraphicsD3D11RegisterResource");
     }
 
+    // ---- AI input bridge setup (additive, Part B; see get_cuda_nv12_by_frame's header
+    // comment for the full design rationale) --------------------------------------------
+    void create_ai_input_bridge()
+    {
+        // Own small shader program for the identity blit, compiled inline (NOT routed
+        // through native/cmake/embed_shader.cmake's present.hlsl pipeline -- that stays
+        // exactly as promoted/validated; this is a separate, additive program).
+        ComPtr<ID3DBlob> vs_blob, ps_y_blob, ps_uv_blob, err_blob;
+        HRESULT hr = D3DCompile(kAiInputBlitShaderSrc, strlen(kAiInputBlitShaderSrc), "ai_input_blit.hlsl",
+            nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs_blob, &err_blob);
+        if (FAILED(hr)) throw std::runtime_error("AI-input VS compile failed: " +
+            std::string(err_blob ? (const char*)err_blob->GetBufferPointer() : "?"));
+        hr = D3DCompile(kAiInputBlitShaderSrc, strlen(kAiInputBlitShaderSrc), "ai_input_blit.hlsl",
+            nullptr, nullptr, "PSMain_Y", "ps_5_0", 0, 0, &ps_y_blob, &err_blob);
+        if (FAILED(hr)) throw std::runtime_error("AI-input PS(Y) compile failed: " +
+            std::string(err_blob ? (const char*)err_blob->GetBufferPointer() : "?"));
+        hr = D3DCompile(kAiInputBlitShaderSrc, strlen(kAiInputBlitShaderSrc), "ai_input_blit.hlsl",
+            nullptr, nullptr, "PSMain_UV", "ps_5_0", 0, 0, &ps_uv_blob, &err_blob);
+        if (FAILED(hr)) throw std::runtime_error("AI-input PS(UV) compile failed: " +
+            std::string(err_blob ? (const char*)err_blob->GetBufferPointer() : "?"));
+
+        check_hr(device_->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &ai_in_vs_),
+            "CreateVertexShader(ai_in)");
+        check_hr(device_->CreatePixelShader(ps_y_blob->GetBufferPointer(), ps_y_blob->GetBufferSize(), nullptr, &ai_in_ps_y_),
+            "CreatePixelShader(ai_in Y)");
+        check_hr(device_->CreatePixelShader(ps_uv_blob->GetBufferPointer(), ps_uv_blob->GetBufferSize(), nullptr, &ai_in_ps_uv_),
+            "CreatePixelShader(ai_in UV)");
+
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT; // exact 1:1 texel identity copy, no filtering
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        check_hr(device_->CreateSamplerState(&sd, &ai_in_sampler_), "CreateSamplerState(ai_in)");
+
+        // Sized to src_width_/src_height_ -- the DISPLAY size, matching pt_ring_tex_ itself.
+        // Unlike spike3 (which blitted straight off the decoder's own macroblock-padded
+        // hw_frames_ctx texture and needed a lazy real-size probe, see
+        // docs/spike3_nv12_interop.md), pt_ring_tex_ has ALREADY been cropped to display size
+        // by decode_loop()'s/seek()'s own CopySubresourceRegion (existing, unmodified code)
+        // -- so these targets can be created eagerly, right here, with no padding concern.
+        D3D11_TEXTURE2D_DESC yd{};
+        yd.Width = static_cast<UINT>(src_width_);
+        yd.Height = static_cast<UINT>(src_height_);
+        yd.MipLevels = 1;
+        yd.ArraySize = 1;
+        yd.Format = DXGI_FORMAT_R8_UNORM;
+        yd.SampleDesc.Count = 1;
+        yd.Usage = D3D11_USAGE_DEFAULT;
+        yd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        check_hr(device_->CreateTexture2D(&yd, nullptr, &ai_in_y_tex_), "CreateTexture2D(ai_in_y_tex_)");
+        check_hr(device_->CreateRenderTargetView(ai_in_y_tex_.Get(), nullptr, &ai_in_y_rtv_), "CreateRTV(ai_in_y)");
+
+        D3D11_TEXTURE2D_DESC uvd = yd;
+        uvd.Width = static_cast<UINT>(src_width_) / 2;
+        uvd.Height = static_cast<UINT>(src_height_) / 2;
+        uvd.Format = DXGI_FORMAT_R8G8_UNORM;
+        check_hr(device_->CreateTexture2D(&uvd, nullptr, &ai_in_uv_tex_), "CreateTexture2D(ai_in_uv_tex_)");
+        check_hr(device_->CreateRenderTargetView(ai_in_uv_tex_.Get(), nullptr, &ai_in_uv_rtv_), "CreateRTV(ai_in_uv)");
+
+        check_cu(cuGraphicsD3D11RegisterResource(&ai_in_cu_res_y_, ai_in_y_tex_.Get(), CU_GRAPHICS_REGISTER_FLAGS_NONE),
+            "cuGraphicsD3D11RegisterResource(ai_in_y_tex_)");
+        check_cu(cuGraphicsD3D11RegisterResource(&ai_in_cu_res_uv_, ai_in_uv_tex_.Get(), CU_GRAPHICS_REGISTER_FLAGS_NONE),
+            "cuGraphicsD3D11RegisterResource(ai_in_uv_tex_)");
+
+        // Persistent, tightly-packed CUDA destination buffer (stacked NV12 layout, see
+        // get_cuda_nv12_by_frame()). Tightly packed (pitch == src_width_) so the Python-side
+        // DLPack wrap can describe it as a contiguous tensor (NULL strides).
+        ai_in_cu_buf_pitch_ = static_cast<size_t>(src_width_);
+        ai_in_cu_buf_size_ = ai_in_cu_buf_pitch_ * static_cast<size_t>(src_height_) * 3 / 2;
+        check_cu(cuMemAlloc(&ai_in_cu_buf_, ai_in_cu_buf_size_), "cuMemAlloc(ai_in_cu_buf_)");
+    }
+
     // ---- decode thread -----------------------------------------------------------------------
 
     void decode_loop()
@@ -988,6 +1264,23 @@ private:
     CUcontext cu_ctx_ = nullptr;
     CUgraphicsResource cu_res_ = nullptr;
 
+    // ---- AI input bridge state (additive, Part B) -- see create_ai_input_bridge() and
+    // get_cuda_nv12_by_frame(). All D3D11/CUDA-interop touches of these go through
+    // d3d_mutex_, same as the rest of the shared device/context (file header).
+    ComPtr<ID3D11VertexShader> ai_in_vs_;
+    ComPtr<ID3D11PixelShader> ai_in_ps_y_;
+    ComPtr<ID3D11PixelShader> ai_in_ps_uv_;
+    ComPtr<ID3D11SamplerState> ai_in_sampler_;
+    ComPtr<ID3D11Texture2D> ai_in_y_tex_;
+    ComPtr<ID3D11RenderTargetView> ai_in_y_rtv_;
+    ComPtr<ID3D11Texture2D> ai_in_uv_tex_;
+    ComPtr<ID3D11RenderTargetView> ai_in_uv_rtv_;
+    CUgraphicsResource ai_in_cu_res_y_ = nullptr;
+    CUgraphicsResource ai_in_cu_res_uv_ = nullptr;
+    CUdeviceptr ai_in_cu_buf_ = 0;   // persistent, single-slot, tightly-packed NV12 dest buffer
+    size_t ai_in_cu_buf_pitch_ = 0;  // == src_width_ (tightly packed)
+    size_t ai_in_cu_buf_size_ = 0;
+
     std::mutex ready_mutex_;
     std::mutex push_mutex_;
     std::mutex trace_mutex_;
@@ -1044,6 +1337,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("seek", &Player::seek, py::arg("frame_num"))
         .def("push_ai_frame", &Player::push_ai_frame,
             py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"), py::arg("pitch_bytes"))
+        .def("get_cuda_nv12_by_frame", &Player::get_cuda_nv12_by_frame, py::arg("frame_num"))
         .def("current_frame", &Player::current_frame)
         .def("frame_count", &Player::frame_count)
         .def("fps", &Player::fps)
