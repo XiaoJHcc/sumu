@@ -1,0 +1,11 @@
+--- old/ultralytics/utils/nms.py	2025-06-19 00:00:00.0.0
++++ new/ultralytics/utils/nms.py	2025-06-19 00:00:00.0.0
+@@ -20,7 +20,7 @@
+     labels=(),
+     max_det: int = 300,
+     nc: int = 0,  # number of classes (optional)
+-    max_time_img: float = 0.05,
++    max_time_img: float = 0.3,
+     max_nms: int = 30000,
+     max_wh: int = 7680,
+     rotated: bool = False,

@@ -7,11 +7,24 @@ description = "Clock-driven, all-GPU realtime de-mosaic preview player"
 requires-python = ">=3.12"
 license = "AGPL-3.0"
 # 依赖分阶段实装。Phase 2 (Spike 1) 起加 torch（cu128）+ numpy；
-# Phase 4 起加 ultralytics / mmengine / torch-tensorrt / PyNvVideoCodec。
+# Phase 4 起加 AI 核心（照搬 lada 的 nvidia extra，去掉本次不需要的 PyNvVideoCodec：
+# 它只服务 lada 的 VideoReader 生产解码路径，sumu 的 AI 帧来自 native 解码头，不走 PyAV）。
 dependencies = [
     "torch==2.8.0",
     "numpy",
     "pybind11",  # native 扩展的构建期头文件/CMake config
+    # --- AI 核心 (Phase 4c) ---
+    "ultralytics==8.4.4",       # Pinned as we apply a patch (see patches/)
+    "torchvision==0.23.0",      # matched to torch 2.8.0 (cu128)
+    "mmengine==0.10.7",         # Pinned as we apply a patch (see patches/)
+    "av>=16.1.0",               # PyAV (one-shot test decode only; not the production path)
+    "opencv-python==4.12.0.88", # cv2, used by ultralytics_utils / image_utils
+    "tqdm",
+    "wcwidth",
+    # --- BasicVSR++ TensorRT 加速路径 (对齐 lada nvidia extra) ---
+    "torch-tensorrt==2.8.0",
+    "tensorrt-cu12-libs==10.12.0.36",
+    "tensorrt-cu12-bindings==10.12.0.36",
 ]
 
 # --- 国内镜像（继承 lada-realtime 已验证配置）---
@@ -26,5 +39,25 @@ name = "pytorch-cu128"
 url = "https://mirrors.nju.edu.cn/pytorch/whl/cu128"
 explicit = true
 
+[[tool.uv.index]]
+# TensorRT runtime libs/bindings (tensorrt-cu12-libs / -bindings) are published
+# only on NVIDIA's index; the Tsinghua mirror is stale (stops at tensorrt 10.2 /
+# torch-tensorrt 2.4). Pulled transitively by torch-tensorrt.
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torch-tensorrt = { index = "pytorch-cu128" }
+tensorrt-cu12-libs = { index = "nvidia" }
+tensorrt-cu12-bindings = { index = "nvidia" }
+
+[tool.uv]
+# Pin the resolution environment to the target machine (win x86_64). This stops
+# uv from solving impossible splits (e.g. torch-tensorrt's tegra variant pulling
+# numpy<2, clashing with opencv's numpy>=2) — same rationale as lada-realtime.
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]

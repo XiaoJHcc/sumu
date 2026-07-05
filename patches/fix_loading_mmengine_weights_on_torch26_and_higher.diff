@@ -1,0 +1,11 @@
+--- old/mmengine/runner/checkpoint.py	2025-06-19 00:00:00.0.0
++++ new/mmengine/runner/checkpoint.py	2025-06-19 00:00:00.0.0
+@@ -344,7 +344,7 @@
+     filename = osp.expanduser(filename)
+     if not osp.isfile(filename):
+         raise FileNotFoundError(f'{filename} can not be found.')
+-    checkpoint = torch.load(filename, map_location=map_location)
++    checkpoint = torch.load(filename, map_location=map_location, weights_only=False)
+     return checkpoint
+ 
+ 
