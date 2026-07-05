@@ -217,6 +217,14 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
             }
             return 0; // genuinely nothing left
         }
+        if (recv == AVERROR_EOF) {
+            // Decoder is fully drained (this is the steady-state EOF signal once the drain
+            // path above has already run out): genuinely nothing left, same as the drain==0
+            // case a few lines up. Must NOT fall through to the generic failure below, or
+            // next_frame() sees r<0 and stops the decode thread permanently instead of
+            // taking its existing loop-to-start path.
+            return 0;
+        }
         fprintf(stderr, "avcodec_receive_frame failed: %d\n", recv);
         return -1;
     }

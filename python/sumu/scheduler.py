@@ -272,21 +272,27 @@ class Scheduler:
 
             n = self.ai_frontier
             frame_count = self.player.frame_count()
-            if frame_count > 0 and n >= frame_count:
-                # Already produced (and, if applicable, eof-flushed) up to the last frame;
-                # nothing to do until a seek/loop moves head backwards again.
-                time.sleep(cfg.sleep_step_s)
-                continue
 
             g = self.player.get_cuda_nv12_by_frame(n)
             if not g["ready"]:
                 # Decode head hasn't reached n yet (or it was overwritten - see
                 # docs/native_ai_input.md's ring-overwrite caveat). Never block: just retry
-                # next iteration.
+                # next iteration. Note: frame numbers are monotonically increasing across
+                # content loops (I5) - there is no "n >= frame_count -> stop producing" state;
+                # the decode head keeps advancing past frame_count on every loop and n must
+                # keep following it, forever.
                 time.sleep(cfg.sleep_step_s)
                 continue
 
-            eof = bool(frame_count > 0 and n == frame_count - 1)
+            # Content-position eof: n's position *within the current loop* (n % frame_count),
+            # not n itself, marks the loop boundary. This fires once per loop (every
+            # frame_count frames) instead of only once at first-pass end, so scenes get
+            # flushed at every content discontinuity - the tail of one loop and the head of
+            # the next are not temporally continuous, so Scene/BasicVSR++ state must not
+            # bridge across it. Only the eof flag/materialize call uses the wrapped position;
+            # get_cuda_nv12_by_frame/push_ai_frame above and ai_frontier below still use the
+            # raw monotonic n, matching present/ring's own frame numbering.
+            eof = bool(frame_count > 0 and (n % frame_count) == frame_count - 1)
             self._process_frame(n, g, eof)
             self.ai_frontier = n + 1
 
