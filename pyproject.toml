@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: sumu Authors
+# SPDX-License-Identifier: AGPL-3.0
+[project]
+name = "sumu"
+version = "0.0.1-dev"
+description = "Clock-driven, all-GPU realtime de-mosaic preview player"
+requires-python = ">=3.12"
+license = "AGPL-3.0"
+# 依赖分阶段实装。Phase 2 (Spike 1) 起加 torch（cu128）+ numpy；
+# Phase 4 起加 ultralytics / mmengine / torch-tensorrt / PyNvVideoCodec。
+dependencies = [
+    "torch==2.8.0",
+    "numpy",
+    "pybind11",  # native 扩展的构建期头文件/CMake config
+]
+
+# --- 国内镜像（继承 lada-realtime 已验证配置）---
+# PyPI 默认走清华；torch cu128 走南京大学（标准 PEP503，uv 能识别 torch==2.8.0）。
+# 坑：别用阿里云 flat 布局做 torch 源（uv 匹配不出干净版本 → No solution found）。
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

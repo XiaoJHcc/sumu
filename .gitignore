@@ -1,0 +1,42 @@
+# --- test footage (huge, not versioned) ---
+test_video.mp4
+test_video_4k.mp4
+test_video_long.mp4
+*.mp4
+
+# --- downloaded build deps / tools (large, fetched not versioned) ---
+third_party/
+tools/
+
+# --- native build ---
+build/
+native/build/
+*.pyd
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# --- python ---
+.venv/
+__pycache__/
+*.egg-info/
+.python-version
+
+# --- CUDA/TRT engine caches (arch-bound, never distributed) ---
+*_sub_engines/
+*.engine
+model_weights/*.pt
+model_weights/*.pth
+
+# --- traces / measurement output ---
+trace/
+*_trace/
+presentmon_*.csv
+*.etl
+
+# --- editor / OS ---
+.vscode/
+.idea/
+.DS_Store
