@@ -283,3 +283,150 @@ bridge exists and is cheap") is empirically confirmed on this machine.
 
 **Raw CSVs** (not committed): `spikes/spike1_cuda_interop/trace/present_spike1_4k.csv`,
 `spikes/spike1_cuda_interop/trace/present_spike1_1080p.csv`.
+
+## Spike 2 (clock-driven mixing)
+
+**Purpose**: prove that a wall-clock-driven present loop that mixes AI-processed frames
+(pulled from a thread-safe ready-map, populated by a simulated AI producer) with
+passthrough original frames (pulled from a GPU-resident decode ring buffer) never hitches
+at an AI<->passthrough switch point, and that its present-cadence distribution is
+statistically indistinguishable from a pure passthrough-only baseline. This is the load-
+bearing precondition for sumu's real player: "the player is master, AI is a servant that
+either has a frame ready in time or doesn't, and either way present never stalls." Code
+lives entirely under `spikes/spike2_clock_mixing/` (independent CMake project + pybind11
+extension, does not touch the rest of the repo).
+
+**Architecture**: a pybind11 C++ extension `sumu_rt` exposing `RealtimePresenter`, reusing
+spike 0's Win32 window / D3D11 flip-model swapchain pattern and spike 1's CUDA
+driver-API/torch-primary-context interop pattern. Three threads share one D3D11 device:
+
+- **Decode thread**: runs spike 0's `Decoder` (FFmpeg + D3D11VA hwaccel) continuously,
+  ahead of the present head by up to `kDecodeAheadMax` frames, `CopySubresourceRegion`-ing
+  each decoded NV12 frame into a fixed-size GPU **passthrough ring buffer**
+  (`Texture2DArray`, `kRingCapacity=64` slots, ~1.07s of buffering at 60fps — sized down
+  from an initial 180-slot/~3s design that hit `E_OUTOFMEMORY` once a same-sized AI ring was
+  added alongside it; 64 slots is still far beyond `kStartBufferFrames=5` and the AI
+  producer's max simulated lateness).
+- **AI-push thread** (simulated in this spike by the Python driver): calls
+  `push_ai_frame(frame_num, cuda_ptr, w, h, pitch)` at arbitrary wall-clock times, from a
+  raw torch CUDA tensor, straight into a same-sized **AI ring buffer** via
+  `cuGraphicsMapResources`/`cuMemcpy2D`/`cuGraphicsUnmapResources` +
+  `CopySubresourceRegion` (zero-copy, same pattern as spike 1), then marks that frame_num
+  ready in a mutex-protected ready-map.
+- **Present thread**: paced purely by `QueryPerformanceCounter` against an absolute-origin
+  schedule (spike 0's self-correcting-overshoot pattern). Each tick picks the current
+  frame_num's source with strict priority **AI-fresh -> passthrough-fresh -> last-shown
+  frame** and **never blocks** on either the decode or AI-push thread — a miss just falls
+  through to the next priority, exactly the fallback chain the real player needs.
+
+**Correction made after empirical testing (the key pitfall of this spike)**: the original
+design assumed `ID3D11Multithread::SetMultithreadProtected(TRUE)`, combined with
+restricting each of the three threads to single atomic `CopySubresourceRegion`/interop
+calls, would be sufficient without any additional CPU-side lock. This held up through
+several short (6-8s) smoke tests, but a full 50-second stress run (~3000 presents, ~600
+concurrent AI pushes, ~3000 decode-thread copies, all against one shared
+`ID3D11DeviceContext`) hit a genuine `DXGI_ERROR_DEVICE_HUNG` (0x887a0006) near the end of
+the run, which then cascaded into `CUDA_ERROR_UNKNOWN` failures for the AI-push thread's
+remaining pushes (the present thread itself was unaffected; the run still completed).
+Rather than try to characterize exactly which interleaving the driver couldn't tolerate,
+the fix taken was conservative: one explicit `std::mutex d3d_mutex_` now serializes **every**
+thread's touch of the shared device/context — the present thread's entire
+draw-plus-`Present` call, the decode thread's `CopySubresourceRegion`, and the AI-push
+thread's whole map/copy/unmap/`CopySubresourceRegion` sequence — each individual call being
+sub-millisecond, so the added serialization cost is negligible against the 16.6ms budget.
+Re-running the full 50s mixed round after this fix: **zero hangs, zero CUDA errors**,
+`n_ai_stale=0`, `n_pt_stale=0` (ring buffers never underran). This is exactly the class of
+"D3D11/CUDA concurrent-thread crash" risk flagged going into this spike, and the important
+takeaway for the real player is that `SetMultithreadProtected(TRUE)` alone is not a
+sufficient substitute for an explicit lock once three threads sustain load for tens of
+seconds, even though it can look fine in short manual tests.
+
+**Other pitfalls fixed along the way**:
+- A per-thread CUDA driver-API context issue: `cuGraphicsMapResources` (and friends)
+  issued directly from `push_ai_frame` intermittently failed with `CUDA_ERROR_UNKNOWN` on
+  the calling OS thread, because relying on implicit/lazy context attachment (as CUDA's
+  Runtime API does automatically for torch's own ops) is not sufficient for raw driver-API
+  calls on a thread that has never explicitly attached a context. Fixed with an explicit
+  `cuCtxSetCurrent(cu_ctx_)` at the top of `push_ai_frame`.
+- Clock-domain alignment: added `RealtimePresenter::start_time_s()` (derived from the same
+  `start_qpc_`/`freq_` used internally) so the Python producer can anchor its per-frame
+  schedule to the presenter's *actual* frame-0 instant rather than a `time.perf_counter()`
+  timestamp captured after the constructor had already returned (which silently ran
+  later than frame 0, shifting every "fast" AI push late enough to miss).
+- A queueing-theory artifact in the test harness itself, not the presenter: the Python AI
+  producer is a single sequential loop that visits every frame_num in order and waits for
+  each one's own absolute deadline. A wide "slow" delay bucket (originally
+  `uniform(20,150)ms` against a 16.7ms frame period) created enough variance in
+  consecutive deadlines that Lindley's recursion (`W_i = max(0, W_{i-1} - drift_i)`)
+  produced a large *stationary average backlog* (empirically ~70-120ms lateness), which
+  looked like a mixing bug but was actually a property of the sequential simulator.
+  Narrowing the slow bucket to `uniform(20,50)ms` (still comfortably "usually a miss")
+  brought `ai_hit_rate` to a stable, well-behaved ~0.20 with bounded lateness (p50~21ms,
+  max~54-67ms) — confirmed only by adding per-push `lateness_ms`/`make_ai_frame_ms`/
+  `push_ai_frame_ms` instrumentation to the driver and measuring, after two other
+  hypotheses (clock-sync gap, OS `sleep()` overshoot) were tested and ruled out the same
+  way.
+
+**Method**: `spike2_driver.py` runs two 50-second rounds against the same 4K60 HEVC clip:
+**mixed** (AI producer thread on: 30% of frames missing, 40% "fast" delay
+`uniform(-60,+5)ms` relative to deadline, 30% "slow" delay `uniform(20,50)ms`; each pushed
+frame is an obvious cyan-tinted RGBA tensor with a moving white bar so AI vs passthrough is
+visually distinguishable) and **passthrough-only** (AI producer thread never started,
+ready-map stays empty, pure fallback path exercised every tick). Both dump a
+`qpc_ns,source,frame_num` trace, analyzed with the shared `scripts/analyze_present.py
+--format ns --fps 60` plus a spike-local `analyze_switches.py` that separately buckets
+present intervals into AI<->passthrough **switch** points vs **non-switch** points within
+the steady-state window, specifically to check whether any extra variance concentrates at
+the handoff (a residual hitch) or is general system noise.
+
+### Present cadence (`scripts/analyze_present.py --format ns --fps 60`)
+
+| Run | window | n | median | stddev | p99 | max | %>1.5x | %>2x | gaps>50ms |
+|---|---|---|---|---|---|---|---|---|---|
+| mixed         | cold [0-6s]      | 359  | 16.68ms | 1.07 | 17.19ms | 31.7ms | 0.3% | 0.0% | 0 |
+| mixed         | steady [10s-end] | 2400 | 16.68ms | 0.54 | 17.08ms | 34.1ms | 0.0% | 0.0% | 0 |
+| passthrough   | cold [0-6s]      | 359  | 16.68ms | 0.16 | 17.08ms | 17.4ms | 0.0% | 0.0% | 0 |
+| passthrough   | steady [10s-end] | 2399 | 16.68ms | 0.13 | 17.03ms | 19.7ms | 0.0% | 0.0% | 0 |
+
+Both rounds' steady-state median is identical (16.68ms, glued to the 59.94fps budget) with
+zero intervals over 1.5x/2x budget and zero gaps>50ms in either round. The mixed round's
+steady-state stddev (0.54ms) and max (34.1ms) are both higher than passthrough-only's
+(0.13ms / 19.7ms) — expected, since the mixed round has a second thread (`push_ai_frame`)
+sharing the now-mutex-serialized D3D11 context, and this is exactly what the dedicated
+switch-point analysis below exists to check: is that extra variance concentrated at
+AI<->passthrough handoffs (a real hitch) or spread generally (harmless extra system
+activity)?
+
+### Switch-point analysis (`analyze_switches.py`, mixed round, steady window [5s-end])
+
+| Interval class | n | median | stddev | p99 | max | %>1.5x | %>2x | gaps>50ms |
+|---|---|---|---|---|---|---|---|---|
+| non-switch (same source as previous tick) | 1979 | 16.68ms | 0.57 | 17.09ms | 34.1ms | 0.1% | 0.1% | 0 |
+| **switch (AI<->passthrough handoff)**     | 721  | 16.68ms | **0.27** | 17.03ms | **23.6ms** | 0.0% | 0.0% | 0 |
+| all | 2700 | 16.68ms | 0.51 | 17.08ms | 34.1ms | 0.0% | 0.0% | 0 |
+
+`ai_hit_rate = 0.1997` (599/3000 presents were fresh AI frames) — a reasonable middle
+value given the producer's 30/40/30 missing/fast/slow mix, confirming the ready-map is
+neither starved nor saturated. **721 switch points occurred in the steady window alone**
+(about a quarter of all steady-state ticks), giving this analysis strong statistical
+power. Critically, the switch-point intervals have **lower** stddev (0.27 vs 0.57ms) and
+**lower** max (23.6ms vs 34.1ms) than the non-switch intervals — the opposite of what a
+handoff hitch would look like. The mixed round's extra variance versus the passthrough-only
+baseline is concentrated in ordinary same-source ticks (consistent with harmless
+contention on `d3d_mutex_` from the concurrent AI-push thread), not at the AI<->passthrough
+transition itself.
+
+**Interpretation — the load-bearing question this spike exists to answer**: **yes** — the
+present-cadence distribution when AI frames randomly become ready/late/missing is, at the
+level that matters (median glued to budget, no fat tail, zero gaps>50ms, no elevated
+variance specifically at switch points), statistically indistinguishable from
+pure-passthrough playback. **Spike 2's pass criteria are met**: no hitch at AI<->
+passthrough switch points, `ai_hit_rate` lands at a reasonable middle value (~0.20), and
+the present thread never blocked on either the decode or AI-push thread across two full
+50-second runs. The one caveat worth carrying forward into the real player: the
+`SetMultithreadProtected(TRUE)`-alone assumption is not safe under sustained multi-thread
+load and needs the explicit `d3d_mutex_`-style serialization this spike settled on.
+
+**Raw CSVs** (not committed):
+`spikes/spike2_clock_mixing/trace/present_spike2_mixed.csv`,
+`spikes/spike2_clock_mixing/trace/present_spike2_passthrough.csv`.

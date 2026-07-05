@@ -43,3 +43,6 @@ presentmon_*.csv
 
 # --- build/run logs ---
 *.log
+
+# --- copied runtime DLLs (fetched deps) ---
+*.dll
