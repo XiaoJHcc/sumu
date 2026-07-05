@@ -40,3 +40,6 @@ presentmon_*.csv
 .vscode/
 .idea/
 .DS_Store
+
+# --- build/run logs ---
+*.log
