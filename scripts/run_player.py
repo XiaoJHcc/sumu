@@ -180,6 +180,42 @@ def main():
     )
     scheduler.start()
 
+    def apply_ui_intents(intents):
+        """Execute one drained player.take_ui_intents() dict (native/src/player.cpp's
+        Player::take_ui_intents()). Python's main thread is the SOLE executor of transport/
+        config changes -- native's present thread only ever renders already-published UI
+        snapshots, never touches seek/play/pause/scheduler (see player.cpp's file header, I2).
+        Rebinds the enclosing scheduler/config on a clip_length/max_regions change: there is
+        no in-place resize on SchedulerConfig, so a config change means stop the old scheduler,
+        mutate config, and construct a brand new Scheduler (same construction call as above).
+        """
+        nonlocal scheduler, config
+
+        if intents["toggle_play"]:
+            if player.is_playing():
+                player.pause()
+            else:
+                player.play()
+
+        seek = intents["seek"]
+        if seek is not None:
+            scheduler.notify_seek(seek)
+            player.seek(seek)
+
+        clip_length = intents["clip_length"]
+        max_regions = intents["max_regions"]
+        if clip_length is not None or max_regions is not None:
+            scheduler.stop()
+            if clip_length is not None:
+                config.clip_length = clip_length
+            if max_regions is not None:
+                config.max_regions_per_frame = max_regions
+            scheduler = Scheduler(
+                player, det_model, res_model, pad_mode, video_meta, config,
+                capture_correctness_samples=args.capture_samples if args.correctness else 0,
+            )
+            scheduler.start()
+
     t0 = time.perf_counter()
     player.play()
 
@@ -187,7 +223,9 @@ def main():
     quit_early = False
     while time.perf_counter() - t0 < args.seconds:
         player.pump_messages()
-        player.ui_tick()  # M2-VERIFY: temporary, M3 will properly wire ui_tick with set_ui_config/take_ui_intents
+        player.set_ui_config(config.clip_length, config.max_regions_per_frame)
+        player.ui_tick()
+        apply_ui_intents(player.take_ui_intents())
         if player.should_quit():
             quit_early = True
             break
@@ -195,6 +233,12 @@ def main():
         if now - last_print >= args.print_interval:
             print_status("main", player, scheduler, t0)
             last_print = now
+        # 50Hz main loop. NOT 0.008 (125Hz): measured (M3 cadence forensics, docs/native_core.md)
+        # a 125Hz loop starves the present thread of CPU/scheduling under timeBeginPeriod(1),
+        # producing a periodic ~30ms present hitch (steady stddev 0.23->4.39, one 177ms tick) in
+        # pure passthrough -- i.e. it breaks the crown present-cadence invariant. 20ms input
+        # latency is imperceptible for transport/seek/keyboard, so 0.02 stays. See also smoke_player
+        # (no ui_tick) staying pristine on the same busy desktop, which localized the cause here.
         time.sleep(0.02)
     player.pump_messages()
     print_status("main-end", player, scheduler, t0)
@@ -216,7 +260,9 @@ def main():
         recovered_hit_rate = None
         while time.perf_counter() - t_seek_obs0 < args.seek_observe_seconds:
             player.pump_messages()
-            player.ui_tick()  # M2-VERIFY: temporary, M3 will properly wire ui_tick with set_ui_config/take_ui_intents
+            player.set_ui_config(config.clip_length, config.max_regions_per_frame)
+            player.ui_tick()
+            apply_ui_intents(player.take_ui_intents())
             if player.should_quit():
                 quit_early = True
                 break
@@ -224,7 +270,13 @@ def main():
             if now - last_print >= args.print_interval or now < 0.001:
                 print_status("seek-recovery", player, scheduler, t_seek_obs0)
                 last_print = now
-            time.sleep(0.02)
+            # 50Hz main loop. NOT 0.008 (125Hz): measured (M3 cadence forensics, docs/native_core.md)
+        # a 125Hz loop starves the present thread of CPU/scheduling under timeBeginPeriod(1),
+        # producing a periodic ~30ms present hitch (steady stddev 0.23->4.39, one 177ms tick) in
+        # pure passthrough -- i.e. it breaks the crown present-cadence invariant. 20ms input
+        # latency is imperceptible for transport/seek/keyboard, so 0.02 stays. See also smoke_player
+        # (no ui_tick) staying pristine on the same busy desktop, which localized the cause here.
+        time.sleep(0.02)
         player.pump_messages()
         st_after = player.stats()
         seek_result = {

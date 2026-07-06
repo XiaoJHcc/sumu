@@ -56,6 +56,11 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
+// imgui_impl_win32.h wraps this declaration in `#if 0` (to avoid dragging a <windows.h>
+// dependency into that header) and its own comment directs callers to copy the line into
+// their .cpp -- windows.h is already included above, so this is safe here.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -68,6 +73,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -109,30 +115,14 @@ void check_cu(CUresult res, const char* what)
 // ---- global Win32 state (one window per process, fine for this player) --------------------
 bool g_quit = false;
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-    case WM_DESTROY:
-        g_quit = true;
-        PostQuitMessage(0);
-        return 0;
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
-            g_quit = true;
-            PostQuitMessage(0);
-        }
-        return 0;
-    case WM_SYSKEYDOWN:
-        if (wp == VK_RETURN) return 0; // swallow Alt+Enter, no exclusive fullscreen here
-        break;
-    default:
-        break;
-    }
-    return DefWindowProc(hwnd, msg, wp, lp);
-}
+// M3: WndProc's DEFINITION now lives in a reopened instance of this same anonymous namespace,
+// placed after class Player's closing brace -- it needs a COMPLETE Player type to route input
+// to a specific instance (GWLP_USERDATA -> Player*, see create_window()) and to call its
+// record_toggle_play()/record_seek()/ui_ready() methods. This forward declaration is all
+// create_window()'s WNDCLASSEXA::lpfnWndProc assignment needs. Unnamed namespaces reopened
+// later in the same translation unit are the SAME namespace, so g_quit above stays visible
+// there unqualified, and this declaration and that definition refer to the same entity.
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 double pctile(std::vector<double>& sorted_ms, double q)
 {
@@ -174,6 +164,56 @@ enum class Source : int8_t {
 };
 
 bool is_ai(Source s) { return s == Source::AiFresh || s == Source::AiStale; }
+
+// ---- seekbar x<->frame mapping (M3) -------------------------------------------------------
+// Pure, no ImGui/Player/D3D dependency -- unit-testable in isolation. Placed here (in the
+// anonymous namespace, above class Player) is sufficient for Player's own member functions to
+// call them: C++ defers compiling member-function BODIES until after the class's closing
+// brace has been seen ("complete-class context"), so any free function visible earlier in the
+// translation unit -- including here -- is visible to every Player method body, regardless of
+// where in the class the method itself is declared.
+//
+// Boundary behavior: frame_count<=0 (not-yet-opened/empty video) always maps to/from frame 0.
+// x is clamped to [x0,x1] before mapping, so a drag past either edge clamps to frame 0 /
+// frame_count-1, never out of bounds. float->frame uses round (llround), not truncation, so a
+// pixel exactly between two frame boundaries maps to the CLOSER frame rather than always the
+// earlier one.
+int64_t frame_for_seekbar_x(float mx, float x0, float x1, int64_t frame_count)
+{
+    if (frame_count <= 0) return 0;
+    if (x1 <= x0) return 0;
+    float t = (mx - x0) / (x1 - x0);
+    t = std::clamp(t, 0.0f, 1.0f);
+    int64_t last = frame_count - 1;
+    int64_t f = static_cast<int64_t>(std::llround(static_cast<double>(t) * static_cast<double>(last)));
+    return std::clamp<int64_t>(f, 0, last);
+}
+
+float seekbar_x_for_frame(int64_t frame, float x0, float x1, int64_t frame_count)
+{
+    if (frame_count <= 1) return x0; // avoids a div-by-zero on `last` below when there's <=1 frame
+    int64_t last = frame_count - 1;
+    frame = std::clamp<int64_t>(frame, 0, last);
+    float t = static_cast<float>(frame) / static_cast<float>(last);
+    return x0 + t * (x1 - x0);
+}
+
+std::string basename_of(const std::string& path)
+{
+    size_t pos = path.find_last_of("/\\");
+    return (pos == std::string::npos) ? path : path.substr(pos + 1);
+}
+
+std::string format_mmss(double seconds)
+{
+    if (seconds < 0.0) seconds = 0.0;
+    int64_t total = static_cast<int64_t>(seconds + 0.5);
+    int64_t m = total / 60;
+    int64_t s = total % 60;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld:%02lld", static_cast<long long>(m), static_cast<long long>(s));
+    return std::string(buf);
+}
 
 // ---- AI input bridge shader (additive, Part B) --------------------------------------------
 // Compiled inline via D3DCompile (NOT routed through native/cmake/embed_shader.cmake's
@@ -241,6 +281,20 @@ struct UiDrawSnapshot {
     }
 };
 
+// ---- UI intent channel (M3) -----------------------------------------------------------
+// Main-thread-exclusive state recording what the UI wants to happen next, drained once per
+// Python main-loop tick by Player::take_ui_intents(). Deliberately NOT mutex-guarded: WndProc
+// (reached via pump_messages()) and ui_tick()/build_*() all run on the SAME Python-owned main
+// thread, and so does take_ui_intents() -- the present thread never reads this struct. Adding
+// a lock here would be the wrong signal (that this got used across threads), see DESIGN.md I2
+// (present never touches transport/config).
+struct UiIntents {
+    std::optional<int64_t> seek;
+    bool toggle_play = false;
+    std::optional<int> clip_length;
+    std::optional<int> max_regions;
+};
+
 // ---------------------------------------------------------------------------------------
 class Player
 {
@@ -273,6 +327,8 @@ public:
     void open(const std::string& video_path)
     {
         if (opened_) throw std::runtime_error("Player.open() called twice on the same Player");
+
+        video_path_ = video_path; // UI displays basename_of(video_path_) in the top bar
 
         std::string decode_err;
         if (!decoder_.open(video_path, device_.Get(), decode_err))
@@ -403,7 +459,7 @@ public:
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        ImGui::ShowDemoWindow(); // M2: still the demo window -- product UI is M3.
+        build_ui(); // M3: real product UI (top bar / bottom bar / settings panel).
         ImGui::Render();
 
         ImDrawData* dd = ImGui::GetDrawData();
@@ -419,6 +475,43 @@ public:
 
         std::lock_guard<std::mutex> lk(ui_mutex_);
         ui_pending_ = std::move(snap); // O(1) pointer move, only moment ui_mutex_ is held here
+    }
+
+    // ---- UI intent recording (M3): main-thread-only. Called from WndProc (keyboard, via
+    // pump_messages()) and from build_top_bar()/build_bottom_bar() (mouse, via ui_tick()) --
+    // both run on the SAME Python-owned main thread. NEVER called from the present thread. No
+    // lock: see UiIntents' own header comment. A second record_seek() before Python drains
+    // simply overwrites the pending target (last-write-wins, which is what continuous seekbar
+    // dragging wants).
+    void record_toggle_play() { ui_intents_.toggle_play = true; }
+    void record_seek(int64_t f) { ui_intents_.seek = f; }
+
+    const std::string& path() const { return video_path_; }
+    bool ui_ready() const { return ui_ready_; }
+
+    // ---- UI config/intents channel (M3): main-thread-exclusive, Python-driven ---------------
+    //
+    // Python's main-thread loop calls these once per its own tick, bracketing ui_tick():
+    // set_ui_config() (refresh the settings panel's read-only mirror of the ACTUAL committed
+    // config -- Python owns the real SchedulerConfig, this is display-only) -> ui_tick()
+    // (pump input via WndProc/pump_messages(), build UI, record intents) -> take_ui_intents()
+    // (drain + execute). All three run on Python's single main thread, never the present
+    // thread, so ui_intents_/ui_cfg_* need no lock.
+    void set_ui_config(int clip_length, int max_regions)
+    {
+        ui_cfg_clip_length_ = clip_length;
+        ui_cfg_max_regions_ = max_regions;
+    }
+
+    py::dict take_ui_intents()
+    {
+        py::dict d;
+        d["seek"] = ui_intents_.seek.has_value() ? py::cast(*ui_intents_.seek) : py::none();
+        d["toggle_play"] = ui_intents_.toggle_play;
+        d["clip_length"] = ui_intents_.clip_length.has_value() ? py::cast(*ui_intents_.clip_length) : py::none();
+        d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
+        ui_intents_ = UiIntents{}; // drain
+        return d;
     }
 
     // I6: seek = reposition, never teardown. Never touches decode_thread_/present_thread_/
@@ -796,6 +889,10 @@ private:
             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
             rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hinst, nullptr);
         if (!hwnd_) throw std::runtime_error("CreateWindowEx failed");
+        // Route WndProc (a free function, required by WNDCLASSEXA::lpfnWndProc) back to this
+        // specific Player instance -- see the reopened-namespace WndProc definition after
+        // class Player's closing brace.
+        SetWindowLongPtrA(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
         ShowWindow(hwnd_, maximized ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(hwnd_);
 
@@ -967,6 +1064,229 @@ private:
         dd.CmdLists.swap(ui_active_->cmd_lists); // O(1) borrow, no per-frame allocation
         ImGui_ImplDX11_RenderDrawData(&dd);
         dd.CmdLists.swap(ui_active_->cmd_lists); // give ownership back to the snapshot
+    }
+
+    // ---- product UI (M3) -- built on the main thread inside ui_tick(), between NewFrame()
+    // and Render(). Only RECORDS intents (record_toggle_play()/record_seek()/ui_intents_.* on
+    // Apply) -- never calls play()/pause()/seek()/anything that touches transport or scheduler
+    // config directly. Python's main thread is the sole executor (see take_ui_intents() and
+    // scripts/run_player.py).
+    void build_ui()
+    {
+        float top_bar_h = 0.0f;
+        build_top_bar(top_bar_h);
+        if (ui_settings_open_) build_settings_panel(top_bar_h);
+        build_bottom_bar();
+    }
+
+    void build_top_bar(float& out_height)
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        const float bar_h = 32.0f;
+        out_height = bar_h;
+
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, bar_h));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGui::Begin("##sumu_top_bar", nullptr, flags);
+
+        if (ImGui::Button(ui_settings_open_ ? "[x] Settings" : "[ ] Settings")) {
+            ui_settings_open_ = !ui_settings_open_;
+            if (ui_settings_open_) settings_edit_init_ = false; // resync edit buffers to latest cfg on open
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(basename_of(video_path_).c_str());
+        ImGui::SameLine();
+
+        // Blank draggable region (native-titlebar-like drag), sized to leave room for the
+        // four right-side buttons so it doesn't eat their clicks.
+        const float btn_w = 28.0f;
+        const int n_btns = 4; // minimize, maximize/restore, fullscreen, close
+        float drag_w = ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * n_btns;
+        if (drag_w < 0.0f) drag_w = 0.0f;
+        ImGui::InvisibleButton("##drag_region", ImVec2(drag_w, bar_h - 4.0f));
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            ReleaseCapture();
+            SendMessageA(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        ImGui::SameLine();
+
+        if (ImGui::Button("_", ImVec2(btn_w, 0))) {
+            ShowWindow(hwnd_, SW_MINIMIZE);
+        }
+        ImGui::SameLine();
+        bool zoomed = IsZoomed(hwnd_) != 0;
+        if (ImGui::Button(zoomed ? "[]" : "[ ]", ImVec2(btn_w, 0))) {
+            ShowWindow(hwnd_, zoomed ? SW_RESTORE : SW_MAXIMIZE);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("[F]", ImVec2(btn_w, 0))) {
+            toggle_fullscreen();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("X", ImVec2(btn_w, 0))) {
+            PostMessageA(hwnd_, WM_CLOSE, 0, 0);
+        }
+
+        ImGui::End();
+    }
+
+    // Auto-hides when the mouse leaves the bottom ~15% of the client area (simple mouse-Y-zone
+    // check, per the task brief). Self-drawn progress bar (InvisibleButton + ImDrawList, not
+    // SliderInt): click/drag -> frame_for_seekbar_x() -> record_seek(); playhead position ->
+    // seekbar_x_for_frame(current_frame()).
+    void build_bottom_bar()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        const float bar_h = 56.0f;
+        const float show_zone_y = io.DisplaySize.y * 0.85f;
+        bool mouse_in_zone = io.MousePos.y >= show_zone_y && io.MousePos.y <= io.DisplaySize.y &&
+            io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
+        if (!mouse_in_zone) return; // auto-hide
+
+        ImGui::SetNextWindowPos(ImVec2(0, io.DisplaySize.y - bar_h));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, bar_h));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGui::Begin("##sumu_bottom_bar", nullptr, flags);
+
+        if (ImGui::Button(is_playing() ? "Pause" : "Play", ImVec2(56.0f, 0))) {
+            record_toggle_play();
+        }
+        ImGui::SameLine();
+
+        int64_t fc = frame_count();
+        double fpsv = fps() > 0.0 ? fps() : 1.0;
+        ImGui::TextUnformatted(format_mmss(static_cast<double>(current_frame()) / fpsv).c_str());
+        ImGui::SameLine();
+
+        // Reserve space for the trailing total-duration label so the track sizes itself first.
+        std::string total_str = format_mmss(static_cast<double>(std::max<int64_t>(fc - 1, 0)) / fpsv);
+        float total_w = ImGui::CalcTextSize(total_str.c_str()).x;
+        float track_w = ImGui::GetContentRegionAvail().x - total_w - ImGui::GetStyle().ItemSpacing.x;
+        if (track_w < 10.0f) track_w = 10.0f;
+        const float track_h = 18.0f;
+
+        ImVec2 track_pos = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##seekbar", ImVec2(track_w, track_h));
+        bool track_active = ImGui::IsItemActive();
+        bool track_hovered = ImGui::IsItemHovered();
+        float x0 = track_pos.x;
+        float x1 = track_pos.x + track_w;
+        float bar_y = track_pos.y + track_h * 0.5f;
+
+        if (track_active) { // covers both the initial click and continued dragging
+            int64_t target = frame_for_seekbar_x(ImGui::GetIO().MousePos.x, x0, x1, fc);
+            record_seek(target);
+        }
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(ImVec2(x0, bar_y - 2.0f), ImVec2(x1, bar_y + 2.0f), IM_COL32(90, 90, 90, 255));
+        float played_x = seekbar_x_for_frame(current_frame(), x0, x1, fc);
+        dl->AddRectFilled(ImVec2(x0, bar_y - 2.0f), ImVec2(played_x, bar_y + 2.0f), IM_COL32(200, 200, 60, 255));
+        dl->AddCircleFilled(ImVec2(played_x, bar_y), 5.0f, IM_COL32(230, 230, 230, 255));
+
+        if (track_hovered || track_active) {
+            float hx = std::clamp(ImGui::GetIO().MousePos.x, x0, x1);
+            dl->AddLine(ImVec2(hx, track_pos.y - 4.0f), ImVec2(hx, track_pos.y + track_h + 4.0f),
+                IM_COL32(255, 255, 255, 160));
+
+            ID3D11ShaderResourceView* thumb = get_thumbnail(frame_for_seekbar_x(hx, x0, x1, fc));
+            if (thumb) { // M3: get_thumbnail() always returns nullptr -- this branch is dead
+                         // until M4 implements it, kept so the hook's call site is real code.
+                ImVec2 tsize(160.0f, 90.0f);
+                ImVec2 tmin(std::clamp(hx - tsize.x * 0.5f, x0, x1 - tsize.x), track_pos.y - 12.0f - tsize.y);
+                dl->AddImage(thumb, tmin, ImVec2(tmin.x + tsize.x, tmin.y + tsize.y));
+            }
+        }
+
+        ImGui::SameLine();
+        ImGui::TextUnformatted(total_str.c_str());
+
+        ImGui::End();
+    }
+
+    void build_settings_panel(float top_bar_h)
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        const float panel_w = 260.0f;
+        ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
+        ImGui::SetNextWindowSize(ImVec2(panel_w, io.DisplaySize.y - top_bar_h));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse;
+        ImGui::Begin("##sumu_settings", nullptr, flags);
+
+        // Staged locally in settings_edit_*_, seeded from the Python-refreshed ui_cfg_*
+        // mirror only once per open (not every frame -- that would clobber an in-progress
+        // edit with Python's per-tick refresh of the ACTUAL committed config).
+        if (!settings_edit_init_) {
+            settings_edit_clip_length_ = ui_cfg_clip_length_;
+            settings_edit_max_regions_ = ui_cfg_max_regions_;
+            settings_edit_init_ = true;
+        }
+
+        ImGui::TextUnformatted("Settings");
+        ImGui::Separator();
+        ImGui::SliderInt("Clip length", &settings_edit_clip_length_, 1, 180);
+        ImGui::SliderInt("Max regions/frame", &settings_edit_max_regions_, 1, 8);
+        if (ImGui::Button("Apply")) {
+            // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
+            // scheduler when it sees a non-null clip_length/max_regions, never on every slider
+            // tick.
+            ui_intents_.clip_length = settings_edit_clip_length_;
+            ui_intents_.max_regions = settings_edit_max_regions_;
+        }
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Diagnostics");
+        ImGui::Text("AI hit rate: %.3f", ai_hit_rate());
+        // backlog_resyncs / clips_restored / frames_pushed are Python Scheduler.get_stats()
+        // fields (python/sumu/scheduler.py) with no native equivalent in Player::stats() and no
+        // channel carrying them into native -- intentionally not displayed here rather than
+        // fabricated (flagged in this milestone's report as a plan-vs-code gap).
+
+        ImGui::End();
+    }
+
+    // Borderless fill-monitor fullscreen toggle -- explicitly NOT exclusive fullscreen (no mode
+    // change, no Alt+Enter path; WM_SYSKEYDOWN already swallows Alt+Enter, see WndProc).
+    void toggle_fullscreen()
+    {
+        if (!fullscreen_) {
+            GetWindowRect(hwnd_, &windowed_rect_);
+            windowed_style_ = GetWindowLongA(hwnd_, GWL_STYLE);
+
+            HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{ sizeof(mi) };
+            GetMonitorInfo(mon, &mi);
+
+            SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_ & ~(WS_CAPTION | WS_THICKFRAME |
+                WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU));
+            SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+            fullscreen_ = true;
+        } else {
+            SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_);
+            SetWindowPos(hwnd_, nullptr, windowed_rect_.left, windowed_rect_.top,
+                windowed_rect_.right - windowed_rect_.left, windowed_rect_.bottom - windowed_rect_.top,
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER);
+            fullscreen_ = false;
+        }
+    }
+
+    // M4 hook (not implemented here): scrub thumbnail SRV for a given content frame number, or
+    // nullptr if unavailable. M3 always returns nullptr -- a real implementation needs its own
+    // scrub-decode path INSIDE this Player (never a second Player instance: native's g_quit is
+    // a process-global shared across instances, see the file header -- a second instance would
+    // cause accidental quits).
+    ID3D11ShaderResourceView* get_thumbnail(int64_t frame_num)
+    {
+        (void)frame_num;
+        return nullptr;
     }
 
     void create_ring_resources()
@@ -1404,6 +1724,19 @@ private:
     std::unique_ptr<UiDrawSnapshot> ui_pending_;
     std::unique_ptr<UiDrawSnapshot> ui_active_;
 
+    // ---- UI product state (M3) -- main-thread-exclusive, see UiIntents' header comment. ------
+    std::string video_path_;
+    UiIntents ui_intents_;
+    int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
+    int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
+    bool ui_settings_open_ = false;
+    bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
+    int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
+    int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
+    bool fullscreen_ = false;
+    RECT windowed_rect_{};  // saved pre-fullscreen window rect, for restore
+    LONG windowed_style_ = 0; // saved pre-fullscreen GWL_STYLE, for restore
+
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGIAdapter> adapter_;
@@ -1489,6 +1822,64 @@ private:
     std::atomic<uint64_t> n_ai_fresh_{ 0 }, n_ai_stale_{ 0 }, n_pt_fresh_{ 0 }, n_pt_stale_{ 0 };
 };
 
+namespace {
+
+// WndProc's full DEFINITION (declared above, before class Player -- see that declaration's
+// header comment for why it had to move here: it needs a complete Player type). This reopened
+// block is the SAME unnamed namespace as the one earlier in this translation unit, so g_quit
+// remains visible here unqualified.
+//
+// ImGui_ImplWin32_WndProcHandler is given first crack at every message (confirmed by reading
+// backends/imgui_impl_win32.cpp: for every keyboard/mouse message it always returns 0/never
+// consumes, except a couple of WM_IME_* paths that return 1 -- so this "return true" idiom is
+// standard boilerplate here, not an observed short-circuit of our own switch below).
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    Player* self = reinterpret_cast<Player*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    if (self && self->ui_ready()) {
+        if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp))
+            return true;
+    }
+
+    switch (msg) {
+    case WM_DESTROY:
+        g_quit = true;
+        PostQuitMessage(0);
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) {
+            // ESC always quits, regardless of ImGui's keyboard-capture state (unchanged M1/M2
+            // behavior) -- an escape hatch that must never be swallowed by a focused widget.
+            g_quit = true;
+            PostQuitMessage(0);
+            return 0;
+        }
+        if (self && self->ui_ready() && !ImGui::GetIO().WantCaptureKeyboard) {
+            if (wp == VK_SPACE) {
+                self->record_toggle_play();
+            } else if (wp == VK_LEFT || wp == VK_RIGHT) {
+                int64_t fc = self->frame_count();
+                int64_t step = static_cast<int64_t>(std::llround(5.0 * self->fps()));
+                int64_t target = self->current_frame() + (wp == VK_LEFT ? -step : step);
+                target = (fc > 0) ? std::clamp<int64_t>(target, 0, fc - 1) : std::max<int64_t>(0, target);
+                self->record_seek(target);
+            }
+        }
+        return 0;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN) return 0; // swallow Alt+Enter, no exclusive fullscreen here
+        break;
+    default:
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+} // namespace
+
 PYBIND11_MODULE(sumu_core, m)
 {
     m.doc() = "sumu native present kernel: clock-driven decode/present/AI-mix with seek=reposition";
@@ -1501,6 +1892,10 @@ PYBIND11_MODULE(sumu_core, m)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)
         .def("ui_tick", &Player::ui_tick) // M2: main-thread NewFrame/build/Render/publish tick
+        .def("ui_ready", &Player::ui_ready)
+        .def("path", &Player::path)
+        .def("set_ui_config", &Player::set_ui_config, py::arg("clip_length"), py::arg("max_regions"))
+        .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_
         .def("seek", &Player::seek, py::arg("frame_num"))
         .def("push_ai_frame", &Player::push_ai_frame,
             py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"), py::arg("pitch_bytes"))
