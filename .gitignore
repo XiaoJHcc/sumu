@@ -7,6 +7,13 @@ test_video_long.mp4
 # --- downloaded build deps / tools (large, fetched not versioned) ---
 third_party/
 tools/
+# ...except native/third_party/imgui/, which is VENDORED (source-in-tree, no fetch script /
+# submodule -- see native/third_party/imgui/README.sumu.md). Re-include it in three steps:
+# un-ignore the parent dir so git will descend, re-ignore anything else dropped alongside it
+# (keeps the "fetched deps stay out" intent), then un-ignore the vendored imgui tree itself.
+!native/third_party/
+native/third_party/*
+!native/third_party/imgui/
 
 # --- native build ---
 build/

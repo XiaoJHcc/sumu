@@ -18,6 +18,7 @@ endif()
 
 set(CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" CACHE PATH "CUDA toolkit root (driver API headers/import lib only, no nvcc)")
 set(FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../spikes/spike0_d3d11_present/third_party/ffmpeg" CACHE PATH "FFmpeg dev package root (reused from spike0, not duplicated)")
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui" CACHE PATH "Vendored Dear ImGui root (see third_party/imgui/README.sumu.md)")
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
@@ -43,6 +44,13 @@ add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}")
 pybind11_add_module(sumu_core
     src/player.cpp
     src/decoder.cpp
+    "${IMGUI_DIR}/imgui.cpp"
+    "${IMGUI_DIR}/imgui_draw.cpp"
+    "${IMGUI_DIR}/imgui_tables.cpp"
+    "${IMGUI_DIR}/imgui_widgets.cpp"
+    "${IMGUI_DIR}/imgui_demo.cpp"
+    "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp"
+    "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
 )
 add_dependencies(sumu_core generate_shaders)
 
@@ -50,6 +58,8 @@ target_include_directories(sumu_core PRIVATE
     "${GENERATED_DIR}"
     "${CUDA_TOOLKIT_ROOT}/include"
     "${FFMPEG_ROOT}/include"
+    "${IMGUI_DIR}"
+    "${IMGUI_DIR}/backends"
 )
 target_link_directories(sumu_core PRIVATE "${FFMPEG_ROOT}/lib")
 
@@ -59,6 +69,7 @@ target_link_libraries(sumu_core PRIVATE
     dxguid
     d3dcompiler
     winmm
+    dwmapi
     avcodec
     avformat
     avutil

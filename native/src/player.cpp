@@ -52,6 +52,10 @@
 #include <cuda.h>
 #include <cudaD3D11.h>
 
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -229,6 +233,8 @@ public:
         create_window(width_hint, height_hint, maximized);
         create_device_and_swapchain();
         create_shader_pipeline();
+        ui_init(); // present thread not started yet (starts in open()) -- no context
+                   // contention for this one-time ImGui/backend warmup.
         init_cuda_driver(); // device-independent-of-video-size CUDA setup only; landing
                              // texture + registration happen in open() once src dims are known.
     }
@@ -301,6 +307,10 @@ public:
         stop_.store(true, std::memory_order_relaxed);
         if (decode_thread_.joinable()) decode_thread_.join();
         if (present_thread_.joinable()) present_thread_.join();
+
+        // Present thread (the only ImGui-touching thread in M1) has now joined -- safe to
+        // tear down ImGui's device objects/context before DestroyWindow below.
+        ui_shutdown();
 
         if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
         // AI input bridge teardown (additive, Part B) -- mirrors cu_res_'s cleanup above,
@@ -820,6 +830,36 @@ private:
         check_hr(device_->CreateBuffer(&cbd, nullptr, &slice_cb_), "CreateBuffer(slice_cb_)");
     }
 
+    // ---- ImGui overlay (M1: static demo window only, present-thread-exclusive) -------------
+    //
+    // M1 scope note: init/shutdown run on the constructor/close() thread (no present thread
+    // running yet at ui_init(), already joined at ui_shutdown()); the actual per-frame
+    // NewFrame/ShowDemoWindow/Render/RenderDrawData sequence runs entirely on the PRESENT
+    // thread inside draw_and_present(), which is legal for M1 only because present is the
+    // sole context user at that point (no WndProc input routing, no cross-thread draw-data
+    // handoff yet -- that's M2).
+    void ui_init()
+    {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        ImGui::StyleColorsDark();
+        ImGui_ImplWin32_Init(hwnd_);
+        ImGui_ImplDX11_Init(device_.Get(), context_.Get());
+        ImGui_ImplDX11_CreateDeviceObjects();
+        ui_ready_ = true;
+    }
+
+    void ui_shutdown()
+    {
+        if (!ui_ready_) return;
+        ui_ready_ = false;
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+    }
+
     void create_ring_resources()
     {
         D3D11_TEXTURE2D_DESC pt_desc{};
@@ -1153,6 +1193,8 @@ private:
 
     void draw_and_present(Source source, UINT slot)
     {
+        context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
         D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(win_width_), static_cast<float>(win_height_), 0.0f, 1.0f };
         context_->RSSetViewports(1, &vp);
         ID3D11RenderTargetView* rtvs[] = { backbuffer_rtv_.Get() };
@@ -1183,6 +1225,20 @@ private:
         }
 
         context_->Draw(3, 0);
+
+        // M1: static demo overlay, entire ImGui frame built AND rendered right here on the
+        // present thread (see ui_init()'s comment for why that's only legal in M1). Guarded
+        // by ui_ready_ so a call between construction and ui_init()/after ui_shutdown() is a
+        // no-op rather than touching a torn-down context.
+        if (ui_ready_) {
+            ImGui_ImplDX11_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+            ImGui::ShowDemoWindow();
+            ImGui::Render();
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        }
+
         swapchain_->Present(1, 0);
     }
 
@@ -1237,6 +1293,7 @@ private:
     bool timer_period_set_ = false;
     bool closed_ = false;
     bool opened_ = false;
+    bool ui_ready_ = false;
 
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
