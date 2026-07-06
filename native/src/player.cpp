@@ -66,6 +66,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -214,6 +215,32 @@ float2 PSMain_UV(VSOut i) : SV_Target
 
 } // namespace
 
+// ---- UI draw-data snapshot (M2: main-thread NewFrame/Render -> present-thread RenderDrawData
+// handoff) --------------------------------------------------------------------------------
+//
+// ImGui::GetDrawData()'s ImDrawList*s are owned by the ImGuiContext and get overwritten by the
+// next NewFrame() -- unsafe to hand across threads by pointer. CloneOutput() (imgui_draw.cpp)
+// deep-copies each ImDrawList's CmdBuffer/IdxBuffer/VtxBuffer into a freshly IM_NEW'd
+// ImDrawList, so a snapshot built from CloneOutput() is safe for the present thread to read
+// after the main thread has moved on to its next frame. IM_NEW/IM_DELETE route through
+// ImGui::MemAlloc/MemFree (imgui.h's IM_NEW/IM_DELETE macros), so cloned lists must be freed
+// with IM_DELETE, not plain `delete` -- matches ImGuiViewportP::~ImGuiViewportP's own use of
+// IM_DELETE on BgFgDrawLists (imgui.h:1988), the only other place in this vendored tree that
+// owns/frees a raw ImDrawList*.
+struct UiDrawSnapshot {
+    ImVector<ImDrawList*> cmd_lists; // each entry is a CloneOutput() result -- owned here
+    int total_vtx = 0;
+    int total_idx = 0;
+    ImVec2 display_pos{};
+    ImVec2 display_size{};
+    ImVec2 framebuffer_scale{};
+
+    ~UiDrawSnapshot()
+    {
+        for (ImDrawList* dl : cmd_lists) IM_DELETE(dl);
+    }
+};
+
 // ---------------------------------------------------------------------------------------
 class Player
 {
@@ -360,6 +387,39 @@ public:
     }
 
     bool is_playing() const { return playing_.load(std::memory_order_relaxed); }
+
+    // ---- UI (M2): main thread only -- NewFrame/build/Render/CloneOutput, publish snapshot ---
+    //
+    // Called once per Python-driven tick (pybind's ui_tick()). Never touches d3d_mutex_ (see
+    // the context-touch audit above ui_init(), private section below -- nothing here issues
+    // D3D11 calls except the CPU-side font-atlas bookkeeping inside ImGui::NewFrame(), which is
+    // backend-agnostic). Defined here in the public section (pybind must bind it directly);
+    // ui_init()/ui_shutdown()/ui_render_drawdata() stay private since only this class's own
+    // methods call them.
+    void ui_tick()
+    {
+        if (!ui_ready_) return;
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        ImGui::ShowDemoWindow(); // M2: still the demo window -- product UI is M3.
+        ImGui::Render();
+
+        ImDrawData* dd = ImGui::GetDrawData();
+        auto snap = std::make_unique<UiDrawSnapshot>();
+        snap->total_vtx = dd->TotalVtxCount;
+        snap->total_idx = dd->TotalIdxCount;
+        snap->display_pos = dd->DisplayPos;
+        snap->display_size = dd->DisplaySize;
+        snap->framebuffer_scale = dd->FramebufferScale;
+        snap->cmd_lists.resize(dd->CmdLists.Size);
+        for (int i = 0; i < dd->CmdLists.Size; ++i)
+            snap->cmd_lists[i] = dd->CmdLists[i]->CloneOutput();
+
+        std::lock_guard<std::mutex> lk(ui_mutex_);
+        ui_pending_ = std::move(snap); // O(1) pointer move, only moment ui_mutex_ is held here
+    }
 
     // I6: seek = reposition, never teardown. Never touches decode_thread_/present_thread_/
     // decoder_/swapchain_ lifetime. Synchronous cost is dominated by Decoder::seek_to_frame's
@@ -830,14 +890,32 @@ private:
         check_hr(device_->CreateBuffer(&cbd, nullptr, &slice_cb_), "CreateBuffer(slice_cb_)");
     }
 
-    // ---- ImGui overlay (M1: static demo window only, present-thread-exclusive) -------------
+    // ---- ImGui overlay (M2: real thread split -- main-thread NewFrame/build/Render/Clone,
+    // present-thread RenderDrawData-only; see ui_tick()/ui_render_drawdata() below) ---------
     //
-    // M1 scope note: init/shutdown run on the constructor/close() thread (no present thread
-    // running yet at ui_init(), already joined at ui_shutdown()); the actual per-frame
-    // NewFrame/ShowDemoWindow/Render/RenderDrawData sequence runs entirely on the PRESENT
-    // thread inside draw_and_present(), which is legal for M1 only because present is the
-    // sole context user at that point (no WndProc input routing, no cross-thread draw-data
-    // handoff yet -- that's M2).
+    // init/shutdown still run on the constructor/close() thread (no present thread running
+    // yet at ui_init(), already joined at ui_shutdown()).
+    //
+    // Backend/context-touch audit for the main-thread-NewFrame vs. present-thread-
+    // RenderDrawData concurrency question (done by reading this vendored ImGui 1.92.8 tree,
+    // not assumed): ImGui_ImplDX11_NewFrame() (backends/imgui_impl_dx11.cpp) only calls
+    // ImGui_ImplDX11_CreateDeviceObjects() if `!bd->pVertexShader` -- since that prewarm call
+    // right below already created it here in ui_init() (present thread not started yet, no
+    // contention for THIS one-time call), ImGui_ImplDX11_NewFrame() on the main thread in
+    // ui_tick() is a pure no-op w.r.t. the D3D11 device/context every frame after that.
+    // ImGui_ImplWin32_NewFrame() only touches Win32/IO state, never D3D11. ImGui::NewFrame()/
+    // ImGui::Render()/CloneOutput() are pure CPU-side ImGui-internal state (including the font
+    // atlas's lazy CPU-side (re)build via UpdateTexturesNewFrame -> ImFontAtlasUpdateNewFrame,
+    // which only sets an ImTextureData's status to WantCreate/WantUpdates -- it does not touch
+    // ID3D11Device/Context). The ONLY ImGui call in this whole vendored tree that issues D3D11
+    // device/context calls -- including the actual font-texture upload that WantCreate defers
+    // to -- is ImGui_ImplDX11_RenderDrawData() (confirmed by reading its body: it maps/unmaps
+    // the vertex/index buffers, iterates draw_data->Textures calling
+    // ImGui_ImplDX11_UpdateTexture() for any non-OK status, and issues the Draw calls), and
+    // that call is made ONLY from ui_render_drawdata() on the present thread, inside
+    // d3d_mutex_, in both M1 and M2. So there is no cross-thread D3D11 context race between
+    // the main thread's ui_tick() and the present thread's ui_render_drawdata() -- confirmed
+    // from source, not assumed from the ImGui docs' general multi-threading caveat.
     void ui_init()
     {
         IMGUI_CHECKVERSION();
@@ -858,6 +936,37 @@ private:
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
+    }
+
+    // ---- present thread (M2): swap in the latest published snapshot, render it -------------
+    //
+    // Called from draw_and_present(), after the video Draw(3,0) and before Present(1,0), while
+    // already holding d3d_mutex_. Never calls NewFrame/Render/CloneOutput -- only renders an
+    // already-published snapshot. Tolerates ui_pending_/ui_active_ both being empty (present
+    // started before the first ui_tick()) by returning without drawing anything.
+    void ui_render_drawdata()
+    {
+        if (!ui_ready_) return;
+        {
+            std::lock_guard<std::mutex> lk(ui_mutex_);
+            if (ui_pending_) ui_active_ = std::move(ui_pending_); // O(1) pointer move only
+        }
+        if (!ui_active_ || ui_active_->cmd_lists.empty()) return; // nothing published yet
+
+        ImDrawData dd{};
+        dd.Valid = true;
+        dd.CmdListsCount = ui_active_->cmd_lists.Size;
+        dd.TotalVtxCount = ui_active_->total_vtx;
+        dd.TotalIdxCount = ui_active_->total_idx;
+        dd.DisplayPos = ui_active_->display_pos;
+        dd.DisplaySize = ui_active_->display_size;
+        dd.FramebufferScale = ui_active_->framebuffer_scale;
+        dd.Textures = &ImGui::GetPlatformIO().Textures; // font-texture WantCreate/WantUpdates
+                                                          // list lives on the (single, shared)
+                                                          // ImGuiContext, not per-snapshot.
+        dd.CmdLists.swap(ui_active_->cmd_lists); // O(1) borrow, no per-frame allocation
+        ImGui_ImplDX11_RenderDrawData(&dd);
+        dd.CmdLists.swap(ui_active_->cmd_lists); // give ownership back to the snapshot
     }
 
     void create_ring_resources()
@@ -1226,18 +1335,10 @@ private:
 
         context_->Draw(3, 0);
 
-        // M1: static demo overlay, entire ImGui frame built AND rendered right here on the
-        // present thread (see ui_init()'s comment for why that's only legal in M1). Guarded
-        // by ui_ready_ so a call between construction and ui_init()/after ui_shutdown() is a
-        // no-op rather than touching a torn-down context.
-        if (ui_ready_) {
-            ImGui_ImplDX11_NewFrame();
-            ImGui_ImplWin32_NewFrame();
-            ImGui::NewFrame();
-            ImGui::ShowDemoWindow();
-            ImGui::Render();
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        }
+        // M2: present thread only renders an already-published draw-data snapshot (built on
+        // the main thread by ui_tick()) -- see ui_render_drawdata()'s header comment. Called
+        // here, after the video Draw(3,0) and before Present(1,0), still inside d3d_mutex_.
+        ui_render_drawdata();
 
         swapchain_->Present(1, 0);
     }
@@ -1294,6 +1395,14 @@ private:
     bool closed_ = false;
     bool opened_ = false;
     bool ui_ready_ = false;
+
+    // ---- UI draw-data handoff (M2) -- ui_pending_ is main-thread-written/present-moved-out,
+    // ui_active_ is present-thread-exclusive (never touched under ui_mutex_ once moved into).
+    // ui_mutex_ is only ever held for the O(1) pointer move in ui_tick()/ui_render_drawdata(),
+    // never across RenderDrawData -- see UiDrawSnapshot's header comment and both methods.
+    std::mutex ui_mutex_;
+    std::unique_ptr<UiDrawSnapshot> ui_pending_;
+    std::unique_ptr<UiDrawSnapshot> ui_active_;
 
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
@@ -1391,6 +1500,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)
+        .def("ui_tick", &Player::ui_tick) // M2: main-thread NewFrame/build/Render/publish tick
         .def("seek", &Player::seek, py::arg("frame_num"))
         .def("push_ai_frame", &Player::push_ai_frame,
             py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"), py::arg("pitch_bytes"))

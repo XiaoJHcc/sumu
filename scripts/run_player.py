@@ -187,6 +187,7 @@ def main():
     quit_early = False
     while time.perf_counter() - t0 < args.seconds:
         player.pump_messages()
+        player.ui_tick()  # M2-VERIFY: temporary, M3 will properly wire ui_tick with set_ui_config/take_ui_intents
         if player.should_quit():
             quit_early = True
             break
@@ -215,6 +216,7 @@ def main():
         recovered_hit_rate = None
         while time.perf_counter() - t_seek_obs0 < args.seek_observe_seconds:
             player.pump_messages()
+            player.ui_tick()  # M2-VERIFY: temporary, M3 will properly wire ui_tick with set_ui_config/take_ui_intents
             if player.should_quit():
                 quit_early = True
                 break
