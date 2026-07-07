@@ -74,9 +74,11 @@ target_link_libraries(sumu_core PRIVATE
     winmm
     dwmapi
     comdlg32
+    ole32
     avcodec
     avformat
     avutil
+    swresample
     "${CUDA_TOOLKIT_ROOT}/lib/x64/cuda.lib"
 )
 

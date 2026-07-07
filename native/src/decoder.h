@@ -20,7 +20,10 @@
 #pragma once
 
 #include <d3d11.h>
+#include <atomic>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
 
 extern "C" {
@@ -75,6 +78,42 @@ public:
     // should treat that as "no known upper bound" rather than crash.
     int64_t frame_count() const { return frame_count_; }
 
+    // ---- audio (spike, additive) -- demux-only: this class never builds an audio
+    // AVCodecContext or decodes audio itself, it only pulls audio AVPackets off fmt_ctx_ (in
+    // pump_one_raw_frame(), same av_read_frame() call the video path already uses) and queues
+    // them for Player's own audio thread to pop, decode (software), resample, and play. No
+    // audio stream in the file is legitimate and silent -- has_audio() is simply false, callers
+    // must not treat that as an error (mirrors this class's existing silent-video-is-fine
+    // stance elsewhere).
+    bool has_audio() const { return audio_stream_idx_ >= 0; }
+    AVCodecParameters* audio_codecpar() const
+    {
+        return has_audio() ? fmt_ctx_->streams[audio_stream_idx_]->codecpar : nullptr;
+    }
+    AVRational audio_time_base() const
+    {
+        return has_audio() ? fmt_ctx_->streams[audio_stream_idx_]->time_base : AVRational{ 1, 1 };
+    }
+    // Shared time-axis origin for the audio thread's A/V sync math (see player.cpp's
+    // audio_loop()): the raw PTS (seconds, stream time_base already applied) of the very first
+    // frame this Decoder ever decoded, established once in next_frame() and never changed by a
+    // seek (I5) -- identical origin present_loop()'s frame numbers are anchored to. Atomic (not
+    // just for pump_one_raw_frame()'s existing single-writer-thread use) because the audio
+    // thread now reads it from a different thread with no other synchronization.
+    double first_pts_seconds() const { return first_pts_seconds_; }
+    bool have_first_pts() const { return have_first_pts_; }
+
+    // Pop one queued audio packet (FIFO order) into `dst` (caller-owned AVPacket, typically
+    // reused across calls -- av_packet_move_ref resets `dst` first). Returns false if the
+    // queue is currently empty (dst left untouched). Thread-safe: this is the ONLY state
+    // shared between the decode thread (pump_one_raw_frame(), the producer) and Player's
+    // audio thread (the sole consumer) -- present_loop() never calls this.
+    bool pop_audio_packet(AVPacket* dst);
+
+    // Best-effort queue depth, for the audio thread's per-second drift/health log only (never
+    // used for control flow) -- see player.cpp's audio_loop().
+    size_t audio_queue_depth() const;
+
     void close();
 
 private:
@@ -101,10 +140,27 @@ private:
     int height_ = 0;
     int64_t frame_count_ = 0;
 
-    bool have_first_pts_ = false;
-    double first_pts_seconds_ = 0.0;
+    // std::atomic: written once (single-shot init) by the decode thread inside next_frame(),
+    // now also read from Player's audio thread (audio_loop()) with no other synchronization --
+    // see first_pts_seconds()'s comment above. Everywhere else in this file these are used
+    // exactly as plain double/bool (atomic<T>'s implicit conversion/assignment operators cover
+    // every existing read/write site unchanged).
+    std::atomic<bool> have_first_pts_{ false };
+    std::atomic<double> first_pts_seconds_{ 0.0 };
     double loop_offset_seconds_ = 0.0; // added to raw pts so the clock keeps climbing across loops
     double last_out_pts_seconds_ = -1.0;
 
     ID3D11Device* d3d_device_ = nullptr; // not owned
+
+    // ---- audio (spike, additive) -----------------------------------------------------------
+    int audio_stream_idx_ = -1; // -1 == no audio stream (legitimate, silent)
+
+    // Bounded so a slow/stalled audio consumer can never grow this without limit: 512 packets
+    // is far more than the ~4s of audio headroom this needs even for small audio frames (e.g.
+    // ~10.9s at a typical 1024-sample/48kHz AAC frame), so steady state should never trip the
+    // drop path below -- if it does, that's the signal (see audio_pkt_dropped_).
+    static constexpr size_t kAudioQueueMaxPackets = 512;
+    mutable std::mutex audio_pkt_mutex_;
+    std::deque<AVPacket*> audio_pkt_queue_; // guarded by audio_pkt_mutex_
+    uint64_t audio_pkt_dropped_ = 0;        // guarded by audio_pkt_mutex_; oldest-drop counter
 };

@@ -17,12 +17,25 @@ Decoder::~Decoder()
 
 void Decoder::close()
 {
+    {
+        // Free any audio packets still sitting in the queue -- by the time close() runs,
+        // Player has already joined both the decode thread (producer) and its own audio
+        // thread (consumer), so no concurrent access is actually possible here; the lock is
+        // just cheap insurance, consistent with the rest of this class's style.
+        std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+        while (!audio_pkt_queue_.empty()) {
+            AVPacket* p = audio_pkt_queue_.front();
+            audio_pkt_queue_.pop_front();
+            av_packet_free(&p);
+        }
+    }
     if (pkt_) av_packet_free(&pkt_);
     if (frame_) av_frame_free(&frame_);
     if (codec_ctx_) avcodec_free_context(&codec_ctx_);
     if (hw_device_ref_) av_buffer_unref(&hw_device_ref_);
     if (fmt_ctx_) avformat_close_input(&fmt_ctx_);
     video_stream_idx_ = -1;
+    audio_stream_idx_ = -1;
 }
 
 AVPixelFormat Decoder::get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts)
@@ -104,6 +117,12 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
         fps_ = av_q2d(stream->avg_frame_rate);
     width_ = stream->codecpar->width;
     height_ = stream->codecpar->height;
+
+    // Audio (spike, additive): demux-only, best-effort. related_stream=idx nudges FFmpeg to
+    // prefer an audio stream muxed alongside the chosen video stream when a container has
+    // several. No audio track is a legitimate, silent result (-1), not an error -- callers
+    // (Player::open()) must treat has_audio()==false the same as "no audio in this file".
+    audio_stream_idx_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, idx, nullptr, 0);
 
     // Best-effort total frame count: prefer the container's own count, else derive from
     // duration * fps. Used only for clamping seek targets -- 0 (unknown) is handled by
@@ -199,6 +218,23 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
                         av_packet_unref(pkt_);
                         fprintf(stderr, "avcodec_send_packet failed: %d\n", send);
                         return -1;
+                    }
+                } else if (audio_stream_idx_ >= 0 && pkt_->stream_index == audio_stream_idx_) {
+                    // Demux-only: hand this packet off to Player's audio thread via the
+                    // bounded queue instead of decoding it here (see file header / decoder.h).
+                    // av_packet_move_ref() resets pkt_ to empty, so the generic
+                    // av_packet_unref(pkt_) below is a harmless no-op for this branch.
+                    AVPacket* apkt = av_packet_alloc();
+                    if (apkt) {
+                        av_packet_move_ref(apkt, pkt_);
+                        std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+                        audio_pkt_queue_.push_back(apkt);
+                        if (audio_pkt_queue_.size() > kAudioQueueMaxPackets) {
+                            AVPacket* drop = audio_pkt_queue_.front();
+                            audio_pkt_queue_.pop_front();
+                            av_packet_free(&drop);
+                            ++audio_pkt_dropped_;
+                        }
                     }
                 }
                 av_packet_unref(pkt_);
@@ -330,4 +366,21 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
 
     error = "seek_to_frame: no frame could be decoded after seek";
     return false;
+}
+
+bool Decoder::pop_audio_packet(AVPacket* dst)
+{
+    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+    if (audio_pkt_queue_.empty()) return false;
+    AVPacket* p = audio_pkt_queue_.front();
+    audio_pkt_queue_.pop_front();
+    av_packet_move_ref(dst, p);
+    av_packet_free(&p);
+    return true;
+}
+
+size_t Decoder::audio_queue_depth() const
+{
+    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+    return audio_pkt_queue_.size();
 }
