@@ -77,8 +77,15 @@ def main():
 
     def apply_ui_intents(intents):
         """Same semantics as run_player.py's apply_ui_intents (toggle_play / seek /
-        clip_length|max_regions rebuild) -- see run_player.py:183 for the full rationale."""
-        nonlocal scheduler, config
+        clip_length|max_regions rebuild) -- see run_player.py:183 for the full rationale.
+        M-C2 adds reopen: a dropped file (open_path) or the top-bar "open" button
+        (open_dialog, answered here with the blocking pick_open_file() dialog -- present keeps
+        showing the current video while it's up) triggers player.reopen(path), which swaps the
+        playing file without tearing down present_thread_/the window (see player.cpp's
+        Player::reopen()). The scheduler is torn down/rebuilt exactly like the clip_length/
+        max_regions path above (model objects reused, only the scheduler + its video_meta are
+        file-specific)."""
+        nonlocal scheduler, config, video_meta
 
         if intents["toggle_play"]:
             if player.is_playing():
@@ -101,6 +108,23 @@ def main():
                 config.max_regions_per_frame = max_regions
             scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
             scheduler.start()
+
+        path = None
+        if intents["open_dialog"]:
+            path = player.pick_open_file()  # modal, main thread; present keeps showing the
+                                             # current video the whole time this is up
+        elif intents["open_path"]:
+            path = intents["open_path"]
+        if path:
+            scheduler.stop()
+            new_frame_count = player.reopen(path)
+            print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
+                  file=sys.stderr)
+            video_meta = get_video_meta_data(path)
+            scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
+            scheduler.start()
+            player.play()  # open_session() starts paused; a freshly reopened file auto-plays
+                           # (matches main()'s open->scheduler.start()->play() sequence below)
 
     player.play()
     try:

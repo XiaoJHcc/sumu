@@ -48,6 +48,7 @@
 #include <wrl/client.h>
 #include <timeapi.h>
 #include <commdlg.h> // GetOpenFileNameW (Player::pick_open_file)
+#include <shellapi.h> // DragAcceptFiles/DragQueryFileW/DragFinish (M-C2: WM_DROPFILES)
 #pragma comment(lib, "winmm.lib")
 
 // Audio (spike, additive): WASAPI. initguid.h MUST precede mmdeviceapi.h/audioclient.h/
@@ -317,6 +318,13 @@ struct UiIntents {
     bool toggle_play = false;
     std::optional<int> clip_length;
     std::optional<int> max_regions;
+    // M-C2: a file the user wants opened (reopen), recorded by either the WM_DROPFILES handler
+    // (open_path, UTF-8 path of the dropped file -- empty means none pending) or the top-bar
+    // "open" button (open_dialog -- Python responds by calling the blocking pick_open_file()
+    // dialog itself, see take_ui_intents()'s header comment for why this stays main-thread-only
+    // same as every other field here).
+    std::string open_path;
+    bool open_dialog = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -348,11 +356,14 @@ public:
         // of in open()/open_session() -- present_loop()'s splash branch (session_active_ still
         // false) draws a "loading" splash the whole time Python is loading AI models between
         // constructing Player and calling open(), instead of the window looking frozen for
-        // that ~10+ second window. freq_/pace_origin_qpc_ are QPC system constants/epoch, not
-        // video-dependent, so establishing them here (once, before present_thread_'s single
-        // long-running tick_idx counter starts advancing) is correct; open_session() must NOT
-        // touch pace_origin_qpc_ again afterward (tick_idx is never reset, so re-stamping the
-        // origin mid-flight would desync the pacing formula against ticks already elapsed).
+        // that ~10+ second window. freq_ is a QPC system constant; pace_origin_qpc_ is the
+        // pacing epoch, established here once so present_thread_'s tick_idx starts from a valid
+        // baseline. open_session() must NOT write pace_origin_qpc_ directly (tick_idx lives in
+        // present_loop() and only it may reset the two together) -- instead, when a (re)opened
+        // session changes fps_, open_session() bumps pace_epoch_ and present_loop() re-anchors
+        // origin+tick_idx itself (see present_loop()'s pacing comment). Originally (M-C1, before
+        // reopen and its per-session fps_ changes existed) this note forbade re-anchoring at
+        // all; M-C2 made it mandatory, routed through pace_epoch_ to keep present the sole writer.
         QueryPerformanceFrequency(&freq_);
         stop_.store(false, std::memory_order_relaxed);
         QueryPerformanceCounter(&pace_origin_qpc_);
@@ -384,6 +395,16 @@ public:
         if (!decoder_.open(video_path, device_.Get(), decode_err))
             throw std::runtime_error("decoder.open failed: " + decode_err);
         fps_ = decoder_.fps();
+        // M-C2: fps_ just (re)set for this session and may DIFFER from the previous session's
+        // (reopen 4K60 <-> 1080p30) or from the constructor's default 60.0 (first open of a
+        // 30fps file). present_loop()'s fixed-cadence formula is pace_origin_qpc_ + tick_idx/
+        // fps_, with tick_idx accumulated over the whole present-thread lifetime -- so a bare
+        // fps_ change desyncs it (target jumps seconds into the future when fps_ drops, freezing
+        // present until wall-clock catches up; this was the multi-second reopen freeze). Signal
+        // present_thread_ (the only writer of pace_origin_qpc_/tick_idx) to re-anchor. Bumped
+        // right after the fps_ write, before any resource build/decode-buffer wait below could
+        // let present act on a stale origin. release publishes both fps_ and the epoch.
+        pace_epoch_.fetch_add(1, std::memory_order_release);
         src_width_ = decoder_.width();
         src_height_ = decoder_.height();
         frame_count_ = decoder_.frame_count();
@@ -484,41 +505,132 @@ public:
 
         if (audio_codec_ctx_) avcodec_free_context(&audio_codec_ctx_);
 
-        // CUDA unregister BEFORE releasing the D3D11 textures they wrap (cu_res_ wraps
-        // landing_tex_; ai_in_cu_res_y_/uv_ wrap ai_in_y_tex_/ai_in_uv_tex_) -- cu_ctx_ itself
-        // is a device-layer resource and stays current/alive here (only close()'s final
-        // teardown below releases it), same ordering the original close() already used.
-        if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
-        if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
-        if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
-        if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
+        // M-C2 fix (device-removed root cause): reopen() no longer relies on Python's
+        // Scheduler.stop() winning a timing race against this teardown. push_ai_frame()/
+        // get_cuda_nv12_by_frame() run on Python's own AI-producer/consumer threads (not
+        // joined above -- decode_thread_/audio_thread_ are the only threads this function
+        // owns) and both take d3d_mutex_ around the exact CUDA-interop/D3D11 resources torn
+        // down below (see push_ai_frame():875, get_cuda_nv12_by_frame():978) -- WITHOUT this
+        // lock here, close_session() could unregister/Reset() a resource while one of those
+        // calls still had it mapped, corrupting driver state (observed: DXGI_ERROR_DEVICE_
+        // REMOVED under stress_reopen.py). Both methods now re-check session_active_ (which
+        // reopen() already flipped false before calling close_session(), see reopen()'s own
+        // comment) immediately after taking their locks and no-op (miss/return) instead of
+        // touching session resources, so by the time THIS thread acquires d3d_lock below any
+        // push_ai_frame()/get_cuda_nv12_by_frame() call already past that check is operating
+        // on the still-valid pre-teardown resources and will finish and release the lock
+        // before we can proceed; any call arriving after is turned away by the same check
+        // before it ever touches d3d_mutex_-guarded state. NOT taken while joining
+        // decode_thread_/audio_thread_ above -- those threads also take d3d_mutex_ themselves
+        // (decode_loop's ring writes, audio does not) and joining them under this lock would
+        // risk a self-deadlock; the lock only wraps the resource teardown itself.
+        {
+            std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
 
-        // Explicit release of session-scoped D3D11 resources (pre-M-C1 these only ever went
-        // away implicitly, via ~Player's ComPtr destructors) -- clears the slate so present_
-        // loop's splash branch never indexes a half-torn-down ring while !session_active_, and
-        // so a future open_session() rebuilds everything from scratch.
-        pt_ring_tex_.Reset();
-        for (auto& srv : pt_srv_y_) srv.Reset();
-        for (auto& srv : pt_srv_uv_) srv.Reset();
-        pt_srv_y_.clear();
-        pt_srv_uv_.clear();
-        pt_tag_.clear();
+            // CUDA unregister BEFORE releasing the D3D11 textures they wrap (cu_res_ wraps
+            // landing_tex_; ai_in_cu_res_y_/uv_ wrap ai_in_y_tex_/ai_in_uv_tex_) -- cu_ctx_
+            // itself is a device-layer resource and stays current/alive here (only close()'s
+            // final teardown below releases it), same ordering the original close() already
+            // used.
+            if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
+            if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
+            if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
+            if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
 
-        ai_ring_tex_.Reset();
-        for (auto& srv : ai_srv_) srv.Reset();
-        ai_srv_.clear();
-        ai_tag_.clear();
+            // Explicit release of session-scoped D3D11 resources (pre-M-C1 these only ever
+            // went away implicitly, via ~Player's ComPtr destructors) -- clears the slate so
+            // present_loop's splash branch never indexes a half-torn-down ring while
+            // !session_active_, and so a future open_session() rebuilds everything from
+            // scratch. pt_tag_/ai_tag_ and the SRV vectors are also read under ready_mutex_
+            // by get_cuda_nv12_by_frame()/decode_loop() (a stale pt_tag_[slot] index into an
+            // already-.clear()'d vector was the second, independent crash this fix closes) --
+            // nested inside d3d_mutex_ here, matching decode_loop()'s/seek()'s existing lock
+            // order (d3d_mutex_ outer, ready_mutex_ inner), never the reverse.
+            pt_ring_tex_.Reset();
+            for (auto& srv : pt_srv_y_) srv.Reset();
+            for (auto& srv : pt_srv_uv_) srv.Reset();
+            {
+                std::lock_guard<std::mutex> ready_lock(ready_mutex_);
+                pt_srv_y_.clear();
+                pt_srv_uv_.clear();
+                pt_tag_.clear();
+            }
 
-        landing_tex_.Reset();
+            ai_ring_tex_.Reset();
+            for (auto& srv : ai_srv_) srv.Reset();
+            {
+                std::lock_guard<std::mutex> ready_lock(ready_mutex_);
+                ai_srv_.clear();
+                ai_tag_.clear();
+            }
 
-        ai_in_y_tex_.Reset();
-        ai_in_y_rtv_.Reset();
-        ai_in_uv_tex_.Reset();
-        ai_in_uv_rtv_.Reset();
+            landing_tex_.Reset();
+
+            ai_in_y_tex_.Reset();
+            ai_in_y_rtv_.Reset();
+            ai_in_uv_tex_.Reset();
+            ai_in_uv_rtv_.Reset();
+        }
 
         decoder_.close();
 
         session_active_.store(false, std::memory_order_relaxed);
+    }
+
+    // M-C2: runtime file swap -- present_thread_ (and the window) is NEVER stopped/rebuilt for
+    // this, unlike close()/~Player(). This is the present-detach handshake close_session()'s own
+    // M-C1 comment flagged as missing: flip session_active_ false so present_loop()'s NEXT
+    // iteration takes the splash branch (draw_splash(), see present_loop()) instead of
+    // draw_and_present(), then spin on present_in_splash_ until that has actually been observed.
+    // present_loop() picks exactly one branch per iteration (it reads session_active_ once at
+    // the top and commits to either draw_and_present() or draw_splash() for the WHOLE iteration),
+    // so the moment a splash iteration has stored present_in_splash_ = true, any earlier
+    // draw_and_present() call has already fully returned (same thread, program order) -- present
+    // is guaranteed to not be touching pt_ring_tex_/ai_ring_tex_/the SRVs/landing_tex_/decoder_
+    // again until session_active_ flips back true, which is exactly what close_session() below
+    // needs to safely tear those down. Bounded spin: present_loop() is on a fixed fps_ cadence
+    // and never blocks on decode/AI, so this is at most ~1-2 present ticks; a 2s timeout guards
+    // against a genuinely wedged present thread rather than dead-waiting forever.
+    //
+    // close_session()/open_session() run here on the SAME thread (Python's main thread) that
+    // called open()/close() originally -- cu_ctx_ is already current on this thread from the
+    // constructor (see init_cuda_driver()), so no CUDA context re-binding is needed, same as
+    // today's open()/close(). No additional d3d_mutex_ protection was added around
+    // close_session()'s resource teardown or open_session()'s resource creation: close_session()
+    // never issues any ID3D11DeviceContext (context_) calls itself (only ComPtr::Reset()/FFmpeg
+    // teardown, which are thread-safe COM refcounting, not context state mutation), and
+    // open_session()'s create_ring_resources()/create_landing_texture()/create_ai_input_bridge()
+    // only call ID3D11Device (device_) resource-creation methods, which the D3D11 runtime
+    // guarantees are free-threaded regardless of ID3D11Multithread::SetMultithreadProtected (that
+    // flag only covers the immediate context, i.e. draw_splash()'s/draw_and_present()'s context_
+    // calls) -- see docs/native_core.md. decode_thread_/audio_thread_ are joined by
+    // close_session() before any of that teardown runs, so there is no concurrent producer onto
+    // the resources being torn down either. Flagging this reasoning explicitly per the task brief
+    // in case a reviewer wants to double-check it.
+    //
+    // Returns the new session's frame_count() (Python rebuilds its Scheduler from this plus its
+    // own get_video_meta_data(path) probe -- see play.py).
+    int64_t reopen(const std::string& video_path)
+    {
+        require_open(); // reopen is "open a different file into an already-open Player"
+
+        session_active_.store(false, std::memory_order_release);
+
+        LARGE_INTEGER t0;
+        QueryPerformanceCounter(&t0);
+        for (;;) {
+            if (present_in_splash_.load(std::memory_order_acquire)) break;
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double waited_s = static_cast<double>(now.QuadPart - t0.QuadPart) / qpc_freq_d();
+            if (waited_s > 2.0)
+                throw std::runtime_error("reopen: present thread failed to detach into splash within 2s");
+            Sleep(1);
+        }
+
+        close_session();
+        open_session(video_path);
+        return frame_count_;
     }
 
     void close()
@@ -673,6 +785,10 @@ public:
     // dragging wants).
     void record_toggle_play() { ui_intents_.toggle_play = true; }
     void record_seek(int64_t f) { ui_intents_.seek = f; }
+    // M-C2: WM_DROPFILES (a file dropped on the window) and the top-bar "open" button -- see
+    // UiIntents' own header comment. Both main-thread-only, same as record_seek() above.
+    void record_open_path(const std::string& path) { ui_intents_.open_path = path; }
+    void record_open_dialog() { ui_intents_.open_dialog = true; }
 
     const std::string& path() const { return video_path_; }
     bool ui_ready() const { return ui_ready_; }
@@ -698,6 +814,8 @@ public:
         d["toggle_play"] = ui_intents_.toggle_play;
         d["clip_length"] = ui_intents_.clip_length.has_value() ? py::cast(*ui_intents_.clip_length) : py::none();
         d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
+        d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
+        d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
         ui_intents_ = UiIntents{}; // drain
         return d;
     }
@@ -804,6 +922,13 @@ public:
 
         std::lock_guard<std::mutex> d3d_lock(d3d_mutex_); // serializes ALL D3D11/CUDA-interop use of the shared context
 
+        // M-C2 fix: reopen() flips session_active_ false (release) before it can touch
+        // close_session()'s teardown of cu_res_/ai_ring_tex_/landing_tex_ (see close_session()'s
+        // own d3d_lock, which this call either runs fully before or waits behind) -- once this
+        // load observes false, those resources are being (or about to be) torn down, so bail as
+        // a no-op rather than mapping/copying into them. acquire pairs with reopen()'s release.
+        if (!session_active_.load(std::memory_order_acquire)) return;
+
         try {
             check_cu(cuGraphicsMapResources(1, &cu_res_, 0), "cuGraphicsMapResources");
             CUarray cu_arr = nullptr;
@@ -891,7 +1016,15 @@ public:
         // cold/lagging AI consumer never adds contention to decode/present/push_ai_frame.
         {
             std::lock_guard<std::mutex> lk(ready_mutex_);
-            if (pt_tag_[slot] != frame_num) {
+            // M-C2 fix: close_session() now .clear()s pt_tag_ under this same ready_mutex_
+            // (see close_session()) as part of a reopen()-driven teardown, which flips
+            // session_active_ false first -- checking it here, before indexing pt_tag_[slot],
+            // is what makes that safe: either this observes session_active_ still true (in
+            // which case close_session() has not yet reached its ready_lock, so pt_tag_ is
+            // still the full, correctly-sized vector) or it observes false and bails before
+            // ever indexing what might now be an empty (post-clear()) vector -- indexing it
+          // was the second crash this fix closes (undefined behaviour, not just a stale read).
+            if (!session_active_.load(std::memory_order_acquire) || pt_tag_[slot] != frame_num) {
                 py::dict miss;
                 miss["ready"] = false;
                 miss["frame_num"] = frame_num;
@@ -904,8 +1037,18 @@ public:
         // (decode_loop advancing a full ring lap, or a seek()) -- both of those writers also
         // take d3d_mutex_ before touching pt_ring_tex_, so once we hold d3d_mutex_ no
         // concurrent writer can be modifying this slot's texture contents; the re-check only
-        // guards against having already lost that race before we got here.
+        // guards against having already lost that race before we got here. Also re-check
+        // session_active_ here (M-C2 fix, same reasoning as push_ai_frame()'s d3d_lock-guarded
+        // check): a reopen() could have flipped it false and be waiting on close_session()'s
+        // own d3d_lock right behind us -- bail before touching pt_ring_tex_/the AI bridge
+        // textures rather than racing that teardown.
         std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        if (!session_active_.load(std::memory_order_acquire)) {
+            py::dict miss;
+            miss["ready"] = false;
+            miss["frame_num"] = frame_num;
+            return miss;
+        }
         {
             std::lock_guard<std::mutex> lk(ready_mutex_);
             if (pt_tag_[slot] != frame_num) {
@@ -1091,6 +1234,7 @@ private:
         // specific Player instance -- see the reopened-namespace WndProc definition after
         // class Player's closing brace.
         SetWindowLongPtrA(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        DragAcceptFiles(hwnd_, TRUE); // M-C2: enables WM_DROPFILES (see WndProc)
         ShowWindow(hwnd_, maximized ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(hwnd_);
 
@@ -1398,6 +1542,19 @@ private:
                 float y = cy + i * 5.0f;
                 r.dl->AddLine(ImVec2(cx - w * 0.5f, y), ImVec2(cx + w * 0.5f, y), icon_col, 1.5f);
             }
+        }
+        ImGui::SameLine();
+
+        { // M-C2: "open file" button (folder glyph: tab + body, same hollow-rect visual weight
+          // as the maximize/fullscreen icons below) -- records open_dialog, drained by Python's
+          // take_ui_intents() which responds by calling the blocking pick_open_file() dialog
+          // (see UiIntents' header comment; present keeps showing the current video meanwhile).
+            IconButtonResult r = icon_button("##open_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) record_open_dialog();
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            r.dl->AddRect(ImVec2(cx - 7.0f, cy - 3.0f), ImVec2(cx + 7.0f, cy + 6.0f), icon_col, 1.0f, 0, 1.5f);
+            r.dl->AddRect(ImVec2(cx - 7.0f, cy - 6.0f), ImVec2(cx - 1.0f, cy - 3.0f), icon_col, 1.0f, 0, 1.5f);
         }
         ImGui::SameLine();
         ImGui::TextUnformatted(basename_of(video_path_).c_str());
@@ -1945,6 +2102,7 @@ private:
         UINT last_actual_slot = 0;
         uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
         int64_t tick_idx = 0;
+        uint64_t local_pace_epoch = pace_epoch_.load(std::memory_order_acquire);
 
         {
             std::lock_guard<std::mutex> lk(trace_mutex_);
@@ -1957,6 +2115,25 @@ private:
             // Pacing engine: fixed cadence at fps_, independent of play/pause/seek state so
             // this thread never busy-spins and never needs tearing down/rebuilding across
             // transport changes.
+            //
+            // M-C2 fix: fps_ is per-session and CHANGES on reopen() (e.g. 4K60 -> 1080p30) and
+            // on the first open() (default 60.0 -> the file's real fps). The formula below is
+            // pace_origin_qpc_ + tick_idx/fps_, and tick_idx accumulates over the WHOLE present-
+            // thread lifetime -- so a bare fps_ change with origin/tick_idx untouched makes the
+            // next target_qpc jump seconds into the future (fps_ dropped) or the past (fps_
+            // rose), freezing or bursting present until wall-clock realigns (observed: multi-
+            // second present freeze on every reopen that lowers fps, even with no AI running).
+            // open_session() bumps pace_epoch_ (release) right after assigning the new fps_;
+            // this thread -- the SOLE writer of pace_origin_qpc_/tick_idx -- re-anchors here on
+            // observing the bump: origin := now, tick_idx := 0, so the cadence re-baselines
+            // cleanly at the new fps_. Fires exactly once per open_session() (play/pause/seek
+            // never touch pace_epoch_), so steady-state cadence is unchanged.
+            uint64_t pe = pace_epoch_.load(std::memory_order_acquire);
+            if (pe != local_pace_epoch) {
+                local_pace_epoch = pe;
+                QueryPerformanceCounter(&pace_origin_qpc_);
+                tick_idx = 0;
+            }
             ++tick_idx;
             LARGE_INTEGER target_qpc;
             target_qpc.QuadPart = pace_origin_qpc_.QuadPart +
@@ -1991,9 +2168,19 @@ private:
             if (!session_active_.load(std::memory_order_relaxed)) {
                 frame = -1;
                 source = Source::NoSession;
+                // M-C2: committed to the splash branch for this whole iteration (session_active_
+                // was just observed false) -- signal reopen()'s spin-wait that draw_and_present()
+                // cannot be in flight anymore (see reopen()'s header comment for the full
+                // argument). release pairs with reopen()'s acquire load.
+                present_in_splash_.store(true, std::memory_order_release);
                 std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
                 draw_splash();
             } else {
+                // M-C2: committed to the normal draw_and_present() branch for this whole
+                // iteration (session_active_ was just observed true) -- clear the splash flag
+                // before doing any real work below, per the task brief ("在读 session_active_ 之
+                // 后、绘制之前"). relaxed: nothing spin-waits for this to become false.
+                present_in_splash_.store(false, std::memory_order_relaxed);
                 if (playing_.load(std::memory_order_relaxed)) {
                     LARGE_INTEGER now;
                     QueryPerformanceCounter(&now);
@@ -2680,6 +2867,13 @@ private:
     // down -- present_loop() branches on this to draw a "no session" splash instead of picking/
     // presenting real frames (draw_splash() vs. draw_and_present()); see present_loop().
     std::atomic<bool> session_active_{ false };
+    // M-C2: present-detach handshake flag, written ONLY by present_loop() (the reader is
+    // reopen()'s spin-wait). true means present_loop() has committed to this iteration's
+    // draw_splash() branch (session_active_ was observed false) -- i.e. it is NOT mid- or about
+    // to run draw_and_present(), and won't again until session_active_ flips back true. false
+    // means the opposite: present_loop() has committed to (or is about to run) draw_and_present()
+    // for this iteration. See present_loop()'s two store sites and reopen()'s header comment.
+    std::atomic<bool> present_in_splash_{ false };
 
     // ---- audio (spike, additive) -- slave to the master clock below (present_head_frame_/
     // playing_/anchor_frame_/anchor_qpc_ticks_/fps_/freq_), never the reverse; see audio_loop()
@@ -2699,6 +2893,10 @@ private:
 
     LARGE_INTEGER pace_origin_qpc_{};
     LARGE_INTEGER freq_{};
+    // M-C2: bumped by open_session() whenever fps_ changes (release); present_loop() (the sole
+    // owner of pace_origin_qpc_/its tick_idx) observes the bump (acquire) and re-anchors its
+    // pacing baseline to the new fps_. See present_loop()'s pacing comment for the full why.
+    std::atomic<uint64_t> pace_epoch_{ 0 };
     std::atomic<int64_t> present_head_frame_{ 0 };
 
     // Transport/seek state (see play()/pause()/seek()/present_loop()).
@@ -2784,6 +2982,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN) return 0; // swallow Alt+Enter, no exclusive fullscreen here
         break;
+    case WM_DROPFILES: {
+        // M-C2: file dropped on the window -- record its path as an open intent (drained by
+        // Python's take_ui_intents(), same channel/discipline as record_seek() etc., see
+        // UiIntents' header comment). Only the FIRST dropped file is used (DragQueryFileW index
+        // 0); multi-file drop is out of scope here.
+        HDROP hdrop = reinterpret_cast<HDROP>(wp);
+        if (self) {
+            wchar_t wide_path[MAX_PATH] = {};
+            if (DragQueryFileW(hdrop, 0, wide_path, ARRAYSIZE(wide_path)) > 0) {
+                // Same WideCharToMultiByte(CP_UTF8) conversion as pick_open_file() -- guards
+                // against a CJK path silently mis-encoding through the process's ANSI codepage.
+                int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, nullptr, 0, nullptr, nullptr);
+                if (utf8_len > 0) {
+                    std::string utf8_path(static_cast<size_t>(utf8_len - 1), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, utf8_path.data(), utf8_len, nullptr, nullptr);
+                    self->record_open_path(utf8_path);
+                }
+            }
+        }
+        DragFinish(hdrop);
+        return 0;
+    }
     default:
         break;
     }
@@ -2801,6 +3021,7 @@ PYBIND11_MODULE(sumu_core, m)
             py::arg("width_hint") = 1280, py::arg("height_hint") = 720, py::arg("maximized") = false)
         .def("pick_open_file", &Player::pick_open_file) // blocking Win32 dialog, call before open()
         .def("open", &Player::open, py::arg("path"))
+        .def("reopen", &Player::reopen, py::arg("path")) // M-C2: runtime file swap, present never stops
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)
