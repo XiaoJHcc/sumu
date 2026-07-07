@@ -112,17 +112,38 @@ Write-Host "== [5/5] smoke testing dist\sumu\sumu.exe ==" -ForegroundColor Cyan
 $videoPath = Join-Path $RepoRoot "test_video.mp4"
 $stderrLog = Join-Path $RepoRoot "build_smoke_stderr.log"
 $stdoutLog = Join-Path $RepoRoot "build_smoke_stdout.log"
-Remove-Item -Path $stderrLog, $stdoutLog -ErrorAction SilentlyContinue
+# The frozen bundle is windowed (console=False) and scripts/sumu_main.py reassigns
+# sys.stdout/sys.stderr to <exe dir>/sumu.log, so the app's own markers (== env ==,
+# == load_models ==, == player.open ==) land in sumu.log -- NOT in the OS-level
+# $stderrLog handle we redirect below (that only catches pre-redirect native/C-level
+# output, e.g. a torch DLL crash). We therefore key pass/fail off sumu.log, keeping
+# $stderrLog only as a supplementary native-crash sink. Remove a stale sumu.log first
+# (the app opens it "w"/truncate, but a failed launch might leave last run's markers).
+$sumuLog = Join-Path $distDir "sumu.log"
+Remove-Item -Path $stderrLog, $stdoutLog, $sumuLog -ErrorAction SilentlyContinue
 
-# The player window has no auto-timeout, so we poll its stderr for the
-# "reached real playback" marker (== player.open ==) and kill it once seen.
-# We poll (up to $SmokeTimeoutSec) rather than sleeping a fixed interval: the
-# FIRST cold run of a ~10GB onedir bundle loads torch's CUDA DLLs off cold disk
-# and can take well over 25s just to reach `import torch`, whereas a warm run
-# gets there in <10s -- a fixed short sleep false-fails the cold case. We also
-# bail early if the process dies (native DLL crash on `import torch` leaves no
-# Python traceback, so an early exit is itself a failure signal).
-$SmokeTimeoutSec = 120
+# Combined marker source: the app's redirected sumu.log plus the OS-level native sink.
+function Get-SmokeLog {
+    $a = if (Test-Path $sumuLog)   { Get-Content $sumuLog   -Raw -ErrorAction SilentlyContinue } else { "" }
+    $b = if (Test-Path $stderrLog) { Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue } else { "" }
+    return "$a`n$b"
+}
+
+# The player window has no auto-timeout, so we poll sumu.log and kill it once
+# BOTH markers are present: == load_models == (warmup thread finished) AND
+# == player.open == (playback started). Warmup is now backgrounded (sumu.app),
+# so these two happen concurrently and in EITHER order -- player.open() no longer
+# waits on the models, so it usually prints first; breaking on player.open alone
+# (the old behavior) would kill the process before load_models had a chance to
+# write, false-failing the $hasLoad check below. We poll (up to $SmokeTimeoutSec)
+# rather than sleeping a fixed interval: the FIRST cold run of a ~10GB onedir
+# bundle loads torch's CUDA DLLs off cold disk and can take well over 25s just to
+# reach `import torch`, whereas a warm run gets there in <10s -- a fixed short
+# sleep false-fails the cold case. TRT compile on top can push load_models to
+# well over a minute cold, hence the generous timeout. We also bail early if the
+# process dies (native DLL crash on `import torch` leaves no Python traceback, so
+# an early exit is itself a failure signal).
+$SmokeTimeoutSec = 180
 $proc = Start-Process -FilePath (Join-Path $distDir "sumu.exe") `
     -ArgumentList $videoPath `
     -WorkingDirectory $distDir `
@@ -134,8 +155,8 @@ $exitedEarly = $false
 for ($i = 0; $i -lt $SmokeTimeoutSec; $i++) {
     Start-Sleep -Seconds 1
     if ($proc.HasExited) { $exitedEarly = $true; break }
-    $log = if (Test-Path $stderrLog) { Get-Content $stderrLog -Raw -ErrorAction SilentlyContinue } else { "" }
-    if ($log -match "== player\.open ==") { break }
+    $log = Get-SmokeLog
+    if (($log -match "== load_models ==") -and ($log -match "== player\.open ==")) { break }
     if ($log -match "Traceback \(most recent call last\)") { break }
 }
 
@@ -144,7 +165,7 @@ if (-not $proc.HasExited) {
 }
 
 Start-Sleep -Seconds 1
-$log = if (Test-Path $stderrLog) { Get-Content $stderrLog -Raw } else { "" }
+$log = Get-SmokeLog
 
 $hasEnv = $log -match "== env == torch"
 $hasLoad = $log -match "== load_models =="
@@ -161,7 +182,13 @@ if ($hasEnv -and $hasLoad -and $hasOpen -and (-not $hasTraceback)) {
     }
 }
 
-Write-Host "---- last 30 lines of $stderrLog ----"
+Write-Host "---- last 30 lines of $sumuLog (app markers) ----"
+if (Test-Path $sumuLog) {
+    Get-Content $sumuLog -Tail 30
+} else {
+    Write-Host "(no sumu.log produced -- app may have crashed before redirect)"
+}
+Write-Host "---- last 30 lines of $stderrLog (native/C-level sink) ----"
 if (Test-Path $stderrLog) {
     Get-Content $stderrLog -Tail 30
 } else {
