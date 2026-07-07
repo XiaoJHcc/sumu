@@ -132,16 +132,18 @@ void check_cu(CUresult res, const char* what)
     }
 }
 
-// ---- global Win32 state (one window per process, fine for this player) --------------------
-bool g_quit = false;
-
 // M3: WndProc's DEFINITION now lives in a reopened instance of this same anonymous namespace,
 // placed after class Player's closing brace -- it needs a COMPLETE Player type to route input
 // to a specific instance (GWLP_USERDATA -> Player*, see create_window()) and to call its
-// record_toggle_play()/record_seek()/ui_ready() methods. This forward declaration is all
-// create_window()'s WNDCLASSEXA::lpfnWndProc assignment needs. Unnamed namespaces reopened
-// later in the same translation unit are the SAME namespace, so g_quit above stays visible
-// there unqualified, and this declaration and that definition refer to the same entity.
+// record_toggle_play()/record_seek()/ui_ready()/set_quit() methods. This forward declaration is
+// all create_window()'s WNDCLASSEXA::lpfnWndProc assignment needs. Unnamed namespaces reopened
+// later in the same translation unit are the SAME namespace, so this declaration and that
+// definition refer to the same entity.
+//
+// M-C1: quit used to be a file-level global (bool g_quit), silently shared across every Player
+// instance in the process -- two Players, one accidentally quitting the other. It is now a
+// per-instance std::atomic<bool> quit_ member (see Player::set_quit()/should_quit()), reached
+// here via the routed `self` (GWLP_USERDATA), same as every other per-instance WndProc action.
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 double pctile(std::vector<double>& sorted_ms, double q)
@@ -181,6 +183,8 @@ enum class Source : int8_t {
     AiFresh = 1,
     PassthroughStale = 2, // re-presented because neither map had this exact frame_num
     AiStale = 3,
+    NoSession = 4, // M-C1: present ticked but no session is open yet (or was just closed) --
+                   // draw_splash() ran instead of draw_and_present(), see present_loop().
 };
 
 bool is_ai(Source s) { return s == Source::AiFresh || s == Source::AiStale; }
@@ -334,10 +338,25 @@ public:
         create_window(width_hint, height_hint, maximized);
         create_device_and_swapchain();
         create_shader_pipeline();
-        ui_init(); // present thread not started yet (starts in open()) -- no context
-                   // contention for this one-time ImGui/backend warmup.
+        ui_init(); // present thread not started yet (starts below) -- no context contention
+                   // for this one-time ImGui/backend warmup.
         init_cuda_driver(); // device-independent-of-video-size CUDA setup only; landing
-                             // texture + registration happen in open() once src dims are known.
+                             // texture + registration happen in open_session() once src dims
+                             // are known.
+
+        // M-C1: present_thread_ now starts here (device layer only, no video open yet) instead
+        // of in open()/open_session() -- present_loop()'s splash branch (session_active_ still
+        // false) draws a "loading" splash the whole time Python is loading AI models between
+        // constructing Player and calling open(), instead of the window looking frozen for
+        // that ~10+ second window. freq_/pace_origin_qpc_ are QPC system constants/epoch, not
+        // video-dependent, so establishing them here (once, before present_thread_'s single
+        // long-running tick_idx counter starts advancing) is correct; open_session() must NOT
+        // touch pace_origin_qpc_ again afterward (tick_idx is never reset, so re-stamping the
+        // origin mid-flight would desync the pacing formula against ticks already elapsed).
+        QueryPerformanceFrequency(&freq_);
+        stop_.store(false, std::memory_order_relaxed);
+        QueryPerformanceCounter(&pace_origin_qpc_);
+        present_thread_ = std::thread(&Player::present_loop, this);
     }
 
     ~Player() { close(); }
@@ -347,7 +366,18 @@ public:
     void open(const std::string& video_path)
     {
         if (opened_) throw std::runtime_error("Player.open() called twice on the same Player");
+        open_session(video_path);
+    }
 
+    // M-C1: the actual session-layer setup, split out of open() so open() can stay a thin,
+    // signature-stable compatibility shell (run_player.py/stress_seek_ai.py call it directly).
+    // Does NOT start present_thread_ (the constructor's job now, see above) -- only
+    // decode_thread_/audio_thread_, which are session-scoped. This milestone (M-C1) never
+    // calls this a second time on the same Player (open()'s opened_ guard above still forbids
+    // it) -- runtime reopen is M-C2's job, layered on top of this split without needing to
+    // revisit it.
+    void open_session(const std::string& video_path)
+    {
         video_path_ = video_path; // UI displays basename_of(video_path_) in the top bar
 
         std::string decode_err;
@@ -396,12 +426,14 @@ public:
         pt_tag_.assign(kRingCapacity, -1);
         ai_tag_.assign(kRingCapacity, -1);
 
-        QueryPerformanceFrequency(&freq_);
-
-        // Decode thread starts immediately and races ahead (throttled) of the present head,
-        // which is still -1 (not started) at this point -- the throttle treats a not-yet-
-        // started present head as "0" so decode can still build the initial buffer.
-        stop_.store(false, std::memory_order_relaxed);
+        // Decode thread starts immediately and races ahead (throttled) of the present head.
+        // present_thread_ is already running by this point (started in the constructor, see
+        // above) but present_head_frame_ still sits at its default 0 -- present_loop()'s splash
+        // branch (session_active_ still false right up until the last line of this function)
+        // never touches present_head_frame_ -- so the throttle below simply treats "no real
+        // playback position yet" the same as frame 0, letting decode build its initial buffer.
+        // session_stop_ was left false by close_session()'s own reset (or is still its
+        // default-false on a first open()) -- see decode_loop()/audio_loop()'s exit conditions.
         decode_thread_ = std::thread(&Player::decode_loop, this);
 
         LARGE_INTEGER t0;
@@ -422,44 +454,93 @@ public:
         clock_frame_.store(0, std::memory_order_relaxed);
         present_head_frame_.store(0, std::memory_order_relaxed);
         playing_.store(false, std::memory_order_relaxed);
-        QueryPerformanceCounter(&pace_origin_qpc_);
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         anchor_qpc_ticks_.store(now.QuadPart, std::memory_order_relaxed);
 
-        opened_ = true;
-        present_thread_ = std::thread(&Player::present_loop, this);
         if (has_audio_)
             audio_thread_ = std::thread(&Player::audio_loop, this);
+
+        opened_ = true;
+        // Last step, once every session resource above is fully built: present_loop()'s
+        // splash branch only stops drawing the splash and starts picking/presenting real
+        // frames once this flips true (see present_loop()).
+        session_active_.store(true, std::memory_order_relaxed);
+    }
+
+    // M-C1: joins/tears down only the session-scoped state (decode/audio threads, the D3D11
+    // session textures/SRVs/tags, the session's CUDA registrations, the audio codec ctx, the
+    // decoder itself) -- leaves the device layer (device_/context_/swapchain_/shader pipeline/
+    // ImGui/cu_ctx_) fully intact, since present_thread_ keeps running across this (drawing the
+    // splash again immediately after). Only ever called from close() in this milestone, always
+    // with present_thread_ already joined (see close() below) -- so there is no present-detach
+    // handshake to do here yet; that's an M-C2 concern for a live (running-present) reopen.
+    void close_session()
+    {
+        session_stop_.store(true, std::memory_order_relaxed);
+        if (decode_thread_.joinable()) decode_thread_.join();
+        if (audio_thread_.joinable()) audio_thread_.join();
+        session_stop_.store(false, std::memory_order_relaxed); // reset so a future open_session() starts clean
+
+        if (audio_codec_ctx_) avcodec_free_context(&audio_codec_ctx_);
+
+        // CUDA unregister BEFORE releasing the D3D11 textures they wrap (cu_res_ wraps
+        // landing_tex_; ai_in_cu_res_y_/uv_ wrap ai_in_y_tex_/ai_in_uv_tex_) -- cu_ctx_ itself
+        // is a device-layer resource and stays current/alive here (only close()'s final
+        // teardown below releases it), same ordering the original close() already used.
+        if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
+        if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
+        if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
+        if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
+
+        // Explicit release of session-scoped D3D11 resources (pre-M-C1 these only ever went
+        // away implicitly, via ~Player's ComPtr destructors) -- clears the slate so present_
+        // loop's splash branch never indexes a half-torn-down ring while !session_active_, and
+        // so a future open_session() rebuilds everything from scratch.
+        pt_ring_tex_.Reset();
+        for (auto& srv : pt_srv_y_) srv.Reset();
+        for (auto& srv : pt_srv_uv_) srv.Reset();
+        pt_srv_y_.clear();
+        pt_srv_uv_.clear();
+        pt_tag_.clear();
+
+        ai_ring_tex_.Reset();
+        for (auto& srv : ai_srv_) srv.Reset();
+        ai_srv_.clear();
+        ai_tag_.clear();
+
+        landing_tex_.Reset();
+
+        ai_in_y_tex_.Reset();
+        ai_in_y_rtv_.Reset();
+        ai_in_uv_tex_.Reset();
+        ai_in_uv_rtv_.Reset();
+
+        decoder_.close();
+
+        session_active_.store(false, std::memory_order_relaxed);
     }
 
     void close()
     {
         if (closed_) return;
         closed_ = true;
+        set_quit(); // this Player is on its way out -- keep should_quit() consistent even if
+                    // close() is reached by a path other than WM_DESTROY/ESC (e.g. play.py's
+                    // no-file-selected early exit).
         stop_.store(true, std::memory_order_relaxed);
-        if (decode_thread_.joinable()) decode_thread_.join();
-        if (present_thread_.joinable()) present_thread_.join();
-        // Audio thread (spike, additive): join before decoder_.close() below, since it may
-        // still be calling decoder_.pop_audio_packet() until it observes stop_. Never touches
-        // d3d_mutex_/ready_mutex_/decoder_mutex_, so joining it here is independent of (and
-        // ordered after) the two joins above purely by convention, not by any shared lock.
-        if (audio_thread_.joinable()) audio_thread_.join();
-        if (audio_codec_ctx_) avcodec_free_context(&audio_codec_ctx_);
+        if (present_thread_.joinable()) present_thread_.join(); // barrier: present is now fully
+                                                                  // stopped before anything below
+                                                                  // touches D3D/CUDA state.
+        close_session(); // safe now that present isn't running; also safe to call even if
+                          // open_session() was never called (every member it touches is still
+                          // at its default-empty/null state).
 
-        // Present thread (the only ImGui-touching thread in M1) has now joined -- safe to
-        // tear down ImGui's device objects/context before DestroyWindow below.
+        // Present thread (the only ImGui-touching thread) has now joined -- safe to tear down
+        // ImGui's device objects/context before DestroyWindow below.
         ui_shutdown();
 
-        if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
-        // AI input bridge teardown (additive, Part B) -- mirrors cu_res_'s cleanup above,
-        // must also happen before the primary context itself is released.
-        if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
-        if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
-        if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
         if (cu_ctx_) { cuCtxSetCurrent(nullptr); cuDevicePrimaryCtxRelease(cu_dev_); cu_ctx_ = nullptr; }
-
-        decoder_.close();
 
         if (hwnd_) { DestroyWindow(hwnd_); hwnd_ = nullptr; }
         if (timer_period_set_) { timeEndPeriod(1); timer_period_set_ = false; }
@@ -502,13 +583,14 @@ public:
     {
         MSG msg{};
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { g_quit = true; break; }
+            if (msg.message == WM_QUIT) { set_quit(); break; }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
     }
 
-    bool should_quit() const { return g_quit; }
+    bool should_quit() const { return quit_.load(std::memory_order_relaxed); }
+    void set_quit() { quit_.store(true, std::memory_order_relaxed); }
 
     // ---- transport control -------------------------------------------------------------
 
@@ -943,6 +1025,7 @@ public:
         d["n_ai_stale"] = n_ai_stale_.load(std::memory_order_relaxed);
         d["n_pt_fresh"] = n_pt_fresh_.load(std::memory_order_relaxed);
         d["n_pt_stale"] = n_pt_stale_.load(std::memory_order_relaxed);
+        d["n_no_session"] = n_no_session_.load(std::memory_order_relaxed); // M-C1: splash-phase present ticks
         d["ai_hit_rate"] = ai_hit_rate();
         d["is_playing"] = playing_.load(std::memory_order_relaxed);
         d["current_frame"] = current_frame();
@@ -1225,10 +1308,38 @@ private:
     // scripts/run_player.py).
     void build_ui()
     {
+        // M-C1: no session open yet (or one was just closed) -- the normal top/bottom bars
+        // read session-scoped state (video_path_, frame_count_, seekbar position, ...) that
+        // isn't meaningful yet, so show a loading splash instead.
+        if (!session_active_.load(std::memory_order_relaxed)) {
+            build_splash_overlay();
+            return;
+        }
         float top_bar_h = 0.0f;
         build_top_bar(top_bar_h);
         if (ui_settings_open_) build_settings_panel(top_bar_h);
         build_bottom_bar();
+    }
+
+    // M-C1: centered "loading" text overlay, shown while !session_active_ (see build_ui()'s
+    // branch above and present_loop()'s draw_splash() call). Built the same way as every other
+    // window here -- main thread, inside ui_tick()'s NewFrame()/Render() bracket -- and never
+    // touches transport/session state, only ImGui + io.DisplaySize.
+    void build_splash_overlay()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs;
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::Begin("##sumu_splash", nullptr, flags);
+        const char* text = u8"加载中…";
+        ImVec2 tsize = ImGui::CalcTextSize(text);
+        ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, (io.DisplaySize.y - tsize.y) * 0.5f));
+        ImGui::TextUnformatted(text);
+        ImGui::End();
     }
 
     // M-A: self-drawn icon buttons (top/bottom bar), replacing the M3 ASCII-text ImGui::Button
@@ -1591,9 +1702,9 @@ private:
 
     // M4 hook (not implemented here): scrub thumbnail SRV for a given content frame number, or
     // nullptr if unavailable. M3 always returns nullptr -- a real implementation needs its own
-    // scrub-decode path INSIDE this Player (never a second Player instance: native's g_quit is
-    // a process-global shared across instances, see the file header -- a second instance would
-    // cause accidental quits).
+    // scrub-decode path INSIDE this Player, not a second Player instance sharing this process
+    // (a second window/message loop is its own can of worms regardless of quit_ now being a
+    // per-instance member -- see set_quit()/should_quit()).
     ID3D11ShaderResourceView* get_thumbnail(int64_t frame_num)
     {
         (void)frame_num;
@@ -1775,13 +1886,16 @@ private:
 
     void decode_loop()
     {
-        while (!stop_.load(std::memory_order_relaxed)) {
+        // M-C1: decode_thread_ is session-scoped (join()ed and restarted by close_session()/
+        // open_session() on every reopen), so it must exit on EITHER the whole-Player stop_ OR
+        // the session-only session_stop_ -- present_loop() must keep checking only stop_.
+        while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
             // Throttle: never get more than kDecodeAheadMax frames ahead of the present
             // head, so we never overwrite a ring slot before present has had its one chance
             // to read it. Before the present thread has started, present_head_frame_ is
             // whatever open() initialized it to (0); after a seek it's the seeked frame.
             for (;;) {
-                if (stop_.load(std::memory_order_relaxed)) return;
+                if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
                 int64_t head = present_head_frame_.load(std::memory_order_relaxed);
                 int64_t high = pt_high_water_.load(std::memory_order_relaxed);
                 if (high - head < kDecodeAheadMax) break;
@@ -1793,7 +1907,7 @@ private:
             // frame decoded from the OLD position can never land in the ring after a seek's
             // fresh write to the same slot.
             std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
-            if (stop_.load(std::memory_order_relaxed)) return;
+            if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
 
             DecodedFrame df;
             if (!decoder_.next_frame(df)) {
@@ -1863,49 +1977,65 @@ private:
             }
 
             int64_t frame;
-            if (playing_.load(std::memory_order_relaxed)) {
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-                int64_t aq = anchor_qpc_ticks_.load(std::memory_order_relaxed);
-                int64_t af = anchor_frame_.load(std::memory_order_relaxed);
-                double elapsed_s = static_cast<double>(now.QuadPart - aq) / freq_.QuadPart;
-                int64_t computed = af + static_cast<int64_t>(std::llround(elapsed_s * fps_));
-                if (!just_seeked && computed <= last_frame_local) computed = last_frame_local + 1;
-                frame = computed;
-            } else {
-                // Paused: frozen at anchor_frame_, present thread keeps redrawing it so the
-                // heartbeat (present cadence) never stops even though content doesn't advance.
-                frame = anchor_frame_.load(std::memory_order_relaxed);
-            }
-            last_frame_local = frame;
-            clock_frame_.store(frame, std::memory_order_relaxed);
-            present_head_frame_.store(frame, std::memory_order_relaxed);
-
-            UINT slot = wrap_slot(frame);
             Source source;
-            UINT use_slot;
-            {
-                std::lock_guard<std::mutex> lk(ready_mutex_);
-                if (ai_tag_[slot] == frame) {
-                    source = Source::AiFresh;
-                    use_slot = slot;
-                } else if (pt_tag_[slot] == frame) {
-                    source = Source::PassthroughFresh;
-                    use_slot = slot;
-                } else {
-                    // Neither map has this exact frame number ready. NEVER block -- just
-                    // re-present whatever was actually shown last tick (I2/I9).
-                    source = is_ai(last_actual_source) ? Source::AiStale : Source::PassthroughStale;
-                    use_slot = last_actual_slot;
-                }
-            }
+            UINT use_slot = 0;
 
-            {
-                // Serializes ALL D3D11/CUDA-interop use of the shared context (see file
-                // header). Decode/push threads are the ones who may occasionally wait a
-                // fraction of a frame for this lock, never the reverse.
+            // M-C1: no session open yet (or one was just closed) -- skip frame-picking and
+            // draw_and_present() entirely (every ring/tag/SRV they touch may not exist, or may
+            // be mid-close_session()), draw a splash instead. frame/source/use_slot are hoisted
+            // out of the two branches below so the trailing trace/counting bookkeeping (kept
+            // textually unchanged) is shared by both; frame is recorded as -1, a clear "no real
+            // frame" marker in the trace. present_head_frame_/clock_frame_/last_frame_local are
+            // NOT touched here -- decode_thread_ isn't running while !session_active_ anyway
+            // (see close_session()/open_session()), so there is nothing for them to throttle.
+            if (!session_active_.load(std::memory_order_relaxed)) {
+                frame = -1;
+                source = Source::NoSession;
                 std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-                draw_and_present(source, use_slot);
+                draw_splash();
+            } else {
+                if (playing_.load(std::memory_order_relaxed)) {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    int64_t aq = anchor_qpc_ticks_.load(std::memory_order_relaxed);
+                    int64_t af = anchor_frame_.load(std::memory_order_relaxed);
+                    double elapsed_s = static_cast<double>(now.QuadPart - aq) / freq_.QuadPart;
+                    int64_t computed = af + static_cast<int64_t>(std::llround(elapsed_s * fps_));
+                    if (!just_seeked && computed <= last_frame_local) computed = last_frame_local + 1;
+                    frame = computed;
+                } else {
+                    // Paused: frozen at anchor_frame_, present thread keeps redrawing it so the
+                    // heartbeat (present cadence) never stops even though content doesn't advance.
+                    frame = anchor_frame_.load(std::memory_order_relaxed);
+                }
+                last_frame_local = frame;
+                clock_frame_.store(frame, std::memory_order_relaxed);
+                present_head_frame_.store(frame, std::memory_order_relaxed);
+
+                UINT slot = wrap_slot(frame);
+                {
+                    std::lock_guard<std::mutex> lk(ready_mutex_);
+                    if (ai_tag_[slot] == frame) {
+                        source = Source::AiFresh;
+                        use_slot = slot;
+                    } else if (pt_tag_[slot] == frame) {
+                        source = Source::PassthroughFresh;
+                        use_slot = slot;
+                    } else {
+                        // Neither map has this exact frame number ready. NEVER block -- just
+                        // re-present whatever was actually shown last tick (I2/I9).
+                        source = is_ai(last_actual_source) ? Source::AiStale : Source::PassthroughStale;
+                        use_slot = last_actual_slot;
+                    }
+                }
+
+                {
+                    // Serializes ALL D3D11/CUDA-interop use of the shared context (see file
+                    // header). Decode/push threads are the ones who may occasionally wait a
+                    // fraction of a frame for this lock, never the reverse.
+                    std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+                    draw_and_present(source, use_slot);
+                }
             }
 
             LARGE_INTEGER pres_now;
@@ -1922,6 +2052,7 @@ private:
             case Source::AiStale: n_ai_stale_.fetch_add(1, std::memory_order_relaxed); break;
             case Source::PassthroughFresh: n_pt_fresh_.fetch_add(1, std::memory_order_relaxed); break;
             case Source::PassthroughStale: n_pt_stale_.fetch_add(1, std::memory_order_relaxed); break;
+            case Source::NoSession: n_no_session_.fetch_add(1, std::memory_order_relaxed); break;
             }
 
             if (source == Source::AiFresh || source == Source::PassthroughFresh) {
@@ -1969,6 +2100,27 @@ private:
         // M2: present thread only renders an already-published draw-data snapshot (built on
         // the main thread by ui_tick()) -- see ui_render_drawdata()'s header comment. Called
         // here, after the video Draw(3,0) and before Present(1,0), still inside d3d_mutex_.
+        ui_render_drawdata();
+
+        swapchain_->Present(1, 0);
+    }
+
+    // M-C1: called from present_loop()'s splash branch (see below), already inside d3d_mutex_,
+    // whenever !session_active_ -- draws a plain dark background plus whatever ui_tick()
+    // published (build_splash_overlay()'s "loading" text) instead of draw_and_present()'s video
+    // path. Must NEVER touch any session-scoped resource (pt_ring_tex_/ai_ring_tex_/
+    // landing_tex_/ai_in_*/the decoder) -- only backbuffer_rtv_ (device-layer, alive for the
+    // whole Player lifetime) and ui_render_drawdata() (tolerates an empty/not-yet-published
+    // snapshot, see its own header comment). draw_and_present() itself is left unmodified.
+    void draw_splash()
+    {
+        D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(win_width_), static_cast<float>(win_height_), 0.0f, 1.0f };
+        context_->RSSetViewports(1, &vp);
+        ID3D11RenderTargetView* rtvs[] = { backbuffer_rtv_.Get() };
+        context_->OMSetRenderTargets(1, rtvs, nullptr);
+        const float clear_color[4] = { 0.05f, 0.05f, 0.07f, 1.0f };
+        context_->ClearRenderTargetView(backbuffer_rtv_.Get(), clear_color);
+
         ui_render_drawdata();
 
         swapchain_->Present(1, 0);
@@ -2180,10 +2332,12 @@ private:
         std::vector<uint8_t> resample_buf; // reused scratch, grown as needed
         uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
 
-        while (!stop_.load(std::memory_order_relaxed)) {
+        // M-C1: audio_thread_ is session-scoped (join()ed and restarted by close_session()/
+        // open_session() on every reopen), same as decode_loop() -- see its own M-C1 comment.
+        while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
             DWORD wait_result = WaitForSingleObject(audio_event, 100);
-            if (stop_.load(std::memory_order_relaxed)) break;
-            if (wait_result != WAIT_OBJECT_0) continue; // timeout: re-check stop_ and loop
+            if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) break;
+            if (wait_result != WAIT_OBJECT_0) continue; // timeout: re-check stop_/session_stop_ and loop
 
             bool playing = playing_.load(std::memory_order_relaxed);
 
@@ -2513,6 +2667,19 @@ private:
     std::thread decode_thread_;
     std::thread present_thread_;
     std::atomic<bool> stop_{ false };
+    // M-C1: per-instance quit flag (see set_quit()/should_quit(), and the header comment above
+    // WndProc's forward declaration) -- replaces a file-level global that used to be silently
+    // shared across every Player instance in the process.
+    std::atomic<bool> quit_{ false };
+    // M-C1: session-only stop signal for decode_thread_/audio_thread_, distinct from stop_
+    // (present_thread_'s own, whole-Player-lifetime stop flag -- present_loop() must keep
+    // checking ONLY stop_, never this). Set true by close_session(), then reset back to false
+    // once both threads have joined, so a future open_session() starts clean.
+    std::atomic<bool> session_stop_{ false };
+    // M-C1: true from the last step of open_session() until close_session() begins tearing
+    // down -- present_loop() branches on this to draw a "no session" splash instead of picking/
+    // presenting real frames (draw_splash() vs. draw_and_present()); see present_loop().
+    std::atomic<bool> session_active_{ false };
 
     // ---- audio (spike, additive) -- slave to the master clock below (present_head_frame_/
     // playing_/anchor_frame_/anchor_qpc_ticks_/fps_/freq_), never the reverse; see audio_loop()
@@ -2550,14 +2717,17 @@ private:
     std::atomic<uint64_t> decode_frame_count_{ 0 };
     std::atomic<uint64_t> ai_push_count_{ 0 };
     std::atomic<uint64_t> n_ai_fresh_{ 0 }, n_ai_stale_{ 0 }, n_pt_fresh_{ 0 }, n_pt_stale_{ 0 };
+    // M-C1: counts present ticks that drew the splash (Source::NoSession) -- kept separate from
+    // the fresh/stale counters above (which are lifetime-cumulative "real frame" stats) so a
+    // splash-phase tick never dilutes them.
+    std::atomic<uint64_t> n_no_session_{ 0 };
 };
 
 namespace {
 
 // WndProc's full DEFINITION (declared above, before class Player -- see that declaration's
 // header comment for why it had to move here: it needs a complete Player type). This reopened
-// block is the SAME unnamed namespace as the one earlier in this translation unit, so g_quit
-// remains visible here unqualified.
+// block is the SAME unnamed namespace as the one earlier in this translation unit.
 //
 // ImGui_ImplWin32_WndProcHandler is given first crack at every message (confirmed by reading
 // backends/imgui_impl_win32.cpp: for every keyboard/mouse message it always returns 0/never
@@ -2573,7 +2743,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_DESTROY:
-        g_quit = true;
+        if (self) self->set_quit();
         PostQuitMessage(0);
         return 0;
     case WM_CLOSE:
@@ -2583,7 +2753,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_ESCAPE) {
             // ESC always quits, regardless of ImGui's keyboard-capture state (unchanged M1/M2
             // behavior) -- an escape hatch that must never be swallowed by a focused widget.
-            g_quit = true;
+            if (self) self->set_quit();
             PostQuitMessage(0);
             return 0;
         }

@@ -37,13 +37,24 @@ def main():
             player.close()
             return
 
+    # M-C1: present_thread_ is already running (started in the Player ctor) and draws a "loading"
+    # splash while !session_active_. Publish a splash frame now, THEN do the whole heavy startup
+    # (torch import + build_models + player.open()'s decoder-open/ring-buffer-prime) with the
+    # splash on screen -- session_active_ only flips true at the very end of player.open() below,
+    # so the window shows "加载中…" for the ENTIRE load instead of a blank/frozen window. We build
+    # the AI models BEFORE player.open() deliberately: that keeps the splash covering the slow
+    # model load too, and once open() returns we start the scheduler + play() within ~1s, so the
+    # user goes splash -> real playback with no lingering frozen first frame. A couple of ticks
+    # (not one) so ImGui's first-frame font-atlas build is already done before the load blocks the
+    # main thread (the splash frame present_thread_ keeps redrawing stays "加载中…" throughout).
+    player.pump_messages()
+    player.ui_tick()
+    player.pump_messages()
+    player.ui_tick()
+
     import torch
     from sumu.ai.utils.video_utils import get_video_meta_data
     from sumu.scheduler import Scheduler, SchedulerConfig
-
-    player.open(video)
-    print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
-          f"dims={player.dims()}", file=sys.stderr)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     fp16 = device.type == "cuda"
@@ -54,6 +65,10 @@ def main():
     det_model, res_model, pad_mode = rp.build_models(device, fp16)
     print(f"== load_models == {time.perf_counter()-t_load0:.2f}s pad_mode={pad_mode}",
           file=sys.stderr)
+
+    player.open(video)
+    print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
+          f"dims={player.dims()}", file=sys.stderr)
 
     video_meta = get_video_meta_data(video)
     config = SchedulerConfig()
