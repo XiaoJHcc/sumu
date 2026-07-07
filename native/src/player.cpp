@@ -2511,14 +2511,44 @@ private:
         }
     }
 
+    // Aspect-preserving "fit inside the window" viewport (letterbox/pillarbox): scales the
+    // video's native src_width_ x src_height_ by the largest factor that still fits both window
+    // dimensions, centered -- the leftover is filled with black bars by the ClearRenderTargetView
+    // in the draw paths below. The VS emits a full-NDC (-1..1) fullscreen triangle, so shrinking
+    // the viewport just scales+centers that triangle into this sub-rect while UVs still span the
+    // whole frame 0..1 -- no vertex/UV/shader change needed. Degenerate dims (pre-open / a 0-size
+    // window mid-resize) fall back to the full window so we never divide by zero or emit a
+    // zero-area viewport. Assumes square pixels (both sumu test videos + typical content); truly
+    // anamorphic sources would need the display aspect ratio here instead of coded dims.
+    D3D11_VIEWPORT fit_viewport() const
+    {
+        float sw = static_cast<float>(src_width_);
+        float sh = static_cast<float>(src_height_);
+        float ww = static_cast<float>(win_width_);
+        float wh = static_cast<float>(win_height_);
+        if (sw <= 0.0f || sh <= 0.0f || ww <= 0.0f || wh <= 0.0f)
+            return D3D11_VIEWPORT{ 0.0f, 0.0f, ww, wh, 0.0f, 1.0f };
+        float scale = (ww / sw < wh / sh) ? (ww / sw) : (wh / sh);
+        float dw = sw * scale;
+        float dh = sh * scale;
+        return D3D11_VIEWPORT{ (ww - dw) * 0.5f, (wh - dh) * 0.5f, dw, dh, 0.0f, 1.0f };
+    }
+
     void draw_and_present(Source source, UINT slot)
     {
         context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 
-        D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(win_width_), static_cast<float>(win_height_), 0.0f, 1.0f };
-        context_->RSSetViewports(1, &vp);
         ID3D11RenderTargetView* rtvs[] = { backbuffer_rtv_.Get() };
         context_->OMSetRenderTargets(1, rtvs, nullptr);
+        // Letterbox: clear the whole backbuffer to black first (the bars), then draw the video
+        // into the aspect-fit sub-viewport. Previously this drew straight into a full-window
+        // viewport, which stretched the video to the window's aspect ratio (non-uniform scale on
+        // resize). Clearing is cheap and now mandatory since the video no longer covers every
+        // pixel of the backbuffer.
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        context_->ClearRenderTargetView(backbuffer_rtv_.Get(), black);
+        D3D11_VIEWPORT vp = fit_viewport();
+        context_->RSSetViewports(1, &vp);
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context_->VSSetShader(vs_.Get(), nullptr, 0);
 
@@ -2570,7 +2600,10 @@ private:
     {
         context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 
-        D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(win_width_), static_cast<float>(win_height_), 0.0f, 1.0f };
+        // Same aspect-fit viewport as draw_and_present() -- the A/B split + divider are computed
+        // in backbuffer-pixel space WITHIN this fit rect below (not full-window), so both halves
+        // stay in the video's native aspect and the letterbox bars match the normal path.
+        D3D11_VIEWPORT vp = fit_viewport();
         context_->RSSetViewports(1, &vp);
         ID3D11RenderTargetView* rtvs[] = { backbuffer_rtv_.Get() };
         context_->OMSetRenderTargets(1, rtvs, nullptr);
@@ -2591,14 +2624,21 @@ private:
         struct SliceCB { UINT arraySlice; UINT pad[3]; };
         D3D11_MAPPED_SUBRESOURCE mapped;
 
-        UINT half = win_width_ / 2;
-        UINT left_end = (half > 0) ? half - 1 : 0;   // left scissor stops 1px short of center
-        UINT right_start = half + 1;                  // right scissor starts 1px past center
-                                                        // -- the 2px gap [left_end, right_start)
-                                                        // is the divider (see header comment).
+        // Split geometry is in backbuffer-pixel space inside the fit viewport (vp), not the whole
+        // window: center at vp.TopLeftX + vp.Width/2, halves clipped to the fit rect vertically so
+        // the letterbox bars above/below (and the pillarbox bars left/right) stay black.
+        LONG vx = static_cast<LONG>(vp.TopLeftX);
+        LONG vy = static_cast<LONG>(vp.TopLeftY);
+        LONG vw = static_cast<LONG>(vp.Width);
+        LONG vh = static_cast<LONG>(vp.Height);
+        LONG center = vx + vw / 2;
+        LONG left_end = (vw > 2) ? center - 1 : center;   // left scissor stops 1px short of center
+        LONG right_start = center + 1;                     // right scissor starts 1px past center
+                                                            // -- the 2px gap [left_end, right_start)
+                                                            // is the divider (see header comment).
 
         // Left half: passthrough (original).
-        D3D11_RECT left_rect{ 0, 0, static_cast<LONG>(left_end), static_cast<LONG>(win_height_) };
+        D3D11_RECT left_rect{ vx, vy, left_end, vy + vh };
         context_->RSSetScissorRects(1, &left_rect);
         if (SUCCEEDED(context_->Map(slice_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             SliceCB cb{ pt_slot, {0, 0, 0} };
@@ -2613,7 +2653,7 @@ private:
 
         // Right half: AI (de-mosaic), or passthrough again if no AI frame has ever landed yet
         // (ai_is_ai == false, see present_loop()'s source-pick block).
-        D3D11_RECT right_rect{ static_cast<LONG>(right_start), 0, static_cast<LONG>(win_width_), static_cast<LONG>(win_height_) };
+        D3D11_RECT right_rect{ right_start, vy, vx + vw, vy + vh };
         context_->RSSetScissorRects(1, &right_rect);
         if (SUCCEEDED(context_->Map(slice_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             SliceCB cb{ ai_slot, {0, 0, 0} };
