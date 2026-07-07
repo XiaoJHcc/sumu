@@ -114,7 +114,9 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,  # windowed: no cmd black window for the daily-use bundle. stdout/stderr
+                    # are redirected to <exe dir>/sumu.log by scripts/sumu_main.py so a
+                    # startup/warmup failure is still diagnosable instead of a silent exit.
     disable_windowed_traceback=False,
 )
 
