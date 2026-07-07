@@ -40,6 +40,14 @@ class _WarmupState:
         self.ready = False
         self.models = None
         self.error = None
+        # The torch-heavy orchestration imports (Scheduler/SchedulerConfig, get_video_meta_data)
+        # are done ON this worker thread too -- see _warmup_worker -- and handed back here so the
+        # MAIN thread never pays their import cost (that cost is the ~3s startup black-window: a
+        # main-thread `from sumu.scheduler import ...` pulls in torch synchronously before the
+        # message loop can pump). Consumed only once ready is True, at scheduler-build time.
+        self.sched_cls = None   # Scheduler
+        self.cfg_cls = None     # SchedulerConfig
+        self.meta_fn = None     # get_video_meta_data
 
 
 def _warmup_worker(state: "_WarmupState") -> None:
@@ -61,8 +69,18 @@ def _warmup_worker(state: "_WarmupState") -> None:
         print(f"== load_models == {time.perf_counter()-t_load0:.2f}s pad_mode={pad_mode}",
               file=sys.stderr)
 
+        # Import the torch-heavy orchestration modules here too, off the main thread. torch is
+        # already imported above so these are effectively free now (module cache hit), but doing
+        # them on the main thread at startup is exactly what caused the ~3s black window -- so
+        # they stay here and the classes/fn are handed back via state (see _WarmupState).
+        from sumu.scheduler import Scheduler, SchedulerConfig
+        from sumu.ai.utils.video_utils import get_video_meta_data
+
         with state.lock:
             state.models = (det_model, res_model, pad_mode)
+            state.sched_cls = Scheduler
+            state.cfg_cls = SchedulerConfig
+            state.meta_fn = get_video_meta_data
             state.ready = True
     except Exception as e:  # noqa: BLE001 -- warmup failure must never crash the player
         print(f"== warmup failed == {e!r}", file=sys.stderr)
@@ -91,8 +109,10 @@ def main():
     warmup = _WarmupState()
     threading.Thread(target=_warmup_worker, args=(warmup,), name="sumu-warmup", daemon=True).start()
 
-    from sumu.ai.utils.video_utils import get_video_meta_data
-    from sumu.scheduler import Scheduler, SchedulerConfig
+    # NOTE: no torch-touching imports on this (main) thread -- Scheduler/SchedulerConfig and
+    # get_video_meta_data are imported on the warmup worker and consumed post-warmup only (they
+    # pull in torch, and a main-thread import here blocks the message loop for ~3s = the startup
+    # black window). See _warmup_worker / _WarmupState.
 
     # No more startup pick_open_file() -- an unopened window shows the native
     # build_open_prompt_overlay() (drop-file / "打开文件" button) instead. A video given on the
@@ -103,7 +123,11 @@ def main():
     opened = False
     current_path = None
     video_meta = None
-    config = SchedulerConfig()
+    # Committed config values as plain ints (defaults mirror SchedulerConfig's clip_length /
+    # max_regions_per_frame). A real SchedulerConfig is only built at scheduler-build time, once
+    # warmup has handed the class over -- so nothing here forces the torch import onto startup.
+    cfg_clip_length = 30
+    cfg_max_regions = 1
     scheduler = None
     det_model = res_model = pad_mode = None
 
@@ -112,14 +136,16 @@ def main():
         dependency), so this starts original/passthrough playback immediately -- the Scheduler
         is deliberately NOT built here, only once warmup finishes (see the main loop's
         "延迟建 scheduler" step below)."""
-        nonlocal opened, current_path, video_meta
+        nonlocal opened, current_path
         player.open(path)
         print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
               f"dims={player.dims()}", file=sys.stderr)
         opened = True
         current_path = path
         settings.push_recent(current_path)
-        video_meta = get_video_meta_data(path)
+        # video_meta is NOT computed here (get_video_meta_data lives on the warmup worker and may
+        # not be handed over yet -- the user can open a file mid-warmup). It's computed lazily in
+        # the "延迟建 scheduler" step below, which only runs post-warmup anyway.
         player.play()
 
     def do_reopen(path):
@@ -128,7 +154,7 @@ def main():
         present_thread_/the window. The scheduler (if any -- warmup may still be in flight) is
         torn down and rebuilt against the new file's video_meta once we get back to the "延迟建
         scheduler" step below."""
-        nonlocal scheduler, video_meta, current_path
+        nonlocal scheduler, current_path
         settings.set_position(current_path, player.current_frame())
         if scheduler is not None:
             scheduler.stop()
@@ -136,7 +162,8 @@ def main():
         new_frame_count = player.reopen(path)
         print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
               file=sys.stderr)
-        video_meta = get_video_meta_data(path)
+        # video_meta recomputed lazily at scheduler-build time (see do_open's note) -- tearing the
+        # scheduler down above forces the build step below to re-run against the new file.
         current_path = path
         settings.push_recent(current_path)
         player.play()  # open_session() starts paused; a freshly reopened file auto-plays
@@ -164,6 +191,9 @@ def main():
                 warm_ready = warmup.ready
                 warm_models = warmup.models
                 warm_error = warmup.error
+                warm_sched_cls = warmup.sched_cls
+                warm_sched_cfg_cls = warmup.cfg_cls
+                warm_meta_fn = warmup.meta_fn
 
             if scheduler is not None:
                 status_text = ""
@@ -175,7 +205,7 @@ def main():
                 status_text = "正在预热中…"
             player.set_status_text(status_text)
 
-            player.set_ui_config(config.clip_length, config.max_regions_per_frame)
+            player.set_ui_config(cfg_clip_length, cfg_max_regions)
             player.ui_tick()
 
             intents = player.take_ui_intents()
@@ -196,12 +226,17 @@ def main():
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
             if (clip_length is not None or max_regions is not None) and scheduler is not None:
+                # scheduler is not None => warmup already succeeded, so warm_sched_cls/cfg_cls are
+                # set (captured in the build step below). Rebuild against a fresh SchedulerConfig
+                # carrying the updated knobs; video_meta is unchanged (same open file).
                 scheduler.stop()
                 if clip_length is not None:
-                    config.clip_length = clip_length
+                    cfg_clip_length = clip_length
                 if max_regions is not None:
-                    config.max_regions_per_frame = max_regions
-                scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
+                    cfg_max_regions = max_regions
+                config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
+                                            max_regions_per_frame=cfg_max_regions)
+                scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
 
             path = None
@@ -226,7 +261,12 @@ def main():
             # after either of those.
             if opened and warm_ready and scheduler is None and warm_error is None:
                 det_model, res_model, pad_mode = warm_models
-                scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
+                # Lazy, off the startup path: compute video_meta now (get_video_meta_data came from
+                # the warmup worker) and build the config from the committed int knobs.
+                video_meta = warm_meta_fn(current_path)
+                config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
+                                            max_regions_per_frame=cfg_max_regions)
+                scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
                 maybe_resume(current_path)
 
