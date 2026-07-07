@@ -104,11 +104,23 @@ public:
     bool have_first_pts() const { return have_first_pts_; }
 
     // Pop one queued audio packet (FIFO order) into `dst` (caller-owned AVPacket, typically
-    // reused across calls -- av_packet_move_ref resets `dst` first). Returns false if the
-    // queue is currently empty (dst left untouched). Thread-safe: this is the ONLY state
-    // shared between the decode thread (pump_one_raw_frame(), the producer) and Player's
-    // audio thread (the sole consumer) -- present_loop() never calls this.
-    bool pop_audio_packet(AVPacket* dst);
+    // reused across calls -- av_packet_move_ref resets `dst` first) and its associated
+    // loop_offset (the decoder's loop_offset_seconds_ at the moment this packet was queued --
+    // see pump_one_raw_frame()/AudioPacketEntry below), written to `loop_offset_out`. Returns
+    // false if the queue is currently empty (dst/loop_offset_out left untouched). Thread-safe:
+    // this is the ONLY state shared between the decode thread (pump_one_raw_frame(), the
+    // producer) and Player's audio thread (the sole consumer) -- present_loop() never calls
+    // this.
+    bool pop_audio_packet(AVPacket* dst, double& loop_offset_out);
+
+    // Seek coordination (additive): discards every audio packet currently queued, WITHOUT
+    // touching fmt_ctx_/codec_ctx_ lifetime (mirrors seek_to_frame()'s own I6 stance). Callers
+    // (Player::seek()) must call this under decoder_mutex_ BEFORE seek_to_frame() -- seek_to_
+    // frame()'s own forward-decode-to-target loop (same thread, same lock) may itself push
+    // fresh, already-correct-for-the-new-position audio packets via pump_one_raw_frame(); this
+    // method only needs to clear whatever stale, pre-seek packets decode_loop() had queued
+    // before the seek started.
+    void flush_audio_queue();
 
     // Best-effort queue depth, for the audio thread's per-second drift/health log only (never
     // used for control flow) -- see player.cpp's audio_loop().
@@ -155,12 +167,22 @@ private:
     // ---- audio (spike, additive) -----------------------------------------------------------
     int audio_stream_idx_ = -1; // -1 == no audio stream (legitimate, silent)
 
+    // One queued audio packet plus the loop_offset_seconds_ that was in effect (decode thread,
+    // pump_one_raw_frame()) the moment it was read off fmt_ctx_ -- needed so the audio thread
+    // can compute audio_s = loop_offset + (raw_pts - first_pts), the SAME formula next_frame()
+    // uses for video's pts_seconds, so audio stays in sync with video across an EOF loop wrap
+    // (loop_offset_seconds_ only changes on those wraps, never on a seek -- see seek_to_frame()).
+    struct AudioPacketEntry {
+        AVPacket* pkt;
+        double loop_offset;
+    };
+
     // Bounded so a slow/stalled audio consumer can never grow this without limit: 512 packets
     // is far more than the ~4s of audio headroom this needs even for small audio frames (e.g.
     // ~10.9s at a typical 1024-sample/48kHz AAC frame), so steady state should never trip the
     // drop path below -- if it does, that's the signal (see audio_pkt_dropped_).
     static constexpr size_t kAudioQueueMaxPackets = 512;
     mutable std::mutex audio_pkt_mutex_;
-    std::deque<AVPacket*> audio_pkt_queue_; // guarded by audio_pkt_mutex_
+    std::deque<AudioPacketEntry> audio_pkt_queue_; // guarded by audio_pkt_mutex_
     uint64_t audio_pkt_dropped_ = 0;        // guarded by audio_pkt_mutex_; oldest-drop counter
 };

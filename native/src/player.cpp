@@ -538,6 +538,18 @@ public:
     // synchronization needed -- set once in open(), never changed afterward.
     bool has_audio() const { return has_audio_; }
 
+    // ---- audio: volume/mute (additive) -- pure native audio state, deliberately NOT routed
+    // through UiIntents/scheduler (see task brief: this needs no scheduler coordination, unlike
+    // seek/transport/config). Writers are the bottom-bar slider/mute icon and WndProc's
+    // Up/Down/M keys (both main thread); reader is audio_loop()'s own thread, which applies the
+    // resulting gain to samples right before handing them to WASAPI. Plain atomics, no lock
+    // needed on either side.
+    void set_volume(float v) { volume_.store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed); }
+    float get_volume() const { return volume_.load(std::memory_order_relaxed); }
+    void set_muted(bool m) { muted_.store(m, std::memory_order_relaxed); }
+    void toggle_mute() { muted_.store(!muted_.load(std::memory_order_relaxed), std::memory_order_relaxed); }
+    bool is_muted() const { return muted_.load(std::memory_order_relaxed); }
+
     // ---- UI (M2): main thread only -- NewFrame/build/Render/CloneOutput, publish snapshot ---
     //
     // Called once per Python-driven tick (pybind's ui_tick()). Never touches d3d_mutex_ (see
@@ -630,6 +642,15 @@ public:
         // it ready" one atomic unit with respect to decode_loop()'s own "decode one frame,
         // copy it, tag it" unit -- see the file header for the race this closes.
         std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
+
+        // Audio (spike->M-B, additive): discard whatever pre-seek audio packets decode_loop()
+        // had queued, BEFORE seek_to_frame()'s own forward-decode-to-target loop (below, same
+        // thread, same decoder_lock) has a chance to push fresh packets for the new position --
+        // ordering matters here (flush first, then seek_to_frame), or we'd wipe out the very
+        // packets we just decoded. audio_loop() (a different thread, never touches
+        // decoder_mutex_) notices this seek happened via seek_version_ below and does its own
+        // held_frame/fifo/codec-buffer reset independently -- see audio_loop()'s seek handling.
+        decoder_.flush_audio_queue();
 
         DecodedFrame df;
         std::string err;
@@ -1393,7 +1414,16 @@ private:
         // Reserve space for the trailing total-duration label so the track sizes itself first.
         std::string total_str = format_mmss(static_cast<double>(std::max<int64_t>(fc - 1, 0)) / fpsv);
         float total_w = ImGui::CalcTextSize(total_str.c_str()).x;
-        float track_w = ImGui::GetContentRegionAvail().x - total_w - ImGui::GetStyle().ItemSpacing.x;
+        // Volume/mute controls (additive): shown only when has_audio(), trailing the
+        // total-duration label -- reserve their width the same way total_w already reserves
+        // room for the duration text, so the seekbar track shrinks to make room rather than
+        // being overdrawn.
+        const float vol_icon_w = 28.0f;
+        const float vol_slider_w = 70.0f;
+        float vol_ctrl_w = has_audio()
+            ? (ImGui::GetStyle().ItemSpacing.x + vol_icon_w + ImGui::GetStyle().ItemSpacing.x + vol_slider_w)
+            : 0.0f;
+        float track_w = ImGui::GetContentRegionAvail().x - total_w - vol_ctrl_w - ImGui::GetStyle().ItemSpacing.x;
         if (track_w < 10.0f) track_w = 10.0f;
         const float track_h = 18.0f;
 
@@ -1432,6 +1462,60 @@ private:
 
         ImGui::SameLine();
         ImGui::TextUnformatted(total_str.c_str());
+
+        if (has_audio()) {
+            ImGui::SameLine();
+            { // mute icon: speaker body (small filled rect) + flare (a trapezoid, not a plain
+              // triangle -- AddTriangleFilled can't produce a correct cone shape here) with
+              // sound-wave arcs when unmuted, or a diagonal slash across the whole glyph when
+              // muted. Click toggles native mute state directly (no UiIntents -- see
+              // set_muted()'s header comment), same style language as the top-bar icons above.
+                IconButtonResult r = icon_button("##mute_btn", ImVec2(vol_icon_w, track_h));
+                if (r.clicked) toggle_mute();
+                float cx = (r.min.x + r.max.x) * 0.5f;
+                float cy = (r.min.y + r.max.y) * 0.5f;
+                const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+                ImVec2 body_min(cx - 9.0f, cy - 4.0f);
+                ImVec2 body_max(cx - 5.0f, cy + 4.0f);
+                r.dl->AddRectFilled(body_min, body_max, icon_col);
+                ImVec2 flare[4] = {
+                    ImVec2(body_max.x, cy - 2.0f), ImVec2(body_max.x, cy + 2.0f),
+                    ImVec2(body_max.x + 6.0f, cy + 7.0f), ImVec2(body_max.x + 6.0f, cy - 7.0f),
+                };
+                r.dl->AddConvexPolyFilled(flare, 4, icon_col);
+                if (is_muted()) {
+                    r.dl->AddLine(ImVec2(cx - 10.0f, cy - 9.0f), ImVec2(cx + 10.0f, cy + 9.0f),
+                        IM_COL32(230, 80, 80, 255), 1.5f);
+                } else {
+                    for (int i = 0; i < 2; ++i) {
+                        float radius = 4.0f + i * 4.0f;
+                        r.dl->PathArcTo(ImVec2(body_max.x + 6.0f, cy), radius, -0.6f, 0.6f, 8);
+                        r.dl->PathStroke(icon_col, 0, 1.5f);
+                    }
+                }
+            }
+            ImGui::SameLine();
+            { // volume slider: same self-drawn InvisibleButton+track+fill+handle pattern as the
+              // seekbar above, but drag writes volume_ directly via set_volume() -- pure native
+              // state, no record_seek()/UiIntents involved (see set_volume()'s header comment).
+                ImVec2 vs_pos = ImGui::GetCursorScreenPos();
+                ImGui::InvisibleButton("##vol_slider", ImVec2(vol_slider_w, track_h));
+                bool vs_active = ImGui::IsItemActive();
+                float vx0 = vs_pos.x;
+                float vx1 = vs_pos.x + vol_slider_w;
+                float vbar_y = vs_pos.y + track_h * 0.5f;
+                if (vs_active) {
+                    float t = (ImGui::GetIO().MousePos.x - vx0) / std::max(vx1 - vx0, 1.0f);
+                    set_volume(std::clamp(t, 0.0f, 1.0f));
+                }
+                float vol = get_volume();
+                float filled_x = vx0 + (vx1 - vx0) * std::clamp(vol, 0.0f, 1.0f);
+                ImDrawList* vdl = ImGui::GetWindowDrawList();
+                vdl->AddRectFilled(ImVec2(vx0, vbar_y - 2.0f), ImVec2(vx1, vbar_y + 2.0f), IM_COL32(90, 90, 90, 255));
+                vdl->AddRectFilled(ImVec2(vx0, vbar_y - 2.0f), ImVec2(filled_x, vbar_y + 2.0f), IM_COL32(200, 200, 60, 255));
+                vdl->AddCircleFilled(ImVec2(filled_x, vbar_y), 5.0f, IM_COL32(230, 230, 230, 255));
+            }
+        }
 
         ImGui::End();
     }
@@ -1956,6 +2040,7 @@ private:
         AVPacket* pkt = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
         AVFrame* held_frame = nullptr; // a decoded frame we chose to hold (too far ahead of master)
+        double held_frame_loop_offset = 0.0; // loop_offset_seconds_ in effect when held_frame's packet was queued
 
         auto cleanup = [&]() {
             if (render_client) render_client->Release();
@@ -2086,11 +2171,14 @@ private:
 
         uint64_t underruns = 0;
         double next_raw_pts_s = first_pts_s;   // fallback estimate if a decoded frame has no PTS
+        double pending_loop_offset = 0.0;      // loop_offset of the most recently popped-and-sent audio packet
         double last_written_audio_s = first_pts_s; // approx audio_s of the most recently-enqueued PCM, for the drift log
+        float last_peak = 0.0f; // peak |sample| (post-gain, normalized to [0,1]) of the most recent device write -- measurable proof gain is actually applied
         LARGE_INTEGER log_t0;
         QueryPerformanceCounter(&log_t0);
         double last_log_wall_s = 0.0;
         std::vector<uint8_t> resample_buf; // reused scratch, grown as needed
+        uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
 
         while (!stop_.load(std::memory_order_relaxed)) {
             DWORD wait_result = WaitForSingleObject(audio_event, 100);
@@ -2098,6 +2186,27 @@ private:
             if (wait_result != WAIT_OBJECT_0) continue; // timeout: re-check stop_ and loop
 
             bool playing = playing_.load(std::memory_order_relaxed);
+
+            // Seek coordination (additive): same poll-once-per-iteration pattern present_loop()
+            // already uses for seek_version_/seek_slot_hint_ (see file header) -- Player::seek()
+            // already called decoder_.flush_audio_queue() under decoder_mutex_ and pushed fresh,
+            // already-correct-for-the-new-position audio packets (via seek_to_frame()'s own
+            // forward-decode, same thread/lock) BEFORE bumping seek_version_. This thread just
+            // needs to drop whatever pre-seek state it was privately holding so no stale audio
+            // plays: the held-ahead frame (if any), the FIFO's buffered PCM (pre-seek position),
+            // and the audio decoder's own internal state (avcodec_flush_buffers) -- mirrors
+            // Decoder::seek_to_frame()'s own avcodec_flush_buffers(codec_ctx_) on the video side.
+            // Realignment to master then happens exactly like normal steady-state playback, via
+            // the same hold/drop/play gating below against compute_master_s().
+            uint64_t sv = seek_version_.load(std::memory_order_relaxed);
+            if (sv != local_seek_version) {
+                local_seek_version = sv;
+                if (held_frame) av_frame_free(&held_frame);
+                av_audio_fifo_reset(fifo);
+                avcodec_flush_buffers(audio_codec_ctx_);
+                double master_now = compute_master_s();
+                last_written_audio_s = master_now; // avoid a stale, pre-seek drift_ms spike in the log
+            }
 
             UINT32 padding = 0;
             if (FAILED(audio_client->GetCurrentPadding(&padding))) continue;
@@ -2117,14 +2226,19 @@ private:
                     // try again next wake, same non-blocking spirit as present_loop().
                     while (static_cast<UINT32>(std::max(av_audio_fifo_size(fifo), 0)) < available) {
                         AVFrame* cur = nullptr;
+                        double cur_loop_offset = 0.0;
                         if (held_frame) {
                             cur = held_frame;
+                            cur_loop_offset = held_frame_loop_offset;
                         } else {
                             int recv = avcodec_receive_frame(audio_codec_ctx_, frame);
                             if (recv == 0) {
                                 cur = frame;
+                                cur_loop_offset = pending_loop_offset;
                             } else if (recv == AVERROR(EAGAIN)) {
-                                if (!decoder_.pop_audio_packet(pkt)) break; // nothing queued right now
+                                double popped_loop_offset = 0.0;
+                                if (!decoder_.pop_audio_packet(pkt, popped_loop_offset)) break; // nothing queued right now
+                                pending_loop_offset = popped_loop_offset;
                                 int send = avcodec_send_packet(audio_codec_ctx_, pkt);
                                 av_packet_unref(pkt);
                                 if (send < 0 && send != AVERROR(EAGAIN)) break;
@@ -2139,7 +2253,12 @@ private:
                             : next_raw_pts_s;
                         int frame_sr = (cur->sample_rate > 0) ? cur->sample_rate : audio_codec_ctx_->sample_rate;
                         next_raw_pts_s = raw_pts_s + static_cast<double>(cur->nb_samples) / static_cast<double>(frame_sr);
-                        double audio_s = raw_pts_s - first_pts_s;
+                        // loop_offset-aware (M-C): same formula as Decoder::next_frame()'s video
+                        // pts_seconds, using THIS packet's own loop_offset (stamped at decode-thread
+                        // enqueue time -- see AudioPacketEntry) rather than the current decoder-wide
+                        // loop_offset_seconds_, so audio computed from a not-yet-drained pre-wrap
+                        // packet still lands in the correct (pre-wrap) domain.
+                        double audio_s = cur_loop_offset + (raw_pts_s - first_pts_s);
                         double master_s = compute_master_s();
                         double diff = audio_s - master_s;
 
@@ -2149,6 +2268,7 @@ private:
                             if (!held_frame) {
                                 held_frame = av_frame_alloc();
                                 av_frame_move_ref(held_frame, frame);
+                                held_frame_loop_offset = cur_loop_offset;
                             }
                             break;
                         }
@@ -2191,6 +2311,46 @@ private:
                         int r = av_audio_fifo_read(fifo, out_ptrs, static_cast<int>(to_write));
                         got = (r > 0) ? static_cast<UINT32>(r) : 0;
                     }
+                    if (got > 0) {
+                        // Volume/mute (additive): applied to samples right before they leave
+                        // this thread, i.e. as late as possible -- a volume/mute change takes
+                        // effect within one WASAPI device-wake (~10-20ms) instead of waiting out
+                        // up to ~1s of already-resampled FIFO content. muted_ wins outright
+                        // (gain 0) over whatever volume_ is currently set to.
+                        float gain = muted_.load(std::memory_order_relaxed)
+                            ? 0.0f
+                            : std::clamp(volume_.load(std::memory_order_relaxed), 0.0f, 1.0f);
+                        size_t nsamples = static_cast<size_t>(got) * static_cast<size_t>(out_channels);
+                        float peak = 0.0f;
+                        switch (out_sample_fmt) {
+                        case AV_SAMPLE_FMT_FLT: {
+                            float* s = reinterpret_cast<float*>(data);
+                            for (size_t i = 0; i < nsamples; ++i) {
+                                s[i] *= gain;
+                                peak = std::max(peak, std::fabs(s[i]));
+                            }
+                            break;
+                        }
+                        case AV_SAMPLE_FMT_S16: {
+                            int16_t* s = reinterpret_cast<int16_t*>(data);
+                            for (size_t i = 0; i < nsamples; ++i) {
+                                s[i] = static_cast<int16_t>(std::lround(static_cast<float>(s[i]) * gain));
+                                peak = std::max(peak, std::fabs(static_cast<float>(s[i]) / 32768.0f));
+                            }
+                            break;
+                        }
+                        case AV_SAMPLE_FMT_S32: {
+                            int32_t* s = reinterpret_cast<int32_t*>(data);
+                            for (size_t i = 0; i < nsamples; ++i) {
+                                s[i] = static_cast<int32_t>(std::lround(static_cast<double>(s[i]) * gain));
+                                peak = std::max(peak, static_cast<float>(std::fabs(static_cast<double>(s[i]) / 2147483648.0)));
+                            }
+                            break;
+                        }
+                        default: break;
+                        }
+                        last_peak = peak;
+                    }
                     if (got < available) {
                         memset(data + static_cast<size_t>(got) * bytes_per_output_frame, 0,
                             static_cast<size_t>(available - got) * bytes_per_output_frame);
@@ -2207,9 +2367,9 @@ private:
             if (wall_s - last_log_wall_s >= 1.0) {
                 last_log_wall_s = wall_s;
                 double master_s_now = compute_master_s();
-                fprintf(stderr, "[audio] master_s=%.3f audio_s=%.3f drift_ms=%.1f queue_depth=%zu underruns=%llu\n",
+                fprintf(stderr, "[audio] master_s=%.3f audio_s=%.3f drift_ms=%.1f queue_depth=%zu underruns=%llu peak=%.4f\n",
                     master_s_now, last_written_audio_s, (last_written_audio_s - master_s_now) * 1000.0,
-                    decoder_.audio_queue_depth(), static_cast<unsigned long long>(underruns));
+                    decoder_.audio_queue_depth(), static_cast<unsigned long long>(underruns), last_peak);
             }
         }
 
@@ -2363,6 +2523,13 @@ private:
     bool has_audio_ = false;
     AVCodecContext* audio_codec_ctx_ = nullptr; // software decode only, no hw_device_ctx
 
+    // Volume/mute (additive): written by the main thread (bottom-bar slider/mute icon,
+    // WndProc's Up/Down/M keys), read lock-free by audio_thread_ right before samples leave it
+    // (see audio_loop()'s gain-application block). Deliberately plain atomics, not routed
+    // through UiIntents -- see set_volume()/set_muted() above for why.
+    std::atomic<float> volume_{ 1.0f };
+    std::atomic<bool> muted_{ false };
+
     LARGE_INTEGER pace_origin_qpc_{};
     LARGE_INTEGER freq_{};
     std::atomic<int64_t> present_head_frame_{ 0 };
@@ -2429,6 +2596,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 int64_t target = self->current_frame() + (wp == VK_LEFT ? -step : step);
                 target = (fc > 0) ? std::clamp<int64_t>(target, 0, fc - 1) : std::max<int64_t>(0, target);
                 self->record_seek(target);
+            } else if (self->has_audio() && (wp == VK_UP || wp == VK_DOWN)) {
+                // Volume/mute (additive): pure native state, writes atomics directly (no
+                // scheduler coordination needed -- see set_volume()'s header comment), so this
+                // does NOT go through record_seek()/record_toggle_play()'s UiIntents channel.
+                float step = (wp == VK_UP) ? 0.05f : -0.05f;
+                self->set_volume(self->get_volume() + step); // set_volume() itself clamps to [0,1]
+            } else if (self->has_audio() && wp == 'M') {
+                // WM_KEYDOWN's wParam is a virtual-key code, not a character: VK codes for
+                // letters equal the uppercase ASCII value regardless of Shift/CapsLock state,
+                // so this already matches both 'm' and 'M' as typed -- no separate lowercase
+                // branch needed.
+                self->toggle_mute();
             }
         }
         return 0;
@@ -2456,6 +2635,11 @@ PYBIND11_MODULE(sumu_core, m)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)
         .def("has_audio", &Player::has_audio)
+        .def("set_volume", &Player::set_volume, py::arg("volume"))
+        .def("get_volume", &Player::get_volume)
+        .def("set_muted", &Player::set_muted, py::arg("muted"))
+        .def("toggle_mute", &Player::toggle_mute)
+        .def("is_muted", &Player::is_muted)
         .def("ui_tick", &Player::ui_tick) // M2: main-thread NewFrame/build/Render/publish tick
         .def("ui_ready", &Player::ui_ready)
         .def("path", &Player::path)

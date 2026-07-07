@@ -24,9 +24,9 @@ void Decoder::close()
         // just cheap insurance, consistent with the rest of this class's style.
         std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
         while (!audio_pkt_queue_.empty()) {
-            AVPacket* p = audio_pkt_queue_.front();
+            AudioPacketEntry e = audio_pkt_queue_.front();
             audio_pkt_queue_.pop_front();
-            av_packet_free(&p);
+            av_packet_free(&e.pkt);
         }
     }
     if (pkt_) av_packet_free(&pkt_);
@@ -228,11 +228,11 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
                     if (apkt) {
                         av_packet_move_ref(apkt, pkt_);
                         std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-                        audio_pkt_queue_.push_back(apkt);
+                        audio_pkt_queue_.push_back(AudioPacketEntry{ apkt, loop_offset_seconds_ });
                         if (audio_pkt_queue_.size() > kAudioQueueMaxPackets) {
-                            AVPacket* drop = audio_pkt_queue_.front();
+                            AudioPacketEntry drop = audio_pkt_queue_.front();
                             audio_pkt_queue_.pop_front();
-                            av_packet_free(&drop);
+                            av_packet_free(&drop.pkt);
                             ++audio_pkt_dropped_;
                         }
                     }
@@ -368,15 +368,26 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
     return false;
 }
 
-bool Decoder::pop_audio_packet(AVPacket* dst)
+bool Decoder::pop_audio_packet(AVPacket* dst, double& loop_offset_out)
 {
     std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
     if (audio_pkt_queue_.empty()) return false;
-    AVPacket* p = audio_pkt_queue_.front();
+    AudioPacketEntry e = audio_pkt_queue_.front();
     audio_pkt_queue_.pop_front();
-    av_packet_move_ref(dst, p);
-    av_packet_free(&p);
+    av_packet_move_ref(dst, e.pkt);
+    av_packet_free(&e.pkt);
+    loop_offset_out = e.loop_offset;
     return true;
+}
+
+void Decoder::flush_audio_queue()
+{
+    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+    while (!audio_pkt_queue_.empty()) {
+        AudioPacketEntry e = audio_pkt_queue_.front();
+        audio_pkt_queue_.pop_front();
+        av_packet_free(&e.pkt);
+    }
 }
 
 size_t Decoder::audio_queue_depth() const
