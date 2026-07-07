@@ -8,13 +8,66 @@
 # Frozen-safe: no sys.path hacks here -- the caller (dev shim scripts/play.py, or a future
 # PyInstaller spec/entry point) is responsible for making `sumu` and `sumu_core` importable
 # before calling main().
+#
+# Startup-UX (model-warmup-in-background): unlike the old version of this module, main() no
+# longer blocks the main thread on model warmup (torch import + build_models(), which can take
+# several seconds for TRT compilation) before showing anything. The window appears immediately
+# and stays responsive (pump_messages() every tick) while warmup runs on a background daemon
+# thread; an open/drop-file prompt is shown until the user picks a file, and a small
+# "正在预热中…" status float (native build_status_float(), driven by set_status_text()) tracks
+# warmup progress. Opening a file no longer waits on the models -- player.open() plus play()
+# starts original-passthrough playback immediately (present's AI-absent fallback, see
+# DESIGN.md I9); the Scheduler is only constructed once warmup finishes, at which point AI
+# frames start covering the passthrough ones with no playback interruption.
 import argparse
 import sys
+import threading
 import time
 
 import sumu_core  # noqa: E402
 from sumu.pipeline import build_models  # noqa: E402
 from sumu import settings as settings_mod  # noqa: E402 -- M-E: persisted volume/mute/recent/resume
+
+
+class _WarmupState:
+    """Cross-thread handoff for the background model-warmup thread below -- guarded by `lock`
+    since the main thread reads it every tick while the warmup thread writes it exactly once
+    (on success or failure). `models` is the (det_model, res_model, pad_mode) tuple build_models()
+    returns; `ready`/`error` are mutually exclusive terminal states (never both set)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ready = False
+        self.models = None
+        self.error = None
+
+
+def _warmup_worker(state: "_WarmupState") -> None:
+    """Runs on a daemon thread started right after the Player is constructed. torch (and
+    everything build_models() pulls in -- sumu.ai, TRT compilation, ...) is only imported here,
+    never on the main thread, so a slow/failing warmup never blocks pump_messages()/ui_tick().
+    Any exception is captured rather than propagated: warmup failing must degrade to
+    passthrough-only playback, never crash the player (see module docstring)."""
+    try:
+        import torch
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        fp16 = device.type == "cuda"
+        print(f"== env == torch {torch.__version__} device {device} "
+              f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}", file=sys.stderr)
+
+        t_load0 = time.perf_counter()
+        det_model, res_model, pad_mode = build_models(device, fp16)
+        print(f"== load_models == {time.perf_counter()-t_load0:.2f}s pad_mode={pad_mode}",
+              file=sys.stderr)
+
+        with state.lock:
+            state.models = (det_model, res_model, pad_mode)
+            state.ready = True
+    except Exception as e:  # noqa: BLE001 -- warmup failure must never crash the player
+        print(f"== warmup failed == {e!r}", file=sys.stderr)
+        with state.lock:
+            state.error = e
 
 
 def main():
@@ -31,64 +84,71 @@ def main():
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
 
-    video = args.video
-    if not video:
-        video = player.pick_open_file()
-        if not video:
-            print("[play] no file selected, exiting", file=sys.stderr)
-            player.close()
-            return
+    # Kick off model warmup in the background immediately -- the window is already up (Player's
+    # ctor starts present_thread_) and the main loop below starts pumping messages right away, so
+    # the window is draggable/responsive for the whole warmup duration instead of the old
+    # synchronous "splash + block main thread" sequence.
+    warmup = _WarmupState()
+    threading.Thread(target=_warmup_worker, args=(warmup,), name="sumu-warmup", daemon=True).start()
 
-    # M-E: current_path tracks whichever file is actually loaded (initial open, then whatever
-    # apply_ui_intents' reopen path swaps it to) -- both the reopen handler and the loop-exit
-    # finally use it to know which file's position to persist.
-    current_path = video
-    settings.push_recent(current_path)
-
-    # M-C1: present_thread_ is already running (started in the Player ctor) and draws a "loading"
-    # splash while !session_active_. Publish a splash frame now, THEN do the whole heavy startup
-    # (torch import + build_models + player.open()'s decoder-open/ring-buffer-prime) with the
-    # splash on screen -- session_active_ only flips true at the very end of player.open() below,
-    # so the window shows "加载中…" for the ENTIRE load instead of a blank/frozen window. We build
-    # the AI models BEFORE player.open() deliberately: that keeps the splash covering the slow
-    # model load too, and once open() returns we start the scheduler + play() within ~1s, so the
-    # user goes splash -> real playback with no lingering frozen first frame. A couple of ticks
-    # (not one) so ImGui's first-frame font-atlas build is already done before the load blocks the
-    # main thread (the splash frame present_thread_ keeps redrawing stays "加载中…" throughout).
-    player.pump_messages()
-    player.ui_tick()
-    player.pump_messages()
-    player.ui_tick()
-
-    import torch
     from sumu.ai.utils.video_utils import get_video_meta_data
     from sumu.scheduler import Scheduler, SchedulerConfig
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    fp16 = device.type == "cuda"
-    print(f"== env == torch {torch.__version__} device {device} "
-          f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}", file=sys.stderr)
+    # No more startup pick_open_file() -- an unopened window shows the native
+    # build_open_prompt_overlay() (drop-file / "打开文件" button) instead. A video given on the
+    # command line is treated as the first pending "open" intent, consumed on the loop's first
+    # iteration -- same open path a drop/button open would take, just pre-seeded.
+    pending_open_path = args.video
 
-    t_load0 = time.perf_counter()
-    det_model, res_model, pad_mode = build_models(device, fp16)
-    print(f"== load_models == {time.perf_counter()-t_load0:.2f}s pad_mode={pad_mode}",
-          file=sys.stderr)
-
-    player.open(video)
-    print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
-          f"dims={player.dims()}", file=sys.stderr)
-
-    video_meta = get_video_meta_data(video)
+    opened = False
+    current_path = None
+    video_meta = None
     config = SchedulerConfig()
-    scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
-    scheduler.start()
+    scheduler = None
+    det_model = res_model = pad_mode = None
+
+    def do_open(path):
+        """First-ever open (opened is False): player.open() is decode-only and fast (no model
+        dependency), so this starts original/passthrough playback immediately -- the Scheduler
+        is deliberately NOT built here, only once warmup finishes (see the main loop's
+        "延迟建 scheduler" step below)."""
+        nonlocal opened, current_path, video_meta
+        player.open(path)
+        print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
+              f"dims={player.dims()}", file=sys.stderr)
+        opened = True
+        current_path = path
+        settings.push_recent(current_path)
+        video_meta = get_video_meta_data(path)
+        player.play()
+
+    def do_reopen(path):
+        """Same semantics as the old apply_ui_intents' reopen path (run_player.py:183 /
+        player.cpp's Player::reopen()): swap the playing file without tearing down
+        present_thread_/the window. The scheduler (if any -- warmup may still be in flight) is
+        torn down and rebuilt against the new file's video_meta once we get back to the "延迟建
+        scheduler" step below."""
+        nonlocal scheduler, video_meta, current_path
+        settings.set_position(current_path, player.current_frame())
+        if scheduler is not None:
+            scheduler.stop()
+            scheduler = None
+        new_frame_count = player.reopen(path)
+        print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
+              file=sys.stderr)
+        video_meta = get_video_meta_data(path)
+        current_path = path
+        settings.push_recent(current_path)
+        player.play()  # open_session() starts paused; a freshly reopened file auto-plays
+                       # (matches do_open()'s open->play() sequence above)
 
     def maybe_resume(path):
         """M-E: seek back to where the user left off in `path`, if settings has a "meaningful
         mid-file" position for it (settings_mod.is_resumable_frame -- skips near-start/near-end
         and unknown fps/frame_count). Same seek order as the UI seek-intent path below
         (scheduler.notify_seek() then player.seek()). No-op if there's no stored position or it
-        doesn't clear the resume gate."""
+        doesn't clear the resume gate. Only called once scheduler is already built, so
+        scheduler.notify_seek() is always valid here."""
         frame = settings.get_position(path)
         if frame is None:
             return
@@ -96,71 +156,80 @@ def main():
             scheduler.notify_seek(frame)
             player.seek(frame)
 
-    maybe_resume(current_path)
-
-    def apply_ui_intents(intents):
-        """Same semantics as run_player.py's apply_ui_intents (toggle_play / seek /
-        clip_length|max_regions rebuild) -- see run_player.py:183 for the full rationale.
-        M-C2 adds reopen: a dropped file (open_path) or the top-bar "open" button
-        (open_dialog, answered here with the blocking pick_open_file() dialog -- present keeps
-        showing the current video while it's up) triggers player.reopen(path), which swaps the
-        playing file without tearing down present_thread_/the window (see player.cpp's
-        Player::reopen()). The scheduler is torn down/rebuilt exactly like the clip_length/
-        max_regions path above (model objects reused, only the scheduler + its video_meta are
-        file-specific)."""
-        nonlocal scheduler, config, video_meta, current_path
-
-        if intents["toggle_play"]:
-            if player.is_playing():
-                player.pause()
-            else:
-                player.play()
-
-        seek = intents["seek"]
-        if seek is not None:
-            scheduler.notify_seek(seek)
-            player.seek(seek)
-
-        clip_length = intents["clip_length"]
-        max_regions = intents["max_regions"]
-        if clip_length is not None or max_regions is not None:
-            scheduler.stop()
-            if clip_length is not None:
-                config.clip_length = clip_length
-            if max_regions is not None:
-                config.max_regions_per_frame = max_regions
-            scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
-            scheduler.start()
-
-        path = None
-        if intents["open_dialog"]:
-            path = player.pick_open_file()  # modal, main thread; present keeps showing the
-                                             # current video the whole time this is up
-        elif intents["open_path"]:
-            path = intents["open_path"]
-        if path:
-            # M-E: snapshot the outgoing file's position before it's swapped away.
-            settings.set_position(current_path, player.current_frame())
-            scheduler.stop()
-            new_frame_count = player.reopen(path)
-            print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
-                  file=sys.stderr)
-            video_meta = get_video_meta_data(path)
-            current_path = path
-            settings.push_recent(current_path)
-            scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
-            scheduler.start()
-            maybe_resume(current_path)
-            player.play()  # open_session() starts paused; a freshly reopened file auto-plays
-                           # (matches main()'s open->scheduler.start()->play() sequence below)
-
-    player.play()
     try:
         while not player.should_quit():
             player.pump_messages()
+
+            with warmup.lock:
+                warm_ready = warmup.ready
+                warm_models = warmup.models
+                warm_error = warmup.error
+
+            if scheduler is not None:
+                status_text = ""
+            elif warm_error is not None:
+                status_text = "预热失败（将播放原片）"
+            elif warm_ready:
+                status_text = ""
+            else:
+                status_text = "正在预热中…"
+            player.set_status_text(status_text)
+
             player.set_ui_config(config.clip_length, config.max_regions_per_frame)
             player.ui_tick()
-            apply_ui_intents(player.take_ui_intents())
+
+            intents = player.take_ui_intents()
+
+            if intents["toggle_play"]:
+                if opened:
+                    if player.is_playing():
+                        player.pause()
+                    else:
+                        player.play()
+
+            seek = intents["seek"]
+            if seek is not None and opened:
+                if scheduler is not None:
+                    scheduler.notify_seek(seek)
+                player.seek(seek)
+
+            clip_length = intents["clip_length"]
+            max_regions = intents["max_regions"]
+            if (clip_length is not None or max_regions is not None) and scheduler is not None:
+                scheduler.stop()
+                if clip_length is not None:
+                    config.clip_length = clip_length
+                if max_regions is not None:
+                    config.max_regions_per_frame = max_regions
+                scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
+                scheduler.start()
+
+            path = None
+            if intents["open_dialog"]:
+                path = player.pick_open_file()  # modal, main thread; present keeps showing the
+                                                 # current video (or the open-prompt) meanwhile
+            elif intents["open_path"]:
+                path = intents["open_path"]
+            elif pending_open_path:
+                path = pending_open_path
+            pending_open_path = None
+
+            if path:
+                if not opened:
+                    do_open(path)
+                else:
+                    do_reopen(path)
+
+            # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
+            # scheduler is already running. Deliberately re-checked every tick (not just right
+            # after do_open()/do_reopen()) since warmup can finish on its own schedule, well
+            # after either of those.
+            if opened and warm_ready and scheduler is None and warm_error is None:
+                det_model, res_model, pad_mode = warm_models
+                scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
+                scheduler.start()
+                maybe_resume(current_path)
+
             # 50Hz main loop. NOT 0.008 (125Hz): measured regression (see run_player.py:236 /
             # docs/native_core.md) -- a 125Hz loop starves the present thread, breaking present
             # cadence. Keep 0.02.
@@ -170,9 +239,11 @@ def main():
         # guarded -- the player may already be mid-close by the time we get here, and persistence
         # must never turn a clean shutdown into a crash.
         try:
-            settings.set_position(current_path, player.current_frame())
+            if current_path is not None:
+                settings.set_position(current_path, player.current_frame())
         except Exception:  # noqa: BLE001 -- persistence must never crash shutdown
             pass
         settings_mod.save(settings)
-        scheduler.stop()
+        if scheduler is not None:
+            scheduler.stop()
         player.close()

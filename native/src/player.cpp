@@ -854,6 +854,11 @@ public:
         ui_cfg_max_regions_ = max_regions;
     }
 
+    // Model-warmup-in-background status line (left-bottom float, build_status_float()):
+    // main-thread-owned, same discipline as ui_cfg_* above -- Python pushes a fresh string every
+    // tick (empty = hide), no lock needed since only the main thread ever touches it.
+    void set_status_text(const std::string& s) { status_text_ = s; }
+
     py::dict take_ui_intents()
     {
         py::dict d;
@@ -1544,17 +1549,23 @@ private:
     // scripts/run_player.py).
     void build_ui()
     {
-        // M-C1: no session open yet (or one was just closed) -- the normal top/bottom bars
-        // read session-scoped state (video_path_, frame_count_, seekbar position, ...) that
-        // isn't meaningful yet, so show a loading splash instead.
-        if (!session_active_.load(std::memory_order_relaxed)) {
-            build_splash_overlay();
-            return;
+        // M-C1 / warmup-UX: no session open yet (or one was just closed) -- the normal
+        // top/bottom bars read session-scoped state (video_path_, frame_count_, seekbar
+        // position, ...) that isn't meaningful yet. Two sub-cases: never opened a file at all
+        // (show the interactive "drop/open a file" prompt so the user isn't staring at a dead
+        // window) vs. a reopen()-driven brief teardown/rebuild of an already-opened file (fall
+        // back to the old plain "loading" splash -- opened_ stays true across reopen()).
+        bool active = session_active_.load(std::memory_order_relaxed);
+        if (!active) {
+            if (!opened_) build_open_prompt_overlay();
+            else          build_splash_overlay();
+        } else {
+            float top_bar_h = 0.0f;
+            build_top_bar(top_bar_h);
+            if (ui_settings_open_) build_settings_panel(top_bar_h);
+            build_bottom_bar();
         }
-        float top_bar_h = 0.0f;
-        build_top_bar(top_bar_h);
-        if (ui_settings_open_) build_settings_panel(top_bar_h);
-        build_bottom_bar();
+        build_status_float(); // model-warmup status line -- drawn in every branch above
     }
 
     // M-C1: centered "loading" text overlay, shown while !session_active_ (see build_ui()'s
@@ -1575,6 +1586,92 @@ private:
         ImVec2 tsize = ImGui::CalcTextSize(text);
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, (io.DisplaySize.y - tsize.y) * 0.5f));
         ImGui::TextUnformatted(text);
+        ImGui::End();
+    }
+
+    // Warmup-UX: shown instead of build_splash_overlay() while !session_active_ AND !opened_,
+    // i.e. before the user has ever opened a file (build_ui()'s branch above). Unlike the plain
+    // splash this one takes input -- WM_DROPFILES already records an open_path intent
+    // unconditionally in WndProc regardless of what's on screen, so this overlay only needs to
+    // give the user a visible target plus an explicit "open file" button, a close button (this
+    // is a borderless window with no OS titlebar), and a draggable region so the window can
+    // still be moved before any content is loaded.
+    void build_open_prompt_overlay()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground;
+            // (deliberately NOT ImGuiWindowFlags_NoInputs -- this overlay must accept clicks)
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::Begin("##sumu_open_prompt", nullptr, flags);
+
+        const float btn_w = 28.0f, btn_h = 28.0f;
+        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+
+        { // top-right close button -- same X glyph as build_top_bar()'s close_btn
+            ImGui::SetCursorPos(ImVec2(io.DisplaySize.x - btn_w - 4.0f, 4.0f));
+            IconButtonResult r = icon_button("##open_prompt_close_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) PostMessageA(hwnd_, WM_CLOSE, 0, 0);
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float half = 5.0f;
+            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, 1.5f);
+            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, 1.5f);
+        }
+
+        // Draggable caption region: the whole top strip minus the close button (same mechanism
+        // as build_top_bar()'s ##drag_region -- publishing these three floats is what makes
+        // WM_NCHITTEST report HTCAPTION there, see point_in_caption_drag()'s header comment).
+        // This overlay has no InvisibleButton standing in for the drag area (nothing else is
+        // there to eat the click), so the rect is just published directly.
+        caption_drag_x0_ = 0.0f;
+        caption_drag_x1_ = io.DisplaySize.x - btn_w - 4.0f;
+        caption_drag_y1_ = 32.0f;
+
+        const char* prompt = u8"拖入视频文件到此处，或";
+        ImVec2 tsize = ImGui::CalcTextSize(prompt);
+        const float open_btn_w = 120.0f, open_btn_h = 32.0f;
+        const float gap = 16.0f;
+        float block_h = tsize.y + gap + open_btn_h;
+        float top = (io.DisplaySize.y - block_h) * 0.5f;
+
+        ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, top));
+        ImGui::TextUnformatted(prompt);
+
+        ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - open_btn_w) * 0.5f, top + tsize.y + gap));
+        if (ImGui::Button(u8"打开文件", ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
+
+        ImGui::End();
+    }
+
+    // Model-warmup status line (left-bottom float): built every build_ui() call (see its header
+    // comment), regardless of which branch (open-prompt / splash / real UI) is active this
+    // frame -- Python drives status_text_ via set_status_text() once per tick and clears it back
+    // to "" the moment the scheduler is up, so this simply no-ops most of the time.
+    void build_status_float()
+    {
+        if (status_text_.empty()) return;
+
+        ImGuiIO& io = ImGui::GetIO();
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
+
+        const float margin = 12.0f;
+        // Nudge above the bottom bar (build_bottom_bar()'s bar_h) when a real session is active
+        // -- otherwise the float would sit under the auto-hidden bottom bar's hit-zone.
+        bool active = session_active_.load(std::memory_order_relaxed);
+        float bottom_clear = active ? 56.0f + margin : margin;
+
+        ImGui::SetNextWindowPos(ImVec2(margin, io.DisplaySize.y - bottom_clear), ImGuiCond_Always,
+            ImVec2(0.0f, 1.0f));
+        ImGui::SetNextWindowBgAlpha(0.55f);
+        ImGui::Begin("##sumu_status_float", nullptr, flags);
+        ImGui::TextUnformatted(status_text_.c_str());
         ImGui::End();
     }
 
@@ -3047,6 +3144,9 @@ private:
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
     int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
     bool ui_settings_open_ = false;
+    // Model-warmup status line, see set_status_text()'s header comment -- empty hides
+    // build_status_float() entirely, non-empty text shown regardless of session_active_.
+    std::string status_text_;
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
@@ -3392,6 +3492,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("ui_ready", &Player::ui_ready)
         .def("path", &Player::path)
         .def("set_ui_config", &Player::set_ui_config, py::arg("clip_length"), py::arg("max_regions"))
+        .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_
         .def("seek", &Player::seek, py::arg("frame_num"))
         .def("push_ai_frame", &Player::push_ai_frame,
