@@ -744,6 +744,17 @@ public:
     void toggle_mute() { muted_.store(!muted_.load(std::memory_order_relaxed), std::memory_order_relaxed); }
     bool is_muted() const { return muted_.load(std::memory_order_relaxed); }
 
+    // ---- present-side view controls (Phase 6 M-D, additive) -- see ai_enabled_/compare_mode_'s
+    // own member comment for the full design writeup (native-only atomics, no UiIntents
+    // round-trip, present_loop() reads these directly). Writers are build_settings_panel()'s
+    // two checkboxes (main thread) and, for ai_enabled_/compare_mode_ individually, WndProc's
+    // 'D'/'C' keys; reader is present_loop() on the present thread. Also exposed via pybind for
+    // Python-side persistence (M-E) and scripted verification.
+    void set_ai_enabled(bool v) { ai_enabled_.store(v, std::memory_order_relaxed); }
+    bool is_ai_enabled() const { return ai_enabled_.load(std::memory_order_relaxed); }
+    void set_compare(bool v) { compare_mode_.store(v, std::memory_order_relaxed); }
+    bool is_compare() const { return compare_mode_.load(std::memory_order_relaxed); }
+
     // ---- UI (M2): main thread only -- NewFrame/build/Render/CloneOutput, publish snapshot ---
     //
     // Called once per Python-driven tick (pybind's ui_tick()). Never touches d3d_mutex_ (see
@@ -1327,6 +1338,24 @@ private:
         cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         check_hr(device_->CreateBuffer(&cbd, nullptr, &slice_cb_), "CreateBuffer(slice_cb_)");
+
+        // Phase 6 M-D: scissor-enabled rasterizer state for draw_and_present_compare()'s A/B
+        // wipe. draw_and_present() itself never calls RSSetState at all -- today it renders
+        // under whatever RS state the ImGui DX11 backend last bound (its own CreateDeviceObjects,
+        // third_party/imgui/backends/imgui_impl_dx11.cpp, always uses FillMode=SOLID/
+        // CullMode=NONE/ScissorEnable=TRUE/DepthClipEnable=TRUE -- confirmed by reading that
+        // file, not assumed), which is why the fullscreen triangle isn't back-face culled today
+        // even though its winding is back-facing under the D3D11 default (CullMode=BACK). This
+        // new state copies those same field values (so the compare draw's own triangles render
+        // exactly like the normal path's already do) and is ONLY ever bound by
+        // draw_and_present_compare(); draw_and_present() is untouched and keeps inheriting the
+        // ImGui backend's RS state as before.
+        D3D11_RASTERIZER_DESC rsd{};
+        rsd.FillMode = D3D11_FILL_SOLID;
+        rsd.CullMode = D3D11_CULL_NONE;
+        rsd.DepthClipEnable = TRUE;
+        rsd.ScissorEnable = TRUE;
+        check_hr(device_->CreateRasterizerState(&rsd, &compare_rs_), "CreateRasterizerState(compare_rs_)");
     }
 
     // ---- ImGui overlay (M2: real thread split -- main-thread NewFrame/build/Render/Clone,
@@ -1811,6 +1840,17 @@ private:
         ImGui::Separator();
         ImGui::SliderInt(u8"片段长度", &settings_edit_clip_length_, 1, 180);
         ImGui::SliderInt(u8"每帧最大区域数", &settings_edit_max_regions_, 1, 8);
+
+        // Phase 6 M-D: instant native toggles (NOT staged/Apply like the two sliders above) --
+        // each frame the local bool is re-seeded from the atomic present_loop() reads, and a
+        // change is stored straight back; see ai_enabled_/compare_mode_'s member comment.
+        bool local_ai = ai_enabled_.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox(u8"去码", &local_ai))
+            ai_enabled_.store(local_ai, std::memory_order_relaxed);
+        bool local_cmp = compare_mode_.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox(u8"原片/去码对比", &local_cmp))
+            compare_mode_.store(local_cmp, std::memory_order_relaxed);
+
         if (ImGui::Button(u8"应用")) {
             // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
             // scheduler when it sees a non-null clip_length/max_regions, never on every slider
@@ -2100,6 +2140,15 @@ private:
         int64_t last_frame_local = -1;
         Source last_actual_source = Source::PassthroughFresh;
         UINT last_actual_slot = 0;
+        // Phase 6 M-D: compare-mode-only slot trackers (see present_loop()'s source-pick block
+        // and draw_and_present_compare()). last_pt_slot mirrors last_actual_slot's own
+        // stale-fallback tracking but for the passthrough half specifically; last_ai_slot/
+        // any_ai_seen do the same for the AI half, with any_ai_seen distinguishing "no fresh AI
+        // frame this tick" from "no AI frame has EVER landed" (the latter falls back to
+        // passthrough on the right half too, see the source-pick block below).
+        UINT last_pt_slot = 0;
+        UINT last_ai_slot = 0;
+        bool any_ai_seen = false;
         uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
         int64_t tick_idx = 0;
         uint64_t local_pace_epoch = pace_epoch_.load(std::memory_order_acquire);
@@ -2200,9 +2249,52 @@ private:
                 present_head_frame_.store(frame, std::memory_order_relaxed);
 
                 UINT slot = wrap_slot(frame);
+                bool cmp = compare_mode_.load(std::memory_order_relaxed);
+                UINT cmp_pt_slot = 0, cmp_ai_slot = 0;
+                bool cmp_ai_is_ai = false;
                 {
                     std::lock_guard<std::mutex> lk(ready_mutex_);
-                    if (ai_tag_[slot] == frame) {
+                    // Phase 6 M-D: gates the AI pick on the de-mosaic-on/off toggle, read once
+                    // here under the same lock as the tag arrays it's compared against. When
+                    // ai_enabled_==true (the default) `ai_on && x` is identical to the bare `x`
+                    // this replaced, so steady-state behavior when de-mosaic stays on is
+                    // unchanged.
+                    bool ai_on = ai_enabled_.load(std::memory_order_relaxed);
+                    // Phase 6 M-D: mirrors the just_seeked repoint of last_actual_slot just above
+                    // (same tick, same seek), but for the passthrough-half tracker specifically
+                    // -- keeps compare mode's left half from showing pre-seek content on a tick
+                    // that races ahead of decode immediately after a seek.
+                    if (just_seeked) last_pt_slot = static_cast<UINT>(seek_slot_hint_.load(std::memory_order_relaxed));
+
+                    if (cmp) {
+                        // A/B compare: same frame number, left = passthrough, right = AI (or
+                        // passthrough too, if no AI frame has ever landed yet) -- see
+                        // draw_and_present_compare(). Independent of ai_enabled_ (compare mode's
+                        // whole point is showing the AI result regardless of that toggle).
+                        bool pt_fresh = (pt_tag_[slot] == frame);
+                        if (pt_fresh) last_pt_slot = slot;
+                        cmp_pt_slot = pt_fresh ? slot : last_pt_slot;
+
+                        bool ai_fresh = (ai_tag_[slot] == frame);
+                        if (ai_fresh) {
+                            last_ai_slot = slot;
+                            any_ai_seen = true;
+                            cmp_ai_slot = slot;
+                            cmp_ai_is_ai = true;
+                        } else if (any_ai_seen) {
+                            cmp_ai_slot = last_ai_slot;
+                            cmp_ai_is_ai = true;
+                        } else {
+                            cmp_ai_slot = cmp_pt_slot;
+                            cmp_ai_is_ai = false;
+                        }
+
+                        // Compare is a view mode, not a real present source -- the trace/counter
+                        // bookkeeping below just needs a value that won't crash switch(source);
+                        // PassthroughFresh is as good as any (no new Source enum value needed).
+                        source = Source::PassthroughFresh;
+                        use_slot = cmp_pt_slot;
+                    } else if (ai_on && ai_tag_[slot] == frame) {
                         source = Source::AiFresh;
                         use_slot = slot;
                     } else if (pt_tag_[slot] == frame) {
@@ -2210,8 +2302,9 @@ private:
                         use_slot = slot;
                     } else {
                         // Neither map has this exact frame number ready. NEVER block -- just
-                        // re-present whatever was actually shown last tick (I2/I9).
-                        source = is_ai(last_actual_source) ? Source::AiStale : Source::PassthroughStale;
+                        // re-present whatever was actually shown last tick (I2/I9). When
+                        // de-mosaic is off, never repeat an AI frame here either.
+                        source = (ai_on && is_ai(last_actual_source)) ? Source::AiStale : Source::PassthroughStale;
                         use_slot = last_actual_slot;
                     }
                 }
@@ -2221,7 +2314,10 @@ private:
                     // header). Decode/push threads are the ones who may occasionally wait a
                     // fraction of a frame for this lock, never the reverse.
                     std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-                    draw_and_present(source, use_slot);
+                    if (cmp)
+                        draw_and_present_compare(cmp_pt_slot, cmp_ai_slot, cmp_ai_is_ai);
+                    else
+                        draw_and_present(source, use_slot);
                 }
             }
 
@@ -2287,6 +2383,103 @@ private:
         // M2: present thread only renders an already-published draw-data snapshot (built on
         // the main thread by ui_tick()) -- see ui_render_drawdata()'s header comment. Called
         // here, after the video Draw(3,0) and before Present(1,0), still inside d3d_mutex_.
+        ui_render_drawdata();
+
+        swapchain_->Present(1, 0);
+    }
+
+    // Phase 6 M-D: A/B compare draw -- same frame number, left half = passthrough (original),
+    // right half = AI (de-mosaic), thin divider at the seam. Called from present_loop() instead
+    // of draw_and_present() only when compare_mode_ is true; draw_and_present() itself is
+    // untouched. Always called from inside d3d_mutex_, same as draw_and_present() (see
+    // present_loop()'s d3d_mutex_ block).
+    //
+    // Full-screen viewport as normal (0..win_width_) so UVs map 1:1 in both halves -- the split
+    // is a true scissor-rect wipe, never a squished half-width draw. Divider technique (see task
+    // brief for the reasoning that ruled out the alternatives): ClearRenderTargetView the whole
+    // backbuffer to near-black FIRST (Clear ignores the scissor rect/state entirely), then
+    // scissor each half to stop 1px short of center -- the resulting 2px uncovered column reads
+    // as a divider line with no separate line-drawing pass needed.
+    void draw_and_present_compare(UINT pt_slot, UINT ai_slot, bool ai_is_ai)
+    {
+        context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
+        D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(win_width_), static_cast<float>(win_height_), 0.0f, 1.0f };
+        context_->RSSetViewports(1, &vp);
+        ID3D11RenderTargetView* rtvs[] = { backbuffer_rtv_.Get() };
+        context_->OMSetRenderTargets(1, rtvs, nullptr);
+        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vs_.Get(), nullptr, 0);
+        context_->RSSetState(compare_rs_.Get()); // ScissorEnable=TRUE twin of the normal path's
+                                                  // inherited RS state -- see create_shader_
+                                                  // pipeline()'s comment. draw_and_present()
+                                                  // never binds this.
+
+        const float clear_color[4] = { 0.02f, 0.02f, 0.02f, 1.0f };
+        context_->ClearRenderTargetView(backbuffer_rtv_.Get(), clear_color);
+
+        ID3D11SamplerState* samplers[] = { sampler_.Get() };
+        context_->PSSetSamplers(0, 1, samplers);
+        ID3D11Buffer* cbs[] = { slice_cb_.Get() };
+
+        struct SliceCB { UINT arraySlice; UINT pad[3]; };
+        D3D11_MAPPED_SUBRESOURCE mapped;
+
+        UINT half = win_width_ / 2;
+        UINT left_end = (half > 0) ? half - 1 : 0;   // left scissor stops 1px short of center
+        UINT right_start = half + 1;                  // right scissor starts 1px past center
+                                                        // -- the 2px gap [left_end, right_start)
+                                                        // is the divider (see header comment).
+
+        // Left half: passthrough (original).
+        D3D11_RECT left_rect{ 0, 0, static_cast<LONG>(left_end), static_cast<LONG>(win_height_) };
+        context_->RSSetScissorRects(1, &left_rect);
+        if (SUCCEEDED(context_->Map(slice_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            SliceCB cb{ pt_slot, {0, 0, 0} };
+            memcpy(mapped.pData, &cb, sizeof(cb));
+            context_->Unmap(slice_cb_.Get(), 0);
+        }
+        context_->PSSetConstantBuffers(0, 1, cbs);
+        context_->PSSetShader(ps_nv12_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* pt_srvs[] = { pt_srv_y_[pt_slot].Get(), pt_srv_uv_[pt_slot].Get() };
+        context_->PSSetShaderResources(0, 2, pt_srvs);
+        context_->Draw(3, 0);
+
+        // Right half: AI (de-mosaic), or passthrough again if no AI frame has ever landed yet
+        // (ai_is_ai == false, see present_loop()'s source-pick block).
+        D3D11_RECT right_rect{ static_cast<LONG>(right_start), 0, static_cast<LONG>(win_width_), static_cast<LONG>(win_height_) };
+        context_->RSSetScissorRects(1, &right_rect);
+        if (SUCCEEDED(context_->Map(slice_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            SliceCB cb{ ai_slot, {0, 0, 0} };
+            memcpy(mapped.pData, &cb, sizeof(cb));
+            context_->Unmap(slice_cb_.Get(), 0);
+        }
+        context_->PSSetConstantBuffers(0, 1, cbs);
+        if (ai_is_ai) {
+            context_->PSSetShader(ps_ai_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* ai_srvs[] = { ai_srv_[ai_slot].Get() };
+            context_->PSSetShaderResources(2, 1, ai_srvs);
+        } else {
+            context_->PSSetShader(ps_nv12_.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* pt_srvs2[] = { pt_srv_y_[ai_slot].Get(), pt_srv_uv_[ai_slot].Get() };
+            context_->PSSetShaderResources(0, 2, pt_srvs2);
+        }
+        context_->Draw(3, 0);
+
+        // Restore a full-window scissor before the shared UI/present tail. This method binds
+        // compare_rs_ (ScissorEnable=TRUE) and leaves a half-window scissor rect; ui_render_
+        // drawdata()'s ImGui DX11 backend backs up and RESTORES the scissor rect + RS state
+        // around its own draws (imgui_impl_dx11.cpp RSGet/RSSetScissorRects), it does NOT reset
+        // them to full-window -- so without this, the next NORMAL draw_and_present() frame (when
+        // compare mode is toggled back off) would inherit this half-window scissor and clip the
+        // video to the right half. draw_and_present() itself never sets scissor (it relies on
+        // inherited state), so the reset must happen here. RS is left as compare_rs_, which is
+        // field-identical to the ImGui RS state the normal path already runs under (see create_
+        // shader_pipeline()), so a full-window scissor fully neutralizes the leak.
+        D3D11_RECT full_rect{ 0, 0, static_cast<LONG>(win_width_), static_cast<LONG>(win_height_) };
+        context_->RSSetScissorRects(1, &full_rect);
+
+        // Same tail as draw_and_present(): render the published UI snapshot, then present once.
         ui_render_drawdata();
 
         swapchain_->Present(1, 0);
@@ -2802,6 +2995,10 @@ private:
     ComPtr<ID3D11PixelShader> ps_ai_;
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<ID3D11Buffer> slice_cb_;
+    // Phase 6 M-D: dedicated scissor-enabled rasterizer state for draw_and_present_compare()'s
+    // A/B wipe only -- draw_and_present() itself never binds this and is otherwise untouched
+    // (see create_shader_pipeline()'s comment for why its field values are what they are).
+    ComPtr<ID3D11RasterizerState> compare_rs_;
 
     ComPtr<ID3D11Texture2D> pt_ring_tex_;
     std::vector<ComPtr<ID3D11ShaderResourceView>> pt_srv_y_;
@@ -2874,6 +3071,21 @@ private:
     // means the opposite: present_loop() has committed to (or is about to run) draw_and_present()
     // for this iteration. See present_loop()'s two store sites and reopen()'s header comment.
     std::atomic<bool> present_in_splash_{ false };
+
+    // Phase 6 M-D: present-side view controls -- native-only atomics, written by
+    // build_settings_panel() (main thread, ui_tick()) and read directly by present_loop()'s
+    // source-pick block on the present thread. Deliberately NOT routed through UiIntents (see
+    // that struct's own header comment on why transport/config stays main-thread-exclusive):
+    // there is nothing here for present to block on -- the AI Scheduler keeps producing frames
+    // into the ready-map regardless of either flag, present merely chooses what to display, so
+    // the toggle is instant in both directions with a plain relaxed atomic (same discipline as
+    // volume_/muted_ above for audio_loop()).
+    // ai_enabled_: false forces present to NEVER show an AI frame (passthrough only), even as a
+    // stale-fallback (see present_loop()'s gating of the AiFresh/AiStale picks).
+    // compare_mode_: true draws the same frame's passthrough half and AI half side by side (see
+    // draw_and_present_compare()) instead of the single full-frame draw_and_present() path.
+    std::atomic<bool> ai_enabled_{ true };
+    std::atomic<bool> compare_mode_{ false };
 
     // ---- audio (spike, additive) -- slave to the master clock below (present_head_frame_/
     // playing_/anchor_frame_/anchor_qpc_ticks_/fps_/freq_), never the reverse; see audio_loop()
@@ -2976,6 +3188,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 // so this already matches both 'm' and 'M' as typed -- no separate lowercase
                 // branch needed.
                 self->toggle_mute();
+            } else if (wp == 'D') {
+                // Phase 6 M-D: de-mosaic on/off, direct atomic flip (same discipline as the
+                // volume/mute keys above -- pure present-side view state, no UiIntents needed).
+                self->set_ai_enabled(!self->is_ai_enabled());
+            } else if (wp == 'C') {
+                self->set_compare(!self->is_compare());
             }
         }
         return 0;
@@ -3031,6 +3249,10 @@ PYBIND11_MODULE(sumu_core, m)
         .def("set_muted", &Player::set_muted, py::arg("muted"))
         .def("toggle_mute", &Player::toggle_mute)
         .def("is_muted", &Player::is_muted)
+        .def("set_ai_enabled", &Player::set_ai_enabled, py::arg("enabled")) // Phase 6 M-D
+        .def("is_ai_enabled", &Player::is_ai_enabled)
+        .def("set_compare", &Player::set_compare, py::arg("enabled"))
+        .def("is_compare", &Player::is_compare)
         .def("ui_tick", &Player::ui_tick) // M2: main-thread NewFrame/build/Render/publish tick
         .def("ui_ready", &Player::ui_ready)
         .def("path", &Player::path)
