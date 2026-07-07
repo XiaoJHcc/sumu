@@ -13,7 +13,10 @@ project(sumu_core CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
-  add_compile_options(/W3 /EHsc)
+  # /utf-8: source files now contain literal UTF-8 Chinese text (settings panel labels).
+  # Without this, MSVC decodes narrow string literals using the system ANSI code page,
+  # which would silently corrupt those bytes at compile time (no build error, wrong text).
+  add_compile_options(/W3 /EHsc /utf-8)
 endif()
 
 set(CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" CACHE PATH "CUDA toolkit root (driver API headers/import lib only, no nvcc)")
@@ -70,6 +73,7 @@ target_link_libraries(sumu_core PRIVATE
     d3dcompiler
     winmm
     dwmapi
+    comdlg32
     avcodec
     avformat
     avutil

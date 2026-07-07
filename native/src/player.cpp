@@ -47,6 +47,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <timeapi.h>
+#include <commdlg.h> // GetOpenFileNameW (Player::pick_open_file)
 #pragma comment(lib, "winmm.lib")
 
 #include <cuda.h>
@@ -407,6 +408,39 @@ public:
 
         if (hwnd_) { DestroyWindow(hwnd_); hwnd_ = nullptr; }
         if (timer_period_set_) { timeEndPeriod(1); timer_period_set_ = false; }
+    }
+
+    // Blocking Win32 "Open" file dialog -- only safe to call before open() (no decode/present
+    // threads running yet, main thread free to block on a modal dialog). Returns the selected
+    // path as UTF-8, or an empty string if the user cancelled.
+    //
+    // Uses the WIDE API (GetOpenFileNameW) + an explicit UTF-8 conversion, NOT the ANSI
+    // GetOpenFileNameA: the ANSI variant returns the path in the process's ANSI codepage
+    // (e.g. GBK on zh-CN Windows), not UTF-8 -- that would silently mis-encode a CJK filename/
+    // path relative to what basename_of()'s (byte-substr, UTF-8-assuming) display and
+    // decoder_.open()'s avformat_open_input (Windows file protocol expects UTF-8) both need,
+    // either garbling the title-bar name or failing to open the file. This one call site is
+    // fixed at the source (return value is guaranteed UTF-8); the rest of the ANSI Win32 calls
+    // elsewhere in this file (CreateWindowExA etc.) are untouched, out of scope here.
+    std::string pick_open_file()
+    {
+        wchar_t file_buf[MAX_PATH] = {};
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter =
+            L"Video Files\0*.mp4;*.mkv;*.mov;*.avi;*.hevc;*.h265;*.ts\0"
+            L"All Files\0*.*\0\0";
+        ofn.lpstrFile = file_buf;
+        ofn.nMaxFile = static_cast<DWORD>(ARRAYSIZE(file_buf));
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&ofn)) return std::string();
+
+        int utf8_len = WideCharToMultiByte(CP_UTF8, 0, file_buf, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8_len <= 0) return std::string();
+        std::string utf8_path(static_cast<size_t>(utf8_len - 1), '\0'); // -1: drop the NUL WideCharToMultiByte counts
+        WideCharToMultiByte(CP_UTF8, 0, file_buf, -1, utf8_path.data(), utf8_len, nullptr, nullptr);
+        return utf8_path;
     }
 
     void pump_messages()
@@ -1020,6 +1054,43 @@ private:
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         ImGui::StyleColorsDark();
+
+        // CJK glyph support -- without this, any non-ASCII text (CJK filenames picked via
+        // pick_open_file(), the Chinese UI labels below) renders as tofu boxes. MUST run
+        // before ImGui_ImplDX11_Init()/CreateDeviceObjects() below: the font atlas has to be
+        // fully configured before the device objects (including the font texture) are built.
+        // Loaded at runtime from the system font directory only -- never bundled/committed,
+        // so no license/redistribution concern. Tries a short candidate list, falling back
+        // through progressively less-common CJK fonts. GetGlyphRangesChineseSimplifiedCommon()
+        // (ASCII + ~2500 common simplified Han glyphs) keeps the atlas far smaller than
+        // GetGlyphRangesChineseFull() while covering filenames/UI labels. 18.0f is a reasonable
+        // starting size for a 4K target; tune if it reads too small/large in practice.
+        static const char* kCjkFontCandidates[] = {
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+            "C:\\Windows\\Fonts\\msyhl.ttc",
+        };
+        bool cjk_font_loaded = false;
+        for (const char* font_path : kCjkFontCandidates) {
+            std::ifstream probe(font_path, std::ios::binary);
+            if (!probe.good()) continue;
+            probe.close();
+            if (io.Fonts->AddFontFromFileTTF(font_path, 18.0f, nullptr,
+                    io.Fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+                fprintf(stderr, "[sumu] CJK font loaded: %s\n", font_path);
+                cjk_font_loaded = true;
+                break;
+            }
+        }
+        if (!cjk_font_loaded) {
+            // No AddFont* call succeeded -- ImGui auto-adds its built-in ASCII-only default
+            // font the first time the atlas is built (Fonts.empty() path), so this is a safe,
+            // non-crashing fallback, just without CJK glyph coverage.
+            fprintf(stderr, "[sumu] warning: no CJK font found among candidates -- falling back "
+                "to the default ASCII-only ImGui font, CJK text will render as tofu boxes\n");
+        }
+
         ImGui_ImplWin32_Init(hwnd_);
         ImGui_ImplDX11_Init(device_.Get(), context_.Get());
         ImGui_ImplDX11_CreateDeviceObjects();
@@ -1079,6 +1150,32 @@ private:
         build_bottom_bar();
     }
 
+    // M-A: self-drawn icon buttons (top/bottom bar), replacing the M3 ASCII-text ImGui::Button
+    // labels -- same InvisibleButton + ImDrawList pattern already used by the seekbar above.
+    // A plain ImGui::Button() auto-sizes an unspecified axis from its label/frame padding;
+    // InvisibleButton has no label to fall back on and asserts on a zero size axis, so callers
+    // here always pass an explicit nonzero size. Returns the item's hit-test result plus its
+    // screen-space rect and draw list so the caller can immediately paint an icon glyph
+    // centered on it, and draws a faint hover highlight (same visual language as ImGui's own
+    // button hover state, just manually painted since these aren't real ImGui buttons).
+    struct IconButtonResult {
+        bool clicked;
+        ImVec2 min, max;
+        ImDrawList* dl;
+    };
+
+    IconButtonResult icon_button(const char* str_id, ImVec2 size)
+    {
+        IconButtonResult r{};
+        r.clicked = ImGui::InvisibleButton(str_id, size);
+        r.min = ImGui::GetItemRectMin();
+        r.max = ImGui::GetItemRectMax();
+        r.dl = ImGui::GetWindowDrawList();
+        if (ImGui::IsItemHovered())
+            r.dl->AddRectFilled(r.min, r.max, IM_COL32(255, 255, 255, 30));
+        return r;
+    }
+
     void build_top_bar(float& out_height)
     {
         ImGuiIO& io = ImGui::GetIO();
@@ -1092,9 +1189,23 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("##sumu_top_bar", nullptr, flags);
 
-        if (ImGui::Button(ui_settings_open_ ? "[x] Settings" : "[ ] Settings")) {
-            ui_settings_open_ = !ui_settings_open_;
-            if (ui_settings_open_) settings_edit_init_ = false; // resync edit buffers to latest cfg on open
+        const float btn_w = 28.0f;
+        const float btn_h = bar_h - 4.0f;
+        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+
+        { // settings toggle: hamburger icon (three horizontal bars), replaces the old text button
+            IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) {
+                ui_settings_open_ = !ui_settings_open_;
+                if (ui_settings_open_) settings_edit_init_ = false; // resync edit buffers to latest cfg on open
+            }
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float w = 14.0f;
+            for (int i = -1; i <= 1; ++i) {
+                float y = cy + i * 5.0f;
+                r.dl->AddLine(ImVec2(cx - w * 0.5f, y), ImVec2(cx + w * 0.5f, y), icon_col, 1.5f);
+            }
         }
         ImGui::SameLine();
         ImGui::TextUnformatted(basename_of(video_path_).c_str());
@@ -1102,7 +1213,6 @@ private:
 
         // Blank draggable region (native-titlebar-like drag), sized to leave room for the
         // four right-side buttons so it doesn't eat their clicks.
-        const float btn_w = 28.0f;
         const int n_btns = 4; // minimize, maximize/restore, fullscreen, close
         float drag_w = ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * n_btns;
         if (drag_w < 0.0f) drag_w = 0.0f;
@@ -1113,21 +1223,58 @@ private:
         }
         ImGui::SameLine();
 
-        if (ImGui::Button("_", ImVec2(btn_w, 0))) {
-            ShowWindow(hwnd_, SW_MINIMIZE);
+        { // minimize: single horizontal bar
+            IconButtonResult r = icon_button("##min_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) ShowWindow(hwnd_, SW_MINIMIZE);
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            r.dl->AddLine(ImVec2(cx - 6.0f, cy), ImVec2(cx + 6.0f, cy), icon_col, 1.5f);
         }
         ImGui::SameLine();
+
         bool zoomed = IsZoomed(hwnd_) != 0;
-        if (ImGui::Button(zoomed ? "[]" : "[ ]", ImVec2(btn_w, 0))) {
-            ShowWindow(hwnd_, zoomed ? SW_RESTORE : SW_MAXIMIZE);
+        { // maximize/restore: hollow square (not maximized) / overlapping double square (maximized)
+            IconButtonResult r = icon_button("##max_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) ShowWindow(hwnd_, zoomed ? SW_RESTORE : SW_MAXIMIZE);
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            if (!zoomed) {
+                r.dl->AddRect(ImVec2(cx - 5.0f, cy - 5.0f), ImVec2(cx + 5.0f, cy + 5.0f), icon_col, 0.0f, 0, 1.5f);
+            } else {
+                r.dl->AddRect(ImVec2(cx - 5.0f, cy - 3.0f), ImVec2(cx + 3.0f, cy + 5.0f), icon_col, 0.0f, 0, 1.5f);
+                r.dl->AddRect(ImVec2(cx - 3.0f, cy - 5.0f), ImVec2(cx + 5.0f, cy + 3.0f), icon_col, 0.0f, 0, 1.5f);
+            }
         }
         ImGui::SameLine();
-        if (ImGui::Button("[F]", ImVec2(btn_w, 0))) {
-            toggle_fullscreen();
+
+        { // fullscreen toggle: four corner brackets -- deliberately distinct from the maximize
+          // square above so the two aren't visually confusable
+            IconButtonResult r = icon_button("##fullscreen_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) toggle_fullscreen();
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float half = 6.0f, leg = 3.5f;
+            const ImVec2 corners[4] = {
+                ImVec2(cx - half, cy - half), ImVec2(cx + half, cy - half),
+                ImVec2(cx - half, cy + half), ImVec2(cx + half, cy + half),
+            };
+            const float dirx[4] = { 1.0f, -1.0f, 1.0f, -1.0f };
+            const float diry[4] = { 1.0f, 1.0f, -1.0f, -1.0f };
+            for (int i = 0; i < 4; ++i) {
+                r.dl->AddLine(corners[i], ImVec2(corners[i].x + dirx[i] * leg, corners[i].y), icon_col, 1.5f);
+                r.dl->AddLine(corners[i], ImVec2(corners[i].x, corners[i].y + diry[i] * leg), icon_col, 1.5f);
+            }
         }
         ImGui::SameLine();
-        if (ImGui::Button("X", ImVec2(btn_w, 0))) {
-            PostMessageA(hwnd_, WM_CLOSE, 0, 0);
+
+        { // close: X (two diagonals)
+            IconButtonResult r = icon_button("##close_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) PostMessageA(hwnd_, WM_CLOSE, 0, 0);
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float half = 5.0f;
+            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, 1.5f);
+            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, 1.5f);
         }
 
         ImGui::End();
@@ -1153,8 +1300,28 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("##sumu_bottom_bar", nullptr, flags);
 
-        if (ImGui::Button(is_playing() ? "Pause" : "Play", ImVec2(56.0f, 0))) {
-            record_toggle_play();
+        { // play/pause: icon shows the ACTION a click performs (matches the old "Pause"/"Play"
+          // text label semantics) -- playing state draws a pause glyph (two bars), paused state
+          // draws a play glyph (solid triangle).
+            IconButtonResult r = icon_button("##play_pause_btn", ImVec2(40.0f, bar_h - 8.0f));
+            if (r.clicked) record_toggle_play();
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+            if (is_playing()) {
+                const float bar_w = 4.0f, bar_gap = 4.0f, bar_hh = 14.0f;
+                r.dl->AddRectFilled(ImVec2(cx - bar_gap * 0.5f - bar_w, cy - bar_hh * 0.5f),
+                    ImVec2(cx - bar_gap * 0.5f, cy + bar_hh * 0.5f), icon_col);
+                r.dl->AddRectFilled(ImVec2(cx + bar_gap * 0.5f, cy - bar_hh * 0.5f),
+                    ImVec2(cx + bar_gap * 0.5f + bar_w, cy + bar_hh * 0.5f), icon_col);
+            } else {
+                const float tri_w = 12.0f, tri_hh = 14.0f;
+                r.dl->AddTriangleFilled(
+                    ImVec2(cx - tri_w * 0.4f, cy - tri_hh * 0.5f),
+                    ImVec2(cx - tri_w * 0.4f, cy + tri_hh * 0.5f),
+                    ImVec2(cx + tri_w * 0.6f, cy),
+                    icon_col);
+            }
         }
         ImGui::SameLine();
 
@@ -1228,11 +1395,11 @@ private:
             settings_edit_init_ = true;
         }
 
-        ImGui::TextUnformatted("Settings");
+        ImGui::TextUnformatted(u8"设置");
         ImGui::Separator();
-        ImGui::SliderInt("Clip length", &settings_edit_clip_length_, 1, 180);
-        ImGui::SliderInt("Max regions/frame", &settings_edit_max_regions_, 1, 8);
-        if (ImGui::Button("Apply")) {
+        ImGui::SliderInt(u8"片段长度", &settings_edit_clip_length_, 1, 180);
+        ImGui::SliderInt(u8"每帧最大区域数", &settings_edit_max_regions_, 1, 8);
+        if (ImGui::Button(u8"应用")) {
             // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
             // scheduler when it sees a non-null clip_length/max_regions, never on every slider
             // tick.
@@ -1241,8 +1408,8 @@ private:
         }
 
         ImGui::Separator();
-        ImGui::TextUnformatted("Diagnostics");
-        ImGui::Text("AI hit rate: %.3f", ai_hit_rate());
+        ImGui::TextUnformatted(u8"诊断");
+        ImGui::Text(u8"AI 命中率：%.3f", ai_hit_rate());
         // backlog_resyncs / clips_restored / frames_pushed are Python Scheduler.get_stats()
         // fields (python/sumu/scheduler.py) with no native equivalent in Player::stats() and no
         // channel carrying them into native -- intentionally not displayed here rather than
@@ -1887,6 +2054,7 @@ PYBIND11_MODULE(sumu_core, m)
     py::class_<Player>(m, "Player")
         .def(py::init<int, int, bool>(),
             py::arg("width_hint") = 1280, py::arg("height_hint") = 720, py::arg("maximized") = false)
+        .def("pick_open_file", &Player::pick_open_file) // blocking Win32 dialog, call before open()
         .def("open", &Player::open, py::arg("path"))
         .def("play", &Player::play)
         .def("pause", &Player::pause)
