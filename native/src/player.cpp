@@ -49,6 +49,7 @@
 #include <timeapi.h>
 #include <commdlg.h> // GetOpenFileNameW (Player::pick_open_file)
 #include <shellapi.h> // DragAcceptFiles/DragQueryFileW/DragFinish (M-C2: WM_DROPFILES)
+#include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM (WndProc's WM_NCHITTEST)
 #pragma comment(lib, "winmm.lib")
 
 // Audio (spike, additive): WASAPI. initguid.h MUST precede mmdeviceapi.h/audioclient.h/
@@ -704,6 +705,41 @@ public:
     bool should_quit() const { return quit_.load(std::memory_order_relaxed); }
     void set_quit() { quit_.store(true, std::memory_order_relaxed); }
 
+    // ---- window resize (WM_SIZE) -- main-thread-only (called from WndProc via
+    // pump_messages()). Rebuilds the swapchain's backbuffer RTV to match the new client area;
+    // takes d3d_mutex_ to serialize against the present thread's draw_and_present() /
+    // draw_and_present_compare() (see file header for the lock's role). Does not touch
+    // pacing/anchor state, DXGI_SCALING_STRETCH, or seek/CUDA/audio logic.
+    void on_resize(UINT w, UINT h)
+    {
+        if (!swapchain_) return;
+        if (w == win_width_ && h == win_height_) return;
+        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        backbuffer_rtv_.Reset();
+        check_hr(swapchain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers");
+        ComPtr<ID3D11Texture2D> backbuffer;
+        swapchain_->GetBuffer(0, IID_PPV_ARGS(&backbuffer));
+        check_hr(device_->CreateRenderTargetView(backbuffer.Get(), nullptr, &backbuffer_rtv_), "CreateRenderTargetView");
+        win_width_ = w;
+        win_height_ = h;
+    }
+
+    // ---- borderless custom-caption support (WM_NCCALCSIZE/WM_NCHITTEST, see WndProc) --------
+    // caption_drag_x0_/x1_/y1_ are published each frame by build_top_bar() from its
+    // "##drag_region" InvisibleButton's item rect (client-space, since the top-bar ImGui window
+    // sits at client (0,0)) and consumed here by WndProc's WM_NCHITTEST to report HTCAPTION over
+    // that region -- giving OS-native window drag/double-click-to-maximize/Aero-Snap without a
+    // synthetic WM_NCLBUTTONDOWN SendMessage (which used to leave ImGui's mouse-down state stuck
+    // until an extra click). Zero-initialized so before the first frame renders (x1_ <= x0_)
+    // point_in_caption_drag() is always false and WM_NCHITTEST safely falls back to HTCLIENT.
+    bool point_in_caption_drag(int x, int y) const
+    {
+        return caption_drag_x1_ > caption_drag_x0_ && x >= (int)caption_drag_x0_ &&
+            x < (int)caption_drag_x1_ && y >= 0 && y < (int)caption_drag_y1_;
+    }
+
+    bool is_fullscreen() const { return fullscreen_; }
+
     // ---- transport control -------------------------------------------------------------
 
     void play()
@@ -1225,6 +1261,26 @@ private:
 
     void create_window(int width_hint, int height_hint, bool maximized)
     {
+        // Process DPI awareness (once per process, before any window is created). Resolved
+        // dynamically via GetProcAddress rather than calling SetProcessDpiAwarenessContext
+        // directly so this doesn't depend on the exact Windows SDK version targeted by the
+        // build. A FALSE return just means something else (e.g. the app manifest) already set
+        // it -- not an error, so the result is ignored.
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((HANDLE)-4)
+#endif
+        static bool once = []() {
+            HMODULE user32 = GetModuleHandleW(L"user32.dll");
+            if (user32) {
+                using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(HANDLE);
+                auto fn = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+                    GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+                if (fn) fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            }
+            return true;
+        }();
+        (void)once;
+
         HINSTANCE hinst = GetModuleHandle(nullptr);
         WNDCLASSEXA wc{};
         wc.cbSize = sizeof(wc);
@@ -1248,6 +1304,13 @@ private:
         DragAcceptFiles(hwnd_, TRUE); // M-C2: enables WM_DROPFILES (see WndProc)
         ShowWindow(hwnd_, maximized ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(hwnd_);
+        // Force one WM_NCCALCSIZE/WM_SIZE recalculation now that GWLP_USERDATA/WndProc's
+        // borderless logic is live, so the window immediately reflects the borderless client
+        // area rather than waiting for the next user-driven resize. Harmlessly a no-op on the
+        // resulting on_resize() call: swapchain_ doesn't exist yet at this point in open(), so
+        // on_resize()'s `if (!swapchain_) return;` early-out absorbs it.
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
         RECT client_rc;
         GetClientRect(hwnd_, &client_rc);
@@ -1595,9 +1658,15 @@ private:
         float drag_w = ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * n_btns;
         if (drag_w < 0.0f) drag_w = 0.0f;
         ImGui::InvisibleButton("##drag_region", ImVec2(drag_w, bar_h - 4.0f));
-        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            ReleaseCapture();
-            SendMessageA(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        // Publish this frame's drag rect (client-space) for WndProc's WM_NCHITTEST to consume
+        // (see point_in_caption_drag()'s header comment) -- WM_NCHITTEST reporting HTCAPTION
+        // here gives OS-native drag/double-click-maximize/Aero-Snap, so no synthetic
+        // WM_NCLBUTTONDOWN SendMessage is needed (that used to leave ImGui's mouse-down state
+        // stuck until an extra click).
+        {
+            ImVec2 dmin = ImGui::GetItemRectMin();
+            ImVec2 dmax = ImGui::GetItemRectMax();
+            caption_drag_x0_ = dmin.x; caption_drag_x1_ = dmax.x; caption_drag_y1_ = bar_h;
         }
         ImGui::SameLine();
 
@@ -2985,6 +3054,11 @@ private:
     RECT windowed_rect_{};  // saved pre-fullscreen window rect, for restore
     LONG windowed_style_ = 0; // saved pre-fullscreen GWL_STYLE, for restore
 
+    // ---- borderless custom-caption drag rect (client-space), published by build_top_bar(),
+    // consumed by WndProc's WM_NCHITTEST via point_in_caption_drag() above. Zero-initialized so
+    // WM_NCHITTEST is safe before the first UI frame renders (see point_in_caption_drag()).
+    float caption_drag_x0_ = 0, caption_drag_x1_ = 0, caption_drag_y1_ = 0;
+
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGIAdapter> adapter_;
@@ -3200,6 +3274,67 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN) return 0; // swallow Alt+Enter, no exclusive fullscreen here
         break;
+    // ---- borderless custom-caption (see Player::point_in_caption_drag()'s header comment) --
+    // WS_OVERLAPPEDWINDOW/WS_CAPTION/WS_THICKFRAME stay ON the window (unlike a from-scratch
+    // popup-style borderless window) -- this pair just hollows out the non-client area so the
+    // client fills the whole window, while keeping DWM's native Aero Snap / maximize animation /
+    // shadow / taskbar behavior (same trick as Windows Terminal / Chromium). May fire during
+    // CreateWindowEx before GWLP_USERDATA is set (self == nullptr) -- the WM_NCCALCSIZE branch
+    // below deliberately doesn't need self for that reason.
+    case WM_NCCALCSIZE:
+        if (wp == TRUE) {
+            if (IsZoomed(hwnd)) {
+                // Maximized: without this inset, DWM's default zoomed rect overhangs the
+                // monitor by one frame thickness on each side, which then overlaps the taskbar
+                // and clips content -- pulling it in by the frame+padding metrics compensates.
+                NCCALCSIZE_PARAMS* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+                UINT dpi = GetDpiForWindow(hwnd);
+                int fx = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                int fy = GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                p->rgrc[0].left += fx; p->rgrc[0].right -= fx;
+                p->rgrc[0].top += fy; p->rgrc[0].bottom -= fy;
+            }
+            return 0; // non-maximized: client fills the entire window == borderless
+        }
+        break;
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &pt);
+        RECT rc; GetClientRect(hwnd, &rc);
+        UINT dpi = GetDpiForWindow(hwnd);
+        int margin = MulDiv(8, dpi, 96);
+        bool can_resize = !IsZoomed(hwnd) && !(self && self->is_fullscreen());
+        if (can_resize) {
+            bool L = pt.x < margin, R = pt.x >= rc.right - margin;
+            bool T = pt.y < margin, B = pt.y >= rc.bottom - margin;
+            if (T && L) return HTTOPLEFT;
+            if (T && R) return HTTOPRIGHT;
+            if (B && L) return HTBOTTOMLEFT;
+            if (B && R) return HTBOTTOMRIGHT;
+            if (L) return HTLEFT;
+            if (R) return HTRIGHT;
+            if (T) return HTTOP;
+            if (B) return HTBOTTOM;
+        }
+        if (self && self->point_in_caption_drag(pt.x, pt.y)) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_SIZE:
+        if (wp != SIZE_MINIMIZED) {
+            UINT w = LOWORD(lp);
+            UINT h = HIWORD(lp);
+            if (self && w != 0 && h != 0) self->on_resize(w, h);
+        }
+        return 0;
+    case WM_DPICHANGED: {
+        RECT* rc = reinterpret_cast<RECT*>(lp);
+        if (rc) {
+            SetWindowPos(hwnd, nullptr, rc->left, rc->top,
+                rc->right - rc->left, rc->bottom - rc->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    }
     case WM_DROPFILES: {
         // M-C2: file dropped on the window -- record its path as an open intent (drained by
         // Python's take_ui_intents(), same channel/discipline as record_seek() etc., see
