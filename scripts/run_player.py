@@ -27,21 +27,15 @@ sys.path.insert(0, os.path.join(_REPO, "python"))
 sys.path.insert(0, os.path.join(_REPO, "python", "sumu"))
 
 import sumu_core  # noqa: E402
+from sumu.pipeline import build_models  # noqa: E402
 
 TRACE_DIR = os.path.join(_HERE, "trace")
+# run_player.py is dev-only smoke/verification tooling; it is NOT part of the frozen
+# daily-player import closure (scripts/sumu_main.py -> sumu.app never imports it), so
+# creating the trace dir at import time is safe here and keeps the dev sibling scripts
+# (stress_reopen.py / stress_seek_ai.py / verify_md.py) that read rp.TRACE_DIR working
+# without calling main().
 os.makedirs(TRACE_DIR, exist_ok=True)
-
-
-def build_models(device, fp16, allow_trt_compile=True):
-    from sumu.ai import ModelFiles
-    from sumu.ai.restorationpipeline import load_models
-
-    rp = ModelFiles.get_restoration_model_by_name("basicvsrpp-v1.2").path
-    dp = ModelFiles.get_detection_model_by_name("v4-fast").path
-    return load_models(
-        device, "basicvsrpp-v1.2", rp, None, dp,
-        fp16=fp16, detect_face_mosaics=False, allow_trt_compile=allow_trt_compile,
-    )
 
 
 def print_status(tag, player, scheduler, t0):

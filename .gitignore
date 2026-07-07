@@ -19,6 +19,9 @@ native/third_party/*
 build/
 native/build/
 *.pyd
+
+# --- PyInstaller onedir bundle (~10GB, arch-bound; built by scripts/build_dist.ps1) ---
+dist/
 *.obj
 *.lib
 *.exp
@@ -44,7 +47,11 @@ presentmon_*.csv
 *.etl
 
 # --- editor / OS ---
-.vscode/
+# Track the shared launch/tasks config (thin forwarders to scripts/); ignore any
+# other (per-user) .vscode content like settings.json.
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
 .idea/
 .DS_Store
 

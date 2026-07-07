@@ -1,0 +1,54 @@
+{
+  // Thin forwarders to the real scripts (scripts/ + native/). VSCode tasks just invoke
+  // them with the right shell; all actual logic lives in the scripts themselves.
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "video",
+      "type": "promptString",
+      "description": "Video file to open (path relative to repo root, or absolute)",
+      "default": "test_video.mp4"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "sumu: run (dev)",
+      "detail": "Launch the daily-use player (scripts/play.py) with the venv interpreter.",
+      "type": "shell",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["scripts/play.py", "${input:video}"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "sumu: build native",
+      "detail": "Rebuild the native sumu_core.pyd via native/build.bat (needs VS2022 BuildTools).",
+      "type": "shell",
+      "command": "cmd",
+      "args": ["/c", "native\\build.bat"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "sumu: apply patches",
+      "detail": "Re-apply third-party runtime patches (ultralytics/mmengine) to .venv site-packages.",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/apply_patches.sh"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "sumu: build dist",
+      "detail": "Full distributable pipeline: native build -> patches -> PyInstaller onedir -> stage weights -> smoke.",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy", "Bypass",
+        "-File", "scripts/build_dist.ps1"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

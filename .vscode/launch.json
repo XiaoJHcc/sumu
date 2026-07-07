@@ -1,0 +1,28 @@
+{
+  // Thin forwarder to the dev entry (scripts/play.py). The real logic lives in
+  // scripts/ + python/sumu; this just launches it under the debugger with the venv
+  // interpreter and the repo as cwd. NOTE: play.py opens a real window and runs until
+  // you close it (no auto-timeout) -- stop the debug session to end it.
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "video",
+      "type": "promptString",
+      "description": "Video file to open (path relative to repo root, or absolute)",
+      "default": "test_video.mp4"
+    }
+  ],
+  "configurations": [
+    {
+      "name": "Debug sumu (dev)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/play.py",
+      "args": ["${input:video}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": false
+    }
+  ]
+}
