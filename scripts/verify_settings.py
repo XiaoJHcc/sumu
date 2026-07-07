@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: sumu Authors
+# SPDX-License-Identifier: AGPL-3.0
+#
+# Phase 6 M-E verification: python/sumu/settings.py round-trip / corruption / push_recent /
+# resume-gate / atomic-write checks. Stdlib + sumu.settings only -- no GPU/torch/Player needed,
+# fast and headless. Run with: .venv/Scripts/python.exe scripts/verify_settings.py
+import os
+import json
+import shutil
+import sys
+import tempfile
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+sys.path.insert(0, os.path.join(_REPO, "python"))
+
+from sumu import settings as settings_mod  # noqa: E402
+
+failures = []
+
+
+def check(name, condition):
+    status = "PASS" if condition else "FAIL"
+    print(f"[{status}] {name}")
+    if not condition:
+        failures.append(name)
+
+
+def main():
+    tmpdir = tempfile.mkdtemp(prefix="sumu_settings_test_")
+    try:
+        settings_path = os.path.join(tmpdir, "settings.json")
+
+        # 1. Round-trip
+        s = settings_mod.Settings(
+            volume=0.5, muted=True, recent=["a", "b", "c"], positions={"x": 1234},
+        )
+        settings_mod.save(s, settings_path)
+        loaded = settings_mod.load(settings_path)
+        check("round-trip volume", loaded.volume == 0.5)
+        check("round-trip muted", loaded.muted is True)
+        check("round-trip recent", loaded.recent == ["a", "b", "c"])
+        check("round-trip positions", loaded.positions == {"x": 1234})
+
+        # 2. Corrupt/missing
+        with open(settings_path, "wb") as f:
+            f.write(b"\x00\x01not json{{{")
+        corrupt_loaded = settings_mod.load(settings_path)
+        check("corrupt file -> defaults (volume)", corrupt_loaded.volume == 1.0)
+        check("corrupt file -> defaults (muted)", corrupt_loaded.muted is False)
+        check("corrupt file -> defaults (recent)", corrupt_loaded.recent == [])
+        check("corrupt file -> defaults (positions)", corrupt_loaded.positions == {})
+
+        os.remove(settings_path)
+        missing_loaded = settings_mod.load(settings_path)
+        check("missing file -> defaults", missing_loaded == settings_mod.Settings())
+
+        # 3. push_recent semantics. push_recent stores os.path.abspath(path) (case-preserved,
+        # "a real usable absolute path" per the spec) and dedups/orders via the case-insensitive
+        # normcase key -- so the expected list below runs the same tokens through abspath() to
+        # match what push_recent actually stores, while still exercising move-to-front + dedup.
+        s2 = settings_mod.Settings()
+        for tok in ["A", "B", "C", "A"]:
+            s2.push_recent(tok)
+        expected_order = [os.path.abspath(tok) for tok in ["A", "C", "B"]]
+        check("push_recent move-to-front + dedup", s2.recent == expected_order)
+
+        s3 = settings_mod.Settings()
+        for i in range(12):
+            s3.push_recent(f"file{i}")
+        check("push_recent cap at 10", len(s3.recent) == 10)
+        expected_capped = [os.path.abspath(f"file{i}") for i in range(11, 1, -1)]
+        check("push_recent keeps newest, drops oldest", s3.recent == expected_capped)
+
+        # 4. Resume gate logic (pure predicate, settings_mod.is_resumable_frame)
+        fps = 30.0
+        frame_count = 3000  # 100s clip
+        check("resume: just after start -> no resume",
+              settings_mod.is_resumable_frame(10, fps, frame_count) is False)
+        check("resume: near end -> no resume",
+              settings_mod.is_resumable_frame(frame_count - 10, fps, frame_count) is False)
+        check("resume: middle -> resumes",
+              settings_mod.is_resumable_frame(1500, fps, frame_count) is True)
+        check("resume: unknown fps -> no resume",
+              settings_mod.is_resumable_frame(1500, 0, frame_count) is False)
+        check("resume: unknown frame_count -> no resume",
+              settings_mod.is_resumable_frame(1500, fps, 0) is False)
+        check("resume: no stored position -> no resume",
+              settings_mod.is_resumable_frame(None, fps, frame_count) is False)
+
+        # 5. Atomic write: no leftover temp file, target parses as valid JSON.
+        s4 = settings_mod.Settings(volume=0.7)
+        settings_mod.save(s4, settings_path)
+        leftover_tmp = [f for f in os.listdir(tmpdir) if f != "settings.json"]
+        check("atomic write: no leftover temp files", leftover_tmp == [])
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+        check("atomic write: target parses as valid JSON", isinstance(data, dict))
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print()
+    if failures:
+        print(f"RESULT: FAIL ({len(failures)} failing): {failures}")
+        sys.exit(1)
+    else:
+        print("RESULT: PASS (all checks passed)")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

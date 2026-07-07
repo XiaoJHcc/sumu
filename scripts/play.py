@@ -17,6 +17,7 @@ sys.path.insert(0, _HERE)
 
 import sumu_core  # noqa: E402
 import run_player as rp  # noqa: E402 -- reuse build_models(), no re-plumbing
+from sumu import settings as settings_mod  # noqa: E402 -- M-E: persisted volume/mute/recent/resume
 
 
 def main():
@@ -27,7 +28,11 @@ def main():
     ap.add_argument("--maximized", action="store_true", default=True)
     args = ap.parse_args()
 
+    settings = settings_mod.load()
+
     player = sumu_core.Player(args.width, args.height, args.maximized)
+    player.set_volume(settings.volume)
+    player.set_muted(settings.muted)
 
     video = args.video
     if not video:
@@ -36,6 +41,12 @@ def main():
             print("[play] no file selected, exiting", file=sys.stderr)
             player.close()
             return
+
+    # M-E: current_path tracks whichever file is actually loaded (initial open, then whatever
+    # apply_ui_intents' reopen path swaps it to) -- both the reopen handler and the loop-exit
+    # finally use it to know which file's position to persist.
+    current_path = video
+    settings.push_recent(current_path)
 
     # M-C1: present_thread_ is already running (started in the Player ctor) and draws a "loading"
     # splash while !session_active_. Publish a splash frame now, THEN do the whole heavy startup
@@ -75,6 +86,21 @@ def main():
     scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
     scheduler.start()
 
+    def maybe_resume(path):
+        """M-E: seek back to where the user left off in `path`, if settings has a "meaningful
+        mid-file" position for it (settings_mod.is_resumable_frame -- skips near-start/near-end
+        and unknown fps/frame_count). Same seek order as the UI seek-intent path below
+        (scheduler.notify_seek() then player.seek()). No-op if there's no stored position or it
+        doesn't clear the resume gate."""
+        frame = settings.get_position(path)
+        if frame is None:
+            return
+        if settings_mod.is_resumable_frame(frame, player.fps(), player.frame_count()):
+            scheduler.notify_seek(frame)
+            player.seek(frame)
+
+    maybe_resume(current_path)
+
     def apply_ui_intents(intents):
         """Same semantics as run_player.py's apply_ui_intents (toggle_play / seek /
         clip_length|max_regions rebuild) -- see run_player.py:183 for the full rationale.
@@ -85,7 +111,7 @@ def main():
         Player::reopen()). The scheduler is torn down/rebuilt exactly like the clip_length/
         max_regions path above (model objects reused, only the scheduler + its video_meta are
         file-specific)."""
-        nonlocal scheduler, config, video_meta
+        nonlocal scheduler, config, video_meta, current_path
 
         if intents["toggle_play"]:
             if player.is_playing():
@@ -116,13 +142,18 @@ def main():
         elif intents["open_path"]:
             path = intents["open_path"]
         if path:
+            # M-E: snapshot the outgoing file's position before it's swapped away.
+            settings.set_position(current_path, player.current_frame())
             scheduler.stop()
             new_frame_count = player.reopen(path)
             print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
                   file=sys.stderr)
             video_meta = get_video_meta_data(path)
+            current_path = path
+            settings.push_recent(current_path)
             scheduler = Scheduler(player, det_model, res_model, pad_mode, video_meta, config)
             scheduler.start()
+            maybe_resume(current_path)
             player.play()  # open_session() starts paused; a freshly reopened file auto-plays
                            # (matches main()'s open->scheduler.start()->play() sequence below)
 
@@ -138,6 +169,14 @@ def main():
             # cadence. Keep 0.02.
             time.sleep(0.02)
     finally:
+        # M-E: persist the outgoing file's position and save settings.json. current_frame() is
+        # guarded -- the player may already be mid-close by the time we get here, and persistence
+        # must never turn a clean shutdown into a crash.
+        try:
+            settings.set_position(current_path, player.current_frame())
+        except Exception:  # noqa: BLE001 -- persistence must never crash shutdown
+            pass
+        settings_mod.save(settings)
         scheduler.stop()
         player.close()
 
