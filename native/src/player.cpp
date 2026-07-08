@@ -327,6 +327,10 @@ struct UiIntents {
     // same as every other field here).
     std::string open_path;
     bool open_dialog = false;
+    // First-screen "compile TRT acceleration engines" button (open-prompt overlay only). Python
+    // responds by spawning the blocking compile off the main thread and driving the compile UI
+    // via set_compile_ui(). Doubles as the "retry" click in the failed state.
+    bool compile_engine = false;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -819,9 +823,14 @@ public:
         int client_w = std::max(1, static_cast<int>(std::lround(sw * scale)));
         int client_h = std::max(1, static_cast<int>(std::lround(sh * scale + kTopBarH)));
 
-        // Center on the current monitor's work area, then clamp so no edge spills off it.
-        int x = mi.rcWork.left + (work_w - client_w) / 2;
-        int y = mi.rcWork.top + (work_h - client_h) / 2;
+        // Keep the window's current center where it is (don't force-center on the monitor);
+        // only nudge it back onto the work area if the new size would spill off an edge.
+        RECT cur{};
+        GetWindowRect(hwnd_, &cur);
+        int center_x = cur.left + (cur.right - cur.left) / 2;
+        int center_y = cur.top + (cur.bottom - cur.top) / 2;
+        int x = center_x - client_w / 2;
+        int y = center_y - client_h / 2;
         if (x + client_w > mi.rcWork.right)  x = mi.rcWork.right - client_w;
         if (y + client_h > mi.rcWork.bottom) y = mi.rcWork.bottom - client_h;
         if (x < mi.rcWork.left) x = mi.rcWork.left;
@@ -959,6 +968,7 @@ public:
     // UiIntents' own header comment. Both main-thread-only, same as record_seek() above.
     void record_open_path(const std::string& path) { ui_intents_.open_path = path; }
     void record_open_dialog() { ui_intents_.open_dialog = true; }
+    void record_compile_engine() { ui_intents_.compile_engine = true; }
 
     const std::string& path() const { return video_path_; }
     bool ui_ready() const { return ui_ready_; }
@@ -982,6 +992,17 @@ public:
     // tick (empty = hide), no lock needed since only the main thread ever touches it.
     void set_status_text(const std::string& s) { status_text_ = s; }
 
+    // First-screen TRT-compile prompt state, pushed once per Python tick (same main-thread-only
+    // publish pattern as set_status_text). state: 0 hidden / 1 idle (offer compile) / 2 running
+    // (progress bar) / 3 failed (offer retry). progress in [0,1]; text is the line shown under
+    // the button (idle/failed) or beside the bar (running). Rendered by build_open_prompt_overlay.
+    void set_compile_ui(int state, float progress, const std::string& text)
+    {
+        compile_ui_state_ = state;
+        compile_ui_progress_ = progress;
+        compile_ui_text_ = text;
+    }
+
     py::dict take_ui_intents()
     {
         py::dict d;
@@ -991,6 +1012,7 @@ public:
         d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
         d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
         d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
+        d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
         ui_intents_ = UiIntents{}; // drain
         return d;
     }
@@ -1758,7 +1780,22 @@ private:
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
         const float open_btn_w = 120.0f, open_btn_h = 32.0f;
         const float gap = 16.0f;
-        float block_h = tsize.y + gap + open_btn_h;
+
+        // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
+        // it first so the whole prompt+button+compile block stays vertically centered.
+        const float compile_cw = 380.0f;      // content column width for the compile region
+        const float region_gap = 30.0f;       // gap between open button and the compile region
+        const float ctrl_gap = 10.0f;         // gap between the compile text line and its control
+        const float compile_btn_w = 200.0f, compile_btn_h = 30.0f, compile_bar_h = 18.0f;
+        bool show_compile = compile_ui_state_ != 0;
+        float compile_text_h = 0.0f, compile_block_h = 0.0f;
+        if (show_compile) {
+            compile_text_h = ImGui::CalcTextSize(compile_ui_text_.c_str(), nullptr, false, compile_cw).y;
+            float ctrl_h = (compile_ui_state_ == 2) ? compile_bar_h : compile_btn_h;
+            compile_block_h = region_gap + compile_text_h + ctrl_gap + ctrl_h;
+        }
+
+        float block_h = tsize.y + gap + open_btn_h + compile_block_h;
         float top = (io.DisplaySize.y - block_h) * 0.5f;
 
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, top));
@@ -1766,6 +1803,31 @@ private:
 
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - open_btn_w) * 0.5f, top + tsize.y + gap));
         if (ImGui::Button(u8"打开文件", ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
+
+        if (show_compile) {
+            float region_x = (io.DisplaySize.x - compile_cw) * 0.5f;
+            float cy = top + tsize.y + gap + open_btn_h + region_gap;
+
+            bool failed = compile_ui_state_ == 3;
+            if (failed) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
+            ImGui::SetCursorPos(ImVec2(region_x, cy));
+            ImGui::PushTextWrapPos(region_x + compile_cw);
+            ImGui::TextUnformatted(compile_ui_text_.c_str());
+            ImGui::PopTextWrapPos();
+            if (failed) ImGui::PopStyleColor();
+
+            float cy2 = cy + compile_text_h + ctrl_gap;
+            if (compile_ui_state_ == 2) {
+                // running: progress bar (Python drives compile_ui_progress_ = step/6)
+                ImGui::SetCursorPos(ImVec2(region_x, cy2));
+                ImGui::ProgressBar(compile_ui_progress_, ImVec2(compile_cw, compile_bar_h));
+            } else {
+                // idle (1) or failed (3): a click records the compile/retry intent
+                const char* label = failed ? u8"重试" : u8"编译加速引擎";
+                ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - compile_btn_w) * 0.5f, cy2));
+                if (ImGui::Button(label, ImVec2(compile_btn_w, compile_btn_h))) record_compile_engine();
+            }
+        }
 
         ImGui::End();
     }
@@ -3535,6 +3597,12 @@ private:
     // Model-warmup status line, see set_status_text()'s header comment -- empty hides
     // build_status_float() entirely, non-empty text shown regardless of session_active_.
     std::string status_text_;
+
+    // First-screen TRT-compile prompt, driven by set_compile_ui() (see its header comment).
+    // Only consulted by build_open_prompt_overlay(); 0 == hidden, the default.
+    int compile_ui_state_ = 0;
+    float compile_ui_progress_ = 0.0f;
+    std::string compile_ui_text_;
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
@@ -3954,6 +4022,9 @@ PYBIND11_MODULE(sumu_core, m)
         .def("path", &Player::path)
         .def("set_ui_config", &Player::set_ui_config, py::arg("clip_length"), py::arg("max_regions"))
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
+        .def("set_compile_ui", &Player::set_compile_ui,
+             py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
+
         .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_
         .def("seek", &Player::seek, py::arg("frame_num"))
         .def("push_ai_frame", &Player::push_ai_frame,

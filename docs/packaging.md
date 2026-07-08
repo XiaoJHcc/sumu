@@ -10,7 +10,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1
 # pyd 已构建且未改时可跳过 native 重建：
 powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1 -SkipNative
 ```
-产物：`dist/sumu/`（含 `sumu.exe` + `_internal/` + `model_weights/`），实测 **≈9.8GB**。
+产物：`dist/sumu/`（含 `sumu.exe` + `_internal/` + `model_weights/`），实测 **≈9.3GB**（不含 TRT 引擎，首启自编）。
 
 ## 组成与关键文件
 
@@ -41,22 +41,30 @@ powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1 -SkipNative
 ## 权重与 TRT 引擎装配
 
 - 冻结态 `sumu.ai._default_model_weights_dir()` 返回 **`<exe 同级>/model_weights`**（`sys.frozen` 分支），该目录须**可写**（TRT 引擎缓存写在 `<weights_dir>/<stem>_sub_engines/`）。
-- `build_dist.ps1` 从 `-WeightsSrc`（默认 `D:/Git/lada-realtime/model_weights`）拷贝**默认路径所需的**：
+- `build_dist.ps1` 只拷贝**权重**（不含引擎）：
   - `lada_mosaic_restoration_model_generic_v1.2.pth`（≈75MB）
   - `lada_mosaic_detection_model_v4_fast.pt`（≈6MB）
-  - `lada_mosaic_restoration_model_generic_v1.2_sub_engines/`（6 个引擎，≈520MB）
-- 冒烟实测：`load_models` **4.75s**（与 dev 4.76s 一致）——预编译引擎被**复用而非重编**（重编需数分钟）。
+- **TRT 引擎不随包分发**——`hardware_compatible=False` 的引擎只在编译它的那套 GPU 架构 / TRT 版本 / 精度 / OS 上能反序列化（文件名 tag 如 `sm89.trt1012.fp16.win`），预编译引擎只对同款硬件有用。故改为**每台机器首次运行自行编译**：启动 warmup 走 load-only（`build_models(..., allow_trt_compile=False)`，引擎在就用、不在就 eager），首屏「打开文件」按钮下方给出「编译加速引擎」提示，用户点击后后台编译（数分钟，进度条原位显示），编完**热切换立即生效**、且落盘缓存供下次 load-only 直接命中（届时提示不再出现）。编译流程见 `python/sumu/app.py` 的 compile 状态机 + `restorationpipeline.compile_and_activate_trt`。
+- 冒烟只验证 `== env == / == load_models == / (== player.open ==)` 三标记 + 无 Traceback；load-only 不再编译，`load_models` 很快，不再断言「引擎复用」时长。
+- **权重源目录解析顺序**（其他机器/团队成员构建时不用改脚本）：`-WeightsSrc` 显式参数 → `$env:SUMU_WEIGHTS_SRC` 环境变量（`setx SUMU_WEIGHTS_SRC "C:\path\to\model_weights"` 设一次，跨会话生效）→ 本仓库原开发机路径 `D:/Git/lada-realtime/model_weights` 兜底。缺文件时报错会指出具体缺哪个文件。
+
+## AGPL-3.0 许可证随包
+
+- `build_dist.ps1` 会把仓库根的 `LICENSE.md` 拷进 `dist/sumu/LICENSE.md`，满足"向他人转让程序副本时一并给出许可证"（AGPL-3.0 §4）。自行打包分发（如打 zip）时保留这个文件。
+- 本管线**不**处理"提供对应源代码"义务（AGPL §6 的书面要约/网络访问等）——分发给仓库之外的人前，自行确认满足这部分。
 
 ## 验证边界（重要）
 
-- **预编译 TRT 引擎只对 sm89 = Ada（RTX 40 系）+ TensorRT 10.12 + fp16 + Windows 有效**（引擎文件名 tag `sm89.trt1012.fp16.win`）。**换 GPU 架构**：首启会删除该缓存并**重新编译**（数分钟，需 `torch_tensorrt` 运行时 + 可写 `model_weights/`）。故本包默认只保证**同类硬件（RTX 40 系）**开箱即用。
+- **本包不含任何预编译 TRT 引擎**，每台机器首次运行经首屏提示自行编译（数分钟，需 `torch_tensorrt` 运行时 + 可写 `model_weights/`），产物 tag 如 `sm89.trt1012.fp16.win`，只对本机这套 arch/TRT/精度/OS 有效、落盘后下次直接命中。**编译前**去码走 eager PyTorch 回退（能用但约 3x 慢，实时可能追不上→回退原片）；**非 Nvidia / 非 fp16** 机器不触发编译，恒走 eager。
 - 整栈只在目标机（RTX 4080 / 驱动 610.47 / py3.13 / torch 2.8.0+cu128）验证过。建议在无 Python/CUDA 的干净机再验一次（需 VC++ 2015+ 运行库）。
 - CJK 字体运行时从 `C:\Windows\Fonts` 加载（msyh.ttc…），缺失回退 ASCII——不随包；stripped/N 版 Windows 可能丢中文 UI。
 
 ## 已知坑（实测踩过）
 
 - **用 `python -m PyInstaller` 可能命中错误解释器**（uv 的 cpython 而非项目 `.venv`）——`build_dist.ps1` 已固定用 `.venv\Scripts\python.exe -m PyInstaller`。**切勿**并发跑两个构建写同一 `dist/`（会互相覆盖损坏）。
-- **首次冷启动慢**：未命中 OS 缓存时，从 ≈10GB 包冷加载 torch CUDA DLL 到 `import torch` 可能 >25s；暖启 <10s。冒烟因此**轮询 `== player.open ==` 标记（上限 120s）**而非定时 sleep。
+- **首次冷启动慢**：未命中 OS 缓存时，从 ≈10GB 包冷加载 torch CUDA DLL 到 `import torch` 可能 >25s；暖启 <10s。冒烟因此**轮询标记（上限 180s）**而非定时 sleep。
+- **`test_video.mp4` 是 .gitignore 的本机测试素材**，别的机器/团队成员 clone 后不带这个文件。冒烟测试检测不到它时会**自动降级**：跳过 `== player.open ==`（播放路径）校验，只验证 exe 能起、torch/CUDA 能 import、模型能 load、无 Traceback；同时打印黄字提醒"未做完整播放路径验证"。不会因为缺这个文件就把整条构建管线判失败。
+- smoke 判定失败（含降级模式下的失败）现在会让 `build_dist.ps1` **非零退出**——之前只打印红字但仍 0 退出，VSCode task 面板会一直显示绿色，看不出冒烟其实没过。
 - 构建期这些 ERROR/WARNING 均**无害**：`torch._C._jit/_nvrtc/_dynamo not found`（是 `_C` 的属性非独立模块）、大量 `torch.distributed._shard.checkpoint.* not found`（`collect_submodules` 扫到不存在项）、`nvrtc64_120_0.dll required via ctypes not found`（仅影响 JIT，基础推理不受影响）。
 - **不要在冻结路径用 `torch.compile`**（dynamo/inductor/triton 在冻结态很脆）；当前 AI 路径走预编译 TRT 引擎 + eager，不触发。
 - PowerShell 5.1 对 native 命令做 `2>&1` 会把 stderr 每行包成 NativeCommandError；`build_dist.ps1` 用 `cmd /c "<cmd> 2>&1"` 在 cmd 内部合流规避。

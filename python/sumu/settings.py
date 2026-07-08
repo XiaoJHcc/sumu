@@ -47,6 +47,13 @@ class Settings:
     muted: bool = False
     recent: list[str] = field(default_factory=list)
     positions: dict[str, int] = field(default_factory=dict)
+    # Cached "can this machine run TRT at all" (cuda + fp16). None = never determined (first run).
+    # The daily player needs this on the MAIN thread, before the first overlay frame, to decide
+    # whether to show the first-screen "compile engines" prompt -- but the real check needs torch
+    # (torch.cuda.is_available()), which is exactly the multi-second startup cost we moved off the
+    # main thread. So we cache the last run's answer (optimistic True on first run, since sumu
+    # targets Nvidia) and reconcile against the real value once background warmup finishes.
+    trt_applicable: Optional[bool] = None
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by normcase, cap at RECENT_CAP entries (oldest dropped).
@@ -77,6 +84,12 @@ def _clamp_volume(value) -> float:
 
 def _coerce_bool(value, default: bool) -> bool:
     return value if isinstance(value, bool) else default
+
+
+def _coerce_opt_bool(value) -> Optional[bool]:
+    """Like _coerce_bool but preserves the None ("never determined") tri-state -- anything that
+    isn't a real bool (including missing/null) collapses to None, not a made-up default."""
+    return value if isinstance(value, bool) else None
 
 
 def _coerce_recent(value) -> list[str]:
@@ -115,6 +128,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             muted=_coerce_bool(data.get("muted"), False),
             recent=_coerce_recent(data.get("recent")),
             positions=_coerce_positions(data.get("positions")),
+            trt_applicable=_coerce_opt_bool(data.get("trt_applicable")),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -134,6 +148,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "muted": bool(settings.muted),
             "recent": list(settings.recent)[:RECENT_CAP],
             "positions": dict(settings.positions),
+            "trt_applicable": settings.trt_applicable,
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

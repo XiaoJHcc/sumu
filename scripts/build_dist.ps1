@@ -5,8 +5,14 @@
 #   native build -> patch third-party deps -> pyinstaller freeze -> stage weights -> smoke test.
 # Usage:
 #   powershell -File scripts/build_dist.ps1 [-WeightsSrc <dir>] [-SkipNative]
+# Weights source resolution (anyone building this, not just the original dev machine):
+#   1. -WeightsSrc if passed explicitly
+#   2. $env:SUMU_WEIGHTS_SRC if set (setx SUMU_WEIGHTS_SRC "C:\path\to\model_weights" once, persists
+#      across sessions) -- lets each machine/teammate configure this without editing the script or
+#      remembering a flag every run.
+#   3. the original dev machine's path, as a last-resort fallback for this repo's own history.
 param(
-    [string]$WeightsSrc = "D:/Git/lada-realtime/model_weights",
+    [string]$WeightsSrc = $(if ($env:SUMU_WEIGHTS_SRC) { $env:SUMU_WEIGHTS_SRC } else { "D:/Git/lada-realtime/model_weights" }),
     [switch]$SkipNative
 )
 
@@ -99,17 +105,35 @@ foreach ($f in $weightFiles) {
     Copy-Item -Path $src -Destination (Join-Path $weightsDst $f) -Force
 }
 
-$subEnginesName = "lada_mosaic_restoration_model_generic_v1.2_sub_engines"
-$subEnginesSrc = Join-Path $WeightsSrc $subEnginesName
-if (-not (Test-Path $subEnginesSrc)) {
-    Fail "missing TRT engine dir: $subEnginesSrc"
-}
-Copy-Item -Path $subEnginesSrc -Destination (Join-Path $weightsDst $subEnginesName) -Recurse -Force
-Write-Host "weights staged OK: $weightsDst" -ForegroundColor Green
+# TRT sub-engines are deliberately NOT bundled. A hardware_compatible=False engine only
+# deserializes on the exact GPU arch / TensorRT version / precision / OS it was built for
+# (filename tag e.g. sm89.trt1012.fp16.win), so a prebuilt engine only helps identical hardware.
+# Instead every install compiles its own on first run, driven by the in-app first-screen "编译加速
+# 引擎" prompt (see python/sumu/app.py's compile state machine). This keeps the package ~520MB
+# smaller and means the first-run compile path is what everyone actually exercises.
+Write-Host "weights staged OK: $weightsDst (TRT engines compiled on first run, not bundled)" -ForegroundColor Green
+
+# AGPL-3.0 requires that anyone you convey the binary to also gets a copy of the license
+# (section 4). Stage it next to the exe so it travels with whatever archive is made from
+# dist\sumu.
+Copy-Item -Path (Join-Path $RepoRoot "LICENSE.md") -Destination (Join-Path $distDir "LICENSE.md") -Force
+Write-Host "LICENSE.md staged OK" -ForegroundColor Green
 
 # --- 5. bounded, non-interactive smoke test ---------------------------------
 Write-Host "== [5/5] smoke testing dist\sumu\sumu.exe ==" -ForegroundColor Cyan
+# test_video.mp4 is .gitignore'd (it's a local dev fixture, not distributed with the repo), so
+# on a fresh clone -- another machine, a teammate, CI -- it won't exist. Passing a nonexistent
+# path as the launch arg makes player.open() throw (do_open() in app.py has no try/except around
+# it), which used to masquerade as a hard smoke FAIL even though the dist itself built fine.
+# Degrade instead: without a video we can't validate the open->playback path, but we can still
+# validate that the frozen exe starts, torch/CUDA imports, and models load -- so drop the
+# "== player.open ==" requirement and launch with no argument (native side shows the open-prompt
+# overlay, same as a normal no-file start).
 $videoPath = Join-Path $RepoRoot "test_video.mp4"
+$hasTestVideo = Test-Path $videoPath
+if (-not $hasTestVideo) {
+    Write-Host "no test_video.mp4 found at $videoPath -- smoke will only validate startup/model load, not the open/playback path" -ForegroundColor Yellow
+}
 $stderrLog = Join-Path $RepoRoot "build_smoke_stderr.log"
 $stdoutLog = Join-Path $RepoRoot "build_smoke_stdout.log"
 # The frozen bundle is windowed (console=False) and scripts/sumu_main.py reassigns
@@ -139,24 +163,31 @@ function Get-SmokeLog {
 # rather than sleeping a fixed interval: the FIRST cold run of a ~10GB onedir
 # bundle loads torch's CUDA DLLs off cold disk and can take well over 25s just to
 # reach `import torch`, whereas a warm run gets there in <10s -- a fixed short
-# sleep false-fails the cold case. TRT compile on top can push load_models to
-# well over a minute cold, hence the generous timeout. We also bail early if the
+# sleep false-fails the cold case. (Startup warmup is load-only now -- it never
+# compiles TRT -- so load_models itself is fast; the generous timeout is purely
+# for the cold CUDA-DLL load off a ~10GB bundle.) We also bail early if the
 # process dies (native DLL crash on `import torch` leaves no Python traceback, so
 # an early exit is itself a failure signal).
 $SmokeTimeoutSec = 180
-$proc = Start-Process -FilePath (Join-Path $distDir "sumu.exe") `
-    -ArgumentList $videoPath `
-    -WorkingDirectory $distDir `
-    -RedirectStandardError $stderrLog `
-    -RedirectStandardOutput $stdoutLog `
-    -PassThru -NoNewWindow
+$procArgs = @{
+    FilePath = Join-Path $distDir "sumu.exe"
+    WorkingDirectory = $distDir
+    RedirectStandardError = $stderrLog
+    RedirectStandardOutput = $stdoutLog
+    PassThru = $true
+    NoNewWindow = $true
+}
+if ($hasTestVideo) { $procArgs.ArgumentList = $videoPath }
+$proc = Start-Process @procArgs
 
 $exitedEarly = $false
 for ($i = 0; $i -lt $SmokeTimeoutSec; $i++) {
     Start-Sleep -Seconds 1
     if ($proc.HasExited) { $exitedEarly = $true; break }
     $log = Get-SmokeLog
-    if (($log -match "== load_models ==") -and ($log -match "== player\.open ==")) { break }
+    $loadReady = $log -match "== load_models =="
+    $openReady = (-not $hasTestVideo) -or ($log -match "== player\.open ==")
+    if ($loadReady -and $openReady) { break }
     if ($log -match "Traceback \(most recent call last\)") { break }
 }
 
@@ -169,10 +200,12 @@ $log = Get-SmokeLog
 
 $hasEnv = $log -match "== env == torch"
 $hasLoad = $log -match "== load_models =="
-$hasOpen = $log -match "== player\.open =="
+$hasOpen = (-not $hasTestVideo) -or ($log -match "== player\.open ==")
 $hasTraceback = $log -match "Traceback \(most recent call last\)"
 
-if ($hasEnv -and $hasLoad -and $hasOpen -and (-not $hasTraceback)) {
+$smokePassed = $hasEnv -and $hasLoad -and $hasOpen -and (-not $hasTraceback)
+
+if ($smokePassed) {
     Write-Host "SMOKE PASS" -ForegroundColor Green
 } else {
     if ($exitedEarly) {
@@ -193,4 +226,10 @@ if (Test-Path $stderrLog) {
     Get-Content $stderrLog -Tail 30
 } else {
     Write-Host "(no stderr log produced)"
+}
+
+# A silent 0-exit on smoke failure previously let the VSCode task show green even though the
+# frozen bundle didn't actually come up -- fail loudly so a bad dist\sumu never looks done.
+if (-not $smokePassed) {
+    Fail "smoke test did not pass (see markers above)"
 }

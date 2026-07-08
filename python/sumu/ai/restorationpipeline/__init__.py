@@ -88,6 +88,37 @@ def load_models(
     return mosaic_detection_model, mosaic_restoration_model, pad_mode
 
 
+def compile_and_activate_trt(res_model, mosaic_restoration_model_path: str, device, fp16: bool):
+    """On-demand TensorRT compile driven by the startup-UX prompt (not the passive load path).
+
+    Blocks (minutes) compiling the 6 BasicVSR++ sub-engines for THIS machine's GPU arch /
+    TRT version / precision, then builds a split forward bound to the already-loaded eager
+    model's generator and returns it. The caller (app.py) attaches it via
+    res_model.activate_trt(...) on the main thread.
+
+    Uses the SAME max_clip_size (BASICVSRPP_TRT_MAX_CLIP_SIZE) the loader looks up, so the
+    engines this writes are exactly the ones a subsequent load-only startup will find. Per-engine
+    progress ("Compiling sub-engine i/6…") flows through report_load_progress() to whatever
+    callback the caller registered. Returns the split forward, or None if compilation was skipped
+    (e.g. non-cuda / fp32 / VRAM too low) or the freshly-written engines failed to load.
+    """
+    from sumu.ai.restorationpipeline.basicvsrpp_trt_compilation import basicvsrpp_startup_policy
+    from sumu.ai.restorationpipeline.basicvsrpp_sub_engines import create_split_forward
+
+    ok = basicvsrpp_startup_policy(
+        restoration_model_path=mosaic_restoration_model_path,
+        device=device, fp16=fp16, compile_basicvsrpp=True,
+        max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=5,
+    )
+    if not ok:
+        logger.warning("On-demand TRT compile did not produce usable engines; staying on PyTorch path.")
+        return None
+    return create_split_forward(
+        res_model.model, mosaic_restoration_model_path, device, fp16,
+        max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE,
+    )
+
+
 def _maybe_build_trt_split_forward(model, mosaic_restoration_model_path: str, device: torch.device, fp16: bool,
                                    allow_compile: bool = True):
     """Compile (if needed) and load the BasicVSR++ TensorRT split forward.

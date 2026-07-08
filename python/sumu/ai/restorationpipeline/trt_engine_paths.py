@@ -23,6 +23,7 @@
 # matches -> every startup would re-attempt a doomed deserialize.
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 
@@ -116,3 +117,29 @@ def all_basicvsrpp_sub_engines_exist(
         os.path.isfile(p)
         for p in get_basicvsrpp_sub_engine_paths(model_weights_path, fp16, max_clip_size, device).values()
     )
+
+
+def basicvsrpp_sub_engines_present_fast(model_weights_path: str, max_clip_size: int = 60) -> bool:
+    """torch-free 快速存在性检查，供主线程在 startup 首帧前调用。
+
+    ``all_basicvsrpp_sub_engines_exist`` 需要精确文件名，而 arch (``sm89``) / trt
+    (``trt1012``) tag 要 import torch / tensorrt 才能算出 —— 那正是启动那几秒的开销，
+    不能在主线程做。这里改用**粗模式 glob**：只校验 6 个 sub-engine 各自的
+    ``<key>...*.engine`` 有至少一个文件，故意忽略 arch/trt/precision/os tag。
+
+    依据用户「不拆显卡直接认已有引擎」的规则：文件在即视为可用。万一是错架构 / 旧
+    TRT 版本的残留引擎（罕见：换了卡或升级了 torch-tensorrt），真正 load 时会失败，
+    由后台 warmup 回填的 ``trt_active`` 纠正首帧的乐观判断（见 app.py 的 reconcile）。
+
+    max_clip_size 必须与 loader 用的 ``BASICVSRPP_TRT_MAX_CLIP_SIZE`` 一致 ——
+    preprocess/upsample 文件名带 ``b{N}``，改 clip 上界即 cache miss，这里也随之找不到。
+    """
+    engine_dir = _basicvsrpp_sub_engine_dir(model_weights_path)
+    try:
+        names = os.listdir(engine_dir)
+    except OSError:
+        return False  # 目录不存在（首次运行）或不可读 -> 视为未编译
+    patterns = [f"loop_body_{d}.*.engine" for d in BASICVSRPP_DIRECTIONS]
+    patterns.append(f"preprocess_b{max_clip_size}.*.engine")
+    patterns.append(f"upsample_dyn_b{max_clip_size}.*.engine")
+    return all(any(fnmatch.fnmatch(n, pat) for n in names) for pat in patterns)

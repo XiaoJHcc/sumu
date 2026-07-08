@@ -20,12 +20,13 @@
 # DESIGN.md I9); the Scheduler is only constructed once warmup finishes, at which point AI
 # frames start covering the passthrough ones with no playback interruption.
 import argparse
+import re
 import sys
 import threading
 import time
 
 import sumu_core  # noqa: E402
-from sumu.pipeline import build_models  # noqa: E402
+from sumu.pipeline import build_models, default_restoration_model_path  # noqa: E402
 from sumu import settings as settings_mod  # noqa: E402 -- M-E: persisted volume/mute/recent/resume
 
 
@@ -48,6 +49,76 @@ class _WarmupState:
         self.sched_cls = None   # Scheduler
         self.cfg_cls = None     # SchedulerConfig
         self.meta_fn = None     # get_video_meta_data
+        # TRT startup-UX handoff. trt_applicable: this machine can run TRT at all (cuda + fp16).
+        # trt_active: engines were found + loaded (load-only warmup) so the restorer already runs
+        # TRT. When applicable but not active, engines are absent -> app offers the on-demand
+        # "compile acceleration engines" prompt. res_path/device/fp16 are what that compile needs.
+        self.trt_applicable = False
+        self.trt_active = False
+        self.res_path = None
+        self.device = None
+        self.fp16 = False
+
+
+class _CompileState:
+    """Cross-thread handoff for the on-demand TRT compile thread (spawned when the user clicks the
+    first-screen 'compile acceleration engines' button). The compile thread writes progress
+    (step/total, text) and the terminal result (split/ok/error); the main loop reads it every tick
+    to drive the native compile UI and, on success, hot-swaps the restorer onto TRT."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.step = 0
+        self.total = 6            # 6 BasicVSR++ sub-engines (loop_body x4 + preprocess + upsample)
+        self.text = ""
+        self.done = False
+        self.ok = False
+        self.error = None
+        self.split = None         # the BasicVSRPlusPlusNetSplit to activate on success
+
+
+# Native compile-UI states pushed via player.set_compile_ui(state, progress, text).
+_COMPILE_UI_HIDDEN = 0
+_COMPILE_UI_IDLE = 1       # engines absent: show prompt + "compile" button
+_COMPILE_UI_RUNNING = 2    # compiling: show progress bar + step text
+_COMPILE_UI_FAILED = 3     # compile failed: show error + "retry" button
+
+
+def _compile_worker(cstate: "_CompileState", res_model, res_path, device, fp16) -> None:
+    """Runs the blocking (multi-minute) TRT compile off the main thread. Progress messages from
+    the compiler are marshalled into cstate via a load-progress callback; the resulting split
+    forward is handed back for the main thread to attach. Any failure is captured, never raised --
+    a failed compile must leave the player on the working eager path."""
+    from sumu.ai.restorationpipeline import compile_and_activate_trt
+    from sumu.ai.restorationpipeline.progress import (
+        set_load_progress_callback, clear_load_progress_callback,
+    )
+
+    def _on_progress(msg: str) -> None:
+        with cstate.lock:
+            cstate.text = msg
+            m = re.search(r"(\d+)\s*/\s*6", msg)  # "Compiling sub-engine 3/6: …"
+            if m:
+                cstate.step = int(m.group(1))
+
+    set_load_progress_callback(_on_progress)
+    try:
+        split = compile_and_activate_trt(res_model, res_path, device, fp16)
+        with cstate.lock:
+            cstate.split = split
+            cstate.ok = split is not None
+            cstate.done = True
+            cstate.running = False
+    except Exception as e:  # noqa: BLE001 -- compile failure must never crash the player
+        print(f"== trt compile failed == {e!r}", file=sys.stderr)
+        with cstate.lock:
+            cstate.error = e
+            cstate.ok = False
+            cstate.done = True
+            cstate.running = False
+    finally:
+        clear_load_progress_callback()
 
 
 def _warmup_worker(state: "_WarmupState") -> None:
@@ -65,9 +136,19 @@ def _warmup_worker(state: "_WarmupState") -> None:
               f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}", file=sys.stderr)
 
         t_load0 = time.perf_counter()
-        det_model, res_model, pad_mode = build_models(device, fp16)
+        # Load-only: use precompiled TRT engines if this machine already has them, otherwise stay
+        # on the eager PyTorch path. We deliberately do NOT compile here anymore -- compilation is
+        # a multi-minute blocking step now driven explicitly by the user via the first-screen
+        # "compile acceleration engines" prompt (see the main loop's compile state machine), so a
+        # fresh machine gets a fast, responsive startup on eager instead of a silent long stall.
+        det_model, res_model, pad_mode = build_models(device, fp16, allow_trt_compile=False)
         print(f"== load_models == {time.perf_counter()-t_load0:.2f}s pad_mode={pad_mode}",
               file=sys.stderr)
+
+        trt_applicable = device.type == "cuda" and fp16
+        trt_active = bool(getattr(res_model, "uses_trt", False))
+        res_path = default_restoration_model_path()
+        print(f"== trt == applicable={trt_applicable} active={trt_active}", file=sys.stderr)
 
         # Import the torch-heavy orchestration modules here too, off the main thread. torch is
         # already imported above so these are effectively free now (module cache hit), but doing
@@ -81,6 +162,11 @@ def _warmup_worker(state: "_WarmupState") -> None:
             state.sched_cls = Scheduler
             state.cfg_cls = SchedulerConfig
             state.meta_fn = get_video_meta_data
+            state.trt_applicable = trt_applicable
+            state.trt_active = trt_active
+            state.res_path = res_path
+            state.device = device
+            state.fp16 = fp16
             state.ready = True
     except Exception as e:  # noqa: BLE001 -- warmup failure must never crash the player
         print(f"== warmup failed == {e!r}", file=sys.stderr)
@@ -135,6 +221,36 @@ def main():
     cfg_max_regions = 1
     scheduler = None
     det_model = res_model = pad_mode = None
+
+    # On-demand TRT compile (first-screen prompt). compile_state is the live handoff while a
+    # compile runs (None otherwise); trt_activated flips True once engines have been hot-swapped
+    # in (either found at warmup or compiled+activated here), which is what hides the prompt.
+    compile_state = None
+    trt_activated = False
+
+    # Startup fast-path for the first-screen compile prompt. The prompt's visibility depends on
+    # (a) is TRT applicable on this machine, (b) are engines already on disk -- and until now both
+    # were only known AFTER the background warmup imported torch + probed the disk, so the prompt
+    # popped in a few seconds late (open button + status float first, prompt jumping in after).
+    # We now decide it on the MAIN thread, before the first overlay frame, torch-free:
+    #   - engine presence: a coarse filesystem glob (basicvsrpp_sub_engines_present_fast) -- no
+    #     torch/tensorrt needed, matches the user's "engines on disk => assume usable" rule.
+    #   - applicability: can't be checked torch-free (needs torch.cuda.is_available()), so we read
+    #     last run's cached answer (optimistic True on first run since sumu targets Nvidia).
+    # Warmup still runs and reconciles both to the real values (see the loop), but in the steady
+    # state (cache warm, engines present-or-absent as expected) the guess already matches, so the
+    # first screen renders once and never changes.
+    from sumu.ai.restorationpipeline import BASICVSRPP_TRT_MAX_CLIP_SIZE
+    from sumu.ai.restorationpipeline.trt_engine_paths import basicvsrpp_sub_engines_present_fast
+    try:
+        _res_path_fast = default_restoration_model_path()
+        trt_present_fast = basicvsrpp_sub_engines_present_fast(_res_path_fast, BASICVSRPP_TRT_MAX_CLIP_SIZE)
+    except Exception as e:  # noqa: BLE001 -- a path/glob hiccup must not block startup; assume absent
+        print(f"== trt == fast presence probe failed ({e!r}); assuming engines absent", file=sys.stderr)
+        trt_present_fast = False
+    trt_applicable_guess = settings.trt_applicable if settings.trt_applicable is not None else True
+    compile_requested = False   # latches a first-screen "compile" click that lands before warmup
+    trt_reconciled = False      # flips once warmup's real applicable/active have been folded in
 
     def do_open(path):
         """First-ever open (opened is False): player.open() is decode-only and fast (no model
@@ -199,21 +315,107 @@ def main():
                 warm_sched_cls = warmup.sched_cls
                 warm_sched_cfg_cls = warmup.cfg_cls
                 warm_meta_fn = warmup.meta_fn
+                warm_trt_applicable = warmup.trt_applicable
+                warm_trt_active = warmup.trt_active
+                warm_res_path = warmup.res_path
+                warm_device = warmup.device
+                warm_fp16 = warmup.fp16
 
-            if scheduler is not None:
-                status_text = ""
-            elif warm_error is not None:
+            if warm_error is not None:
                 status_text = "预热失败（将播放原片）"
-            elif warm_ready:
+            elif scheduler is not None or warm_ready:
+                status_text = ""
+            elif not opened:
+                # First screen (no file open yet): the middle compile-prompt region already
+                # conveys startup state and shows from frame 1 -- a separate bottom-left
+                # "正在预热模型…" float that appears then vanishes a few seconds later is exactly
+                # the startup flicker we're removing, so suppress it here. The float is kept only
+                # for the file-open-mid-warmup case below (and the warm_error case above).
                 status_text = ""
             else:
                 status_text = "正在预热模型…"
             player.set_status_text(status_text)
 
+            # On-demand TRT compile state machine. First consume a finished compile (hot-swap the
+            # restorer onto TRT on this main thread -- a single atomic attribute set, see
+            # BasicvsrppMosaicRestorer.activate_trt), then derive what the first-screen compile
+            # prompt should show this tick.
+            if compile_state is not None:
+                with compile_state.lock:
+                    cs_running = compile_state.running
+                    cs_done = compile_state.done
+                    cs_ok = compile_state.ok
+                    cs_split = compile_state.split
+                    cs_step = compile_state.step
+                    cs_total = compile_state.total
+                if cs_done and cs_ok and cs_split is not None:
+                    # warm_models[1] is the same restorer object the (possibly already built)
+                    # scheduler holds, so this activates TRT live -- no scheduler rebuild.
+                    warm_models[1].activate_trt(cs_split)
+                    trt_activated = True
+                    compile_state = None
+                    print("== trt == compiled + activated (live)", file=sys.stderr)
+
+            # Reconcile the startup fast-path guesses against warmup's real answers, once, the
+            # first tick warmup is ready. In the steady state the guess already matched (engines
+            # present-or-absent as cached), so the prompt state doesn't change here -- this only
+            # bites on a first run whose cached applicability was wrong (e.g. a non-Nvidia box that
+            # optimistically defaulted to True), where the prompt correctly disappears now. Persist
+            # the real applicability so next launch's guess is exact (save() never raises).
+            if warm_ready and not trt_reconciled:
+                trt_reconciled = True
+                if settings.trt_applicable != warm_trt_applicable:
+                    settings.trt_applicable = warm_trt_applicable
+                    settings_mod.save(settings)
+
+            # Effective applicability/presence: warmup's real values once ready, else the torch-free
+            # startup guesses. This is what lets the prompt render correctly from frame 1 instead of
+            # waiting for the multi-second warmup.
+            trt_applicable_eff = warm_trt_applicable if warm_ready else trt_applicable_guess
+            trt_present_eff = warm_trt_active if warm_ready else trt_present_fast
+
+            if not trt_applicable_eff or trt_present_eff or trt_activated:
+                compile_ui_state, compile_progress, compile_ui_text = _COMPILE_UI_HIDDEN, 0.0, ""
+            elif compile_state is not None and cs_running:
+                frac = (cs_step / cs_total) if cs_total else 0.0
+                compile_ui_state = _COMPILE_UI_RUNNING
+                compile_progress = frac
+                compile_ui_text = f"正在编译加速引擎 {cs_step}/{cs_total}…（首次，需数分钟）"
+            elif compile_state is not None and cs_done and not cs_ok:
+                compile_ui_state, compile_progress, compile_ui_text = _COMPILE_UI_FAILED, 0.0, "编译失败"
+            else:
+                compile_ui_state = _COMPILE_UI_IDLE
+                compile_progress = 0.0
+                compile_ui_text = "尚未为你的显卡编译去码加速引擎（首次约数分钟，编完自动生效）"
+            player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
+
             player.set_ui_config(cfg_clip_length, cfg_max_regions)
             player.ui_tick()
 
             intents = player.take_ui_intents()
+
+            # First-screen "compile acceleration engines" button (or "retry" after a failure).
+            # The prompt now shows from frame 1 (before warmup finishes), so a click can land
+            # before the models are loaded -- but the compile needs the loaded eager restorer
+            # (warm_models[1]). So a click only LATCHES the request; the spawn below fires as soon
+            # as warmup is ready (and TRT is applicable, engines aren't already active, nothing is
+            # already compiling). This way "click then it works" holds even for an eager clicker,
+            # instead of the click silently no-op'ing until warmup catches up.
+            if intents.get("compile_engine"):
+                compile_requested = True
+            compile_busy = compile_state is not None and compile_state.running
+            if (compile_requested and warm_ready and warm_trt_applicable
+                    and not (warm_trt_active or trt_activated)
+                    and not compile_busy and warm_models is not None):
+                compile_requested = False
+                compile_state = _CompileState()
+                compile_state.running = True
+                threading.Thread(
+                    target=_compile_worker,
+                    args=(compile_state, warm_models[1], warm_res_path, warm_device, warm_fp16),
+                    name="sumu-trt-compile", daemon=True,
+                ).start()
+                print("== trt == on-demand compile started", file=sys.stderr)
 
             if intents["toggle_play"]:
                 if opened:
