@@ -81,6 +81,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -339,6 +340,14 @@ public:
     static constexpr int64_t kDecodeAheadMax = static_cast<int64_t>(kRingCapacity) - 10;
     static constexpr int64_t kStartBufferFrames = 5;
 
+    // Height (in client/backbuffer pixels -- ImGui DisplaySize == physical client pixels here,
+    // FramebufferScale==1) of the self-drawn top title bar. Single source of truth shared by
+    // build_top_bar() (which draws the bar), fit_viewport() (which reserves this strip so the
+    // video is letterboxed BELOW the bar instead of underneath it) and resize_window_for_video()
+    // (which adds it to the target client height so an auto-sized window shows the video 1:1
+    // with the bar sitting just above it).
+    static constexpr float kTopBarH = 32.0f;
+
     Player(int width_hint, int height_hint, bool maximized)
     {
         timeBeginPeriod(1);
@@ -458,6 +467,19 @@ public:
         // default-false on a first open()) -- see decode_loop()/audio_loop()'s exit conditions.
         decode_thread_ = std::thread(&Player::decode_loop, this);
 
+        // M4: independent scrub-decode path for seekbar hover thumbnails. Best-effort -- failing
+        // to open the second decoder just means no hover previews (the player is fully functional
+        // without them), never a failed session. Its GPU resources were already built above by
+        // create_ring_resources() -> create_scrub_resources().
+        {
+            std::string scrub_err;
+            if (scrub_decoder_.open(video_path, device_.Get(), scrub_err))
+                scrub_thread_ = std::thread(&Player::scrub_loop, this);
+            else
+                fprintf(stderr, "[sumu] scrub decoder open failed (%s) -- hover thumbnails disabled\n",
+                    scrub_err.c_str());
+        }
+
         LARGE_INTEGER t0;
         QueryPerformanceCounter(&t0);
         for (;;) {
@@ -488,6 +510,13 @@ public:
         // splash branch only stops drawing the splash and starts picking/presenting real
         // frames once this flips true (see present_loop()).
         session_active_.store(true, std::memory_order_relaxed);
+
+        // Auto-size the window to this video (1:1 point-for-point, capped/on-screen -- see the
+        // method). Done last, after session_active_ so the synchronous WM_SIZE this triggers
+        // (SetWindowPos -> on_resize + WndProc's ui_tick refresh) already renders real frames at
+        // the final size. No-op while maximized/fullscreen. Applies to reopen() too (it routes
+        // through open_session()), so switching files re-fits the window to the new video.
+        resize_window_for_video();
     }
 
     // M-C1: joins/tears down only the session-scoped state (decode/audio threads, the D3D11
@@ -500,8 +529,12 @@ public:
     void close_session()
     {
         session_stop_.store(true, std::memory_order_relaxed);
+        scrub_cv_.notify_one(); // wake scrub_thread_ out of its wait so it observes session_stop_
         if (decode_thread_.joinable()) decode_thread_.join();
         if (audio_thread_.joinable()) audio_thread_.join();
+        // scrub_thread_ takes d3d_mutex_ during its blit (like decode_thread_), so join it here
+        // BEFORE the d3d_lock block below -- joining it under d3d_mutex_ would risk self-deadlock.
+        if (scrub_thread_.joinable()) scrub_thread_.join();
         session_stop_.store(false, std::memory_order_relaxed); // reset so a future open_session() starts clean
 
         if (audio_codec_ctx_) avcodec_free_context(&audio_codec_ctx_);
@@ -571,9 +604,26 @@ public:
             ai_in_y_rtv_.Reset();
             ai_in_uv_tex_.Reset();
             ai_in_uv_rtv_.Reset();
+
+            // M4 scrub thumbnail resources. scrub_thread_ is already joined (above), and reopen()
+            // has already put present into its splash branch (so no live ImGui draw snapshot still
+            // references a thumbnail SRV) -- safe to release the NV12 blit source and the thumb
+            // pool. scrub_cache_ is also read by get_thumbnail() on the main thread; the same main
+            // thread runs close_session(), so there is no concurrent reader here, but take
+            // scrub_cache_mutex_ anyway to keep every scrub_cache_ access uniformly guarded.
+            scrub_nv12_tex_.Reset();
+            scrub_srv_y_.Reset();
+            scrub_srv_uv_.Reset();
+            {
+                std::lock_guard<std::mutex> scrub_cache_lock(scrub_cache_mutex_);
+                scrub_cache_.clear();
+                scrub_cache_next_ = 0;
+            }
+            scrub_request_frame_.store(-1, std::memory_order_relaxed);
         }
 
         decoder_.close();
+        scrub_decoder_.close();
 
         session_active_.store(false, std::memory_order_relaxed);
     }
@@ -724,6 +774,62 @@ public:
         win_height_ = h;
     }
 
+    // ---- auto-size the window to the just-opened video ------------------------------------
+    // Called from open_session() (main thread) once src_width_/src_height_ are known. Sizes the
+    // window so the video renders point-for-point (1:1, no scaling) in the letterbox region
+    // BELOW the title bar: client = src_width_ x (src_height_ + kTopBarH). Constraints:
+    //   * width capped at 80% of the CURRENT monitor's work-area width;
+    //   * the whole window must fit within that monitor's work area (height too);
+    //   * when the 1:1 size exceeds either budget, the video is scaled down UNIFORMLY (aspect
+    //     preserved -- fit_viewport() still letterboxes correctly at any window size);
+    //   * final position clamped so the window sits fully inside the work area.
+    // DPI / multi-monitor: everything here is in physical pixels on the target monitor. The
+    // process is Per-Monitor-DPI-Aware-V2 (see create_window()), so GetMonitorInfo's rcWork and
+    // the D3D backbuffer client size are both physical pixels on the SAME monitor -- no HiDPI
+    // scaling conversion is needed, and MonitorFromWindow(MONITOR_DEFAULTTONEAREST) picks the
+    // monitor the window currently sits on. No-op while maximized or fullscreen (the user chose
+    // a full-area layout; auto-resizing out from under that would be wrong). Because the window
+    // is borderless (WM_NCCALCSIZE hollows the frame), window rect == client rect, so the
+    // computed client dimensions are passed straight to SetWindowPos. SetWindowPos drives WM_SIZE
+    // synchronously -> on_resize() (swapchain resize) + the WndProc ui_tick() refresh.
+    void resize_window_for_video()
+    {
+        if (!hwnd_ || fullscreen_.load(std::memory_order_relaxed) || IsZoomed(hwnd_)) return;
+        if (src_width_ <= 0 || src_height_ <= 0) return;
+
+        HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfo(mon, &mi)) return;
+        const LONG work_w = mi.rcWork.right - mi.rcWork.left;
+        const LONG work_h = mi.rcWork.bottom - mi.rcWork.top;
+        if (work_w <= 0 || work_h <= 0) return;
+
+        const float sw = static_cast<float>(src_width_);
+        const float sh = static_cast<float>(src_height_);
+
+        // Budgets: width <= 80% of work area; total client height <= work area height, which
+        // leaves work_h - kTopBarH for the video itself.
+        const float max_w = static_cast<float>(work_w) * 0.80f;
+        const float avail_video_h = static_cast<float>(work_h) - kTopBarH;
+
+        float scale = 1.0f; // 1.0 == point-for-point
+        if (sw > max_w) scale = std::min(scale, max_w / sw);
+        if (avail_video_h > 0.0f && sh > avail_video_h) scale = std::min(scale, avail_video_h / sh);
+
+        int client_w = std::max(1, static_cast<int>(std::lround(sw * scale)));
+        int client_h = std::max(1, static_cast<int>(std::lround(sh * scale + kTopBarH)));
+
+        // Center on the current monitor's work area, then clamp so no edge spills off it.
+        int x = mi.rcWork.left + (work_w - client_w) / 2;
+        int y = mi.rcWork.top + (work_h - client_h) / 2;
+        if (x + client_w > mi.rcWork.right)  x = mi.rcWork.right - client_w;
+        if (y + client_h > mi.rcWork.bottom) y = mi.rcWork.bottom - client_h;
+        if (x < mi.rcWork.left) x = mi.rcWork.left;
+        if (y < mi.rcWork.top)  y = mi.rcWork.top;
+
+        SetWindowPos(hwnd_, nullptr, x, y, client_w, client_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     // ---- borderless custom-caption support (WM_NCCALCSIZE/WM_NCHITTEST, see WndProc) --------
     // caption_drag_x0_/x1_/y1_ are published each frame by build_top_bar() from its
     // "##drag_region" InvisibleButton's item rect (client-space, since the top-bar ImGui window
@@ -738,7 +844,7 @@ public:
             x < (int)caption_drag_x1_ && y >= 0 && y < (int)caption_drag_y1_;
     }
 
-    bool is_fullscreen() const { return fullscreen_; }
+    bool is_fullscreen() const { return fullscreen_.load(std::memory_order_relaxed); }
 
     // ---- transport control -------------------------------------------------------------
 
@@ -802,6 +908,23 @@ public:
     void ui_tick()
     {
         if (!ui_ready_) return;
+
+        // Re-entrancy guard. A window-size change initiated from INSIDE build_ui() -- the custom
+        // title bar's maximize/restore button (ShowWindow()) or the fullscreen button
+        // (toggle_fullscreen() -> SetWindowPos()) -- drives a SYNCHRONOUS WM_SIZE, whose WndProc
+        // handler calls ui_tick() again to refresh the self-drawn bars live at the new size.
+        // Doing that here, while this frame's ImGui::NewFrame() is still open, would begin a
+        // nested NewFrame() with no matching Render() -- ImGui state corruption that hard-hangs
+        // the main thread (confirmed via repro: in-frame ShowWindow -> "ui_tick RE-ENTRANT" ->
+        // window stops pumping messages). Skip the nested refresh: the outer frame finishes and
+        // publishes normally, and the next Python-driven tick (~one frame / ~20ms later) lays the
+        // bars out at the new size. The live drag-resize refresh is unaffected -- that WM_SIZE
+        // comes from the OS modal move/size loop, NOT from within a frame, so this guard is false
+        // there and the WndProc ui_tick() runs as before. Main-thread-only, so a plain bool (no
+        // atomic) is correct: the re-entrant call is synchronous on this same thread.
+        if (in_ui_tick_) return;
+        in_ui_tick_ = true;
+        struct Guard { bool* f; ~Guard() { *f = false; } } _guard{ &in_ui_tick_ };
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -1704,8 +1827,25 @@ private:
     void build_top_bar(float& out_height)
     {
         ImGuiIO& io = ImGui::GetIO();
-        const float bar_h = 32.0f;
+        const float bar_h = kTopBarH;
         out_height = bar_h;
+
+        // Fullscreen: the title bar auto-hides and only appears when the mouse nears the TOP edge
+        // -- the same mouse-zone reveal the bottom bar uses at the bottom (build_bottom_bar()).
+        // In fullscreen the video fills the whole screen (fit_viewport() reserves no strip), so a
+        // hidden bar means nothing is drawn and the caption drag-rect must be cleared, otherwise
+        // WM_NCHITTEST would still report HTCAPTION over the (now invisible) top strip. In
+        // windowed mode the bar is always shown and its strip is reserved (task: title bar
+        // outside the video), so this whole block is skipped.
+        if (fullscreen_.load(std::memory_order_relaxed)) {
+            const float show_zone_y = io.DisplaySize.y * 0.10f; // top 10%
+            bool mouse_in_zone = io.MousePos.y >= 0.0f && io.MousePos.y <= show_zone_y &&
+                io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
+            if (!mouse_in_zone) {
+                caption_drag_x0_ = caption_drag_x1_ = 0.0f; // disable phantom HTCAPTION while hidden
+                return;
+            }
+        }
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, bar_h));
@@ -2040,7 +2180,7 @@ private:
     // change, no Alt+Enter path; WM_SYSKEYDOWN already swallows Alt+Enter, see WndProc).
     void toggle_fullscreen()
     {
-        if (!fullscreen_) {
+        if (!fullscreen_.load(std::memory_order_relaxed)) {
             GetWindowRect(hwnd_, &windowed_rect_);
             windowed_style_ = GetWindowLongA(hwnd_, GWL_STYLE);
 
@@ -2048,30 +2188,176 @@ private:
             MONITORINFO mi{ sizeof(mi) };
             GetMonitorInfo(mon, &mi);
 
+            // Flip the flag BEFORE SetWindowPos: SetWindowPos drives WM_SIZE synchronously, which
+            // now calls ui_tick() (see WndProc) -- so the very first UI rebuild at the fullscreen
+            // size already sees fullscreen_==true and lays out the auto-hiding bar / full-screen
+            // video (fit_viewport()) correctly, with no one-frame transient.
+            fullscreen_.store(true, std::memory_order_relaxed);
             SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_ & ~(WS_CAPTION | WS_THICKFRAME |
                 WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU));
             SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                 mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                 SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
-            fullscreen_ = true;
         } else {
+            fullscreen_.store(false, std::memory_order_relaxed); // before SetWindowPos, see above
             SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_);
             SetWindowPos(hwnd_, nullptr, windowed_rect_.left, windowed_rect_.top,
                 windowed_rect_.right - windowed_rect_.left, windowed_rect_.bottom - windowed_rect_.top,
                 SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER);
-            fullscreen_ = false;
         }
     }
 
-    // M4 hook (not implemented here): scrub thumbnail SRV for a given content frame number, or
-    // nullptr if unavailable. M3 always returns nullptr -- a real implementation needs its own
-    // scrub-decode path INSIDE this Player, not a second Player instance sharing this process
-    // (a second window/message loop is its own can of worms regardless of quit_ now being a
-    // per-instance member -- see set_quit()/should_quit()).
+    // M4: quantize a raw content frame to a scrub bucket so a pixel-by-pixel hover drag doesn't
+    // re-decode every intermediate frame. ~1 second granularity (stride = round(fps)); a scrub
+    // preview doesn't need finer, and seek_to_frame() lands on the nearest keyframe at/before the
+    // target anyway. Clamped to a valid frame.
+    int64_t scrub_bucket_for_frame(int64_t frame_num) const
+    {
+        int64_t stride = std::max<int64_t>(1, std::llround(fps_ > 0.0 ? fps_ : 1.0));
+        int64_t bucket = (frame_num / stride) * stride;
+        if (frame_count_ > 0)
+            bucket = std::max<int64_t>(0, std::min<int64_t>(bucket, frame_count_ - 1));
+        else
+            bucket = std::max<int64_t>(0, bucket);
+        return bucket;
+    }
+
+    // M4: scrub thumbnail SRV for a given content frame number, or nullptr if not ready yet.
+    // Called ONLY from build_bottom_bar() on the MAIN thread inside ui_tick() (which never
+    // touches d3d_mutex_, see ui_tick()) -- this must never block or do GPU work, so it only
+    // reads the ready cache and posts the hovered bucket to scrub_thread_. A miss returns nullptr
+    // and the call site simply draws the hover cursor line without an image until the thumbnail
+    // lands. The returned raw SRV stays valid until close_session() (which joins scrub_thread_
+    // and clears the cache on this same main thread), long past the present thread rendering the
+    // ImGui draw snapshot it gets baked into.
     ID3D11ShaderResourceView* get_thumbnail(int64_t frame_num)
     {
-        (void)frame_num;
+        if (!session_active_.load(std::memory_order_relaxed)) return nullptr;
+        int64_t bucket = scrub_bucket_for_frame(frame_num);
+        {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            for (auto& e : scrub_cache_)
+                if (e.bucket == bucket && e.srv) return e.srv.Get();
+        }
+        // Miss: request this bucket (coalescing -- newest hover wins) and wake the scrub thread.
+        scrub_request_frame_.store(bucket, std::memory_order_relaxed);
+        scrub_cv_.notify_one();
         return nullptr;
+    }
+
+    // M4: render the NV12 blit source (already holding the just-decoded scrub frame) into a small
+    // RGBA8 thumbnail RTV, reusing draw_and_present()'s exact NV12->RGB pipeline (vs_ + ps_nv12_ +
+    // sampler_ + slice_cb_). Caller MUST hold d3d_mutex_ (shared immediate context). Sets its own
+    // full pipeline state; draw_and_present() re-sets everything each frame so nothing leaks.
+    void render_thumbnail(ID3D11RenderTargetView* rtv)
+    {
+        context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        ID3D11RenderTargetView* rtvs[] = { rtv };
+        context_->OMSetRenderTargets(1, rtvs, nullptr);
+        D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(kThumbW), static_cast<float>(kThumbH), 0.0f, 1.0f };
+        context_->RSSetViewports(1, &vp);
+        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vs_.Get(), nullptr, 0);
+
+        // Single-slice scrub SRVs -> arraySlice 0 (the shader clamps an out-of-range slice anyway).
+        struct SliceCB { UINT arraySlice; UINT pad[3]; };
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(context_->Map(slice_cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            SliceCB cb{ 0, {0, 0, 0} };
+            memcpy(mapped.pData, &cb, sizeof(cb));
+            context_->Unmap(slice_cb_.Get(), 0);
+        }
+        ID3D11Buffer* cbs[] = { slice_cb_.Get() };
+        context_->PSSetConstantBuffers(0, 1, cbs);
+        ID3D11SamplerState* samplers[] = { sampler_.Get() };
+        context_->PSSetSamplers(0, 1, samplers);
+        context_->PSSetShader(ps_nv12_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[] = { scrub_srv_y_.Get(), scrub_srv_uv_.Get() };
+        context_->PSSetShaderResources(0, 2, srvs);
+        context_->Draw(3, 0);
+
+        // Unbind: the thumb texture is about to be sampled as an SRV by ImGui (ui_render_drawdata),
+        // so it must not be left bound as a render target.
+        ID3D11ShaderResourceView* nullsrv[2] = { nullptr, nullptr };
+        context_->PSSetShaderResources(0, 2, nullsrv);
+        ID3D11RenderTargetView* nullrtv[1] = { nullptr };
+        context_->OMSetRenderTargets(1, nullrtv, nullptr);
+    }
+
+    // M4: scrub thumbnail producer. Sleeps on scrub_cv_ until the main thread posts a new hovered
+    // bucket, then: (1) slow seek on the INDEPENDENT scrub_decoder_ with NO Player lock held (its
+    // own d3d11va pool self-serializes at the device level, exactly like decode_loop()'s decode);
+    // (2) a brief d3d_mutex_ critical section to blit NV12->RGBA into a reused thumbnail texture;
+    // (3) publish it into scrub_cache_ under scrub_cache_mutex_. d3d_mutex_ and scrub_cache_mutex_
+    // are never held together, so there is no lock cycle with get_thumbnail() (main thread,
+    // scrub_cache_mutex_ only) or the present thread (d3d_mutex_ only). Session-scoped: started by
+    // open_session(), joined by close_session() (which sets session_stop_ + notifies the cv).
+    void scrub_loop()
+    {
+        int64_t last_handled = -1;
+        while (true) {
+            int64_t bucket;
+            {
+                std::unique_lock<std::mutex> lk(scrub_cv_mutex_);
+                scrub_cv_.wait(lk, [&] {
+                    return session_stop_.load(std::memory_order_relaxed) ||
+                           stop_.load(std::memory_order_relaxed) ||
+                           scrub_request_frame_.load(std::memory_order_relaxed) != last_handled;
+                });
+                if (session_stop_.load(std::memory_order_relaxed) || stop_.load(std::memory_order_relaxed))
+                    return;
+                bucket = scrub_request_frame_.load(std::memory_order_relaxed);
+            }
+            last_handled = bucket;
+            if (bucket < 0) continue;
+
+            // Already produced? (a re-hover of a still-cached bucket)
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+                for (auto& e : scrub_cache_)
+                    if (e.bucket == bucket) { cached = true; break; }
+            }
+            if (cached) continue;
+
+            // Slow part -- no Player lock. scrub_decoder_ is touched ONLY by this thread.
+            DecodedFrame df;
+            std::string err;
+            if (!scrub_decoder_.seek_to_frame(bucket, df, err))
+                continue; // best-effort: leave the cursor line imageless, try the next hover
+
+            // Coalesce: if the hover moved on while we were seeking, drop this frame and let the
+            // next iteration serve the newest bucket rather than spending a blit on a stale one.
+            if (scrub_request_frame_.load(std::memory_order_relaxed) != bucket)
+                continue;
+
+            // Pick the round-robin slot to (re)use; copy out its RTV/SRV under the cache lock so
+            // the blit below runs without holding it.
+            size_t slot;
+            ComPtr<ID3D11RenderTargetView> target_rtv;
+            {
+                std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+                if (scrub_cache_.empty()) continue; // torn down
+                slot = scrub_cache_next_;
+                target_rtv = scrub_cache_[slot].rtv;
+            }
+            if (!target_rtv) continue;
+
+            {
+                std::lock_guard<std::mutex> d3d_lock(d3d_mutex_); // brief -- one copy + one triangle
+                if (!scrub_nv12_tex_) continue;
+                context_->CopySubresourceRegion(scrub_nv12_tex_.Get(), 0, 0, 0, 0,
+                    df.texture, df.array_slice, nullptr);
+                render_thumbnail(target_rtv.Get());
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+                if (scrub_cache_.empty() || slot >= scrub_cache_.size()) continue;
+                scrub_cache_[slot].bucket = bucket;
+                scrub_cache_next_ = (scrub_cache_next_ + 1) % scrub_cache_.size();
+            }
+        }
     }
 
     void create_ring_resources()
@@ -2130,6 +2416,57 @@ private:
             ad.Texture2DArray.FirstArraySlice = i;
             ad.Texture2DArray.ArraySize = 1;
             check_hr(device_->CreateShaderResourceView(ai_ring_tex_.Get(), &ad, &ai_srv_[i]), "CreateSRV(ai)");
+        }
+
+        create_scrub_resources();
+    }
+
+    // M4: single-slice NV12 blit source + reused RGBA8 thumbnail pool for the seekbar hover
+    // preview. Same NV12/SRV recipe as pt_ring_tex_ above (BIND_DECODER needed alongside
+    // BIND_SHADER_RESOURCE for the driver to accept an NV12 texture), just ArraySize==1. Built
+    // here (session scope, sized to this video) and torn down in close_session().
+    void create_scrub_resources()
+    {
+        D3D11_TEXTURE2D_DESC nv{};
+        nv.Width = src_width_;
+        nv.Height = src_height_;
+        nv.MipLevels = 1;
+        nv.ArraySize = 1;
+        nv.Format = DXGI_FORMAT_NV12;
+        nv.SampleDesc.Count = 1;
+        nv.Usage = D3D11_USAGE_DEFAULT;
+        nv.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+        check_hr(device_->CreateTexture2D(&nv, nullptr, &scrub_nv12_tex_), "CreateTexture2D(scrub_nv12_tex_)");
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC yd{};
+        yd.Format = DXGI_FORMAT_R8_UNORM;
+        yd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        yd.Texture2DArray.MostDetailedMip = 0;
+        yd.Texture2DArray.MipLevels = 1;
+        yd.Texture2DArray.FirstArraySlice = 0;
+        yd.Texture2DArray.ArraySize = 1;
+        check_hr(device_->CreateShaderResourceView(scrub_nv12_tex_.Get(), &yd, &scrub_srv_y_), "CreateSRV(scrub Y)");
+        D3D11_SHADER_RESOURCE_VIEW_DESC uvd = yd;
+        uvd.Format = DXGI_FORMAT_R8G8_UNORM;
+        check_hr(device_->CreateShaderResourceView(scrub_nv12_tex_.Get(), &uvd, &scrub_srv_uv_), "CreateSRV(scrub UV)");
+
+        scrub_cache_.clear();
+        scrub_cache_.resize(kScrubCacheCap);
+        scrub_cache_next_ = 0;
+        for (auto& e : scrub_cache_) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = kThumbW;
+            td.Height = kThumbH;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            check_hr(device_->CreateTexture2D(&td, nullptr, &e.tex), "CreateTexture2D(thumb)");
+            check_hr(device_->CreateRenderTargetView(e.tex.Get(), nullptr, &e.rtv), "CreateRTV(thumb)");
+            check_hr(device_->CreateShaderResourceView(e.tex.Get(), nullptr, &e.srv), "CreateSRV(thumb)");
+            e.bucket = -1;
         }
     }
 
@@ -2525,13 +2862,23 @@ private:
         float sw = static_cast<float>(src_width_);
         float sh = static_cast<float>(src_height_);
         float ww = static_cast<float>(win_width_);
-        float wh = static_cast<float>(win_height_);
+        // Reserve the top strip for the self-drawn title bar (kTopBarH, drawn by build_top_bar())
+        // so the video is letterboxed into the area BELOW it rather than being partly covered by
+        // it -- the leftover strip is left black by draw_and_present()'s full-backbuffer clear and
+        // the opaque top-bar ImGui window paints over it. The letterbox math runs against this
+        // reduced region; region_y offsets the result downward past the bar. In fullscreen the
+        // bar auto-hides (build_top_bar()) and only overlays on hover, exactly like the bottom
+        // bar -- so no strip is reserved there and the video fills the whole screen.
+        float bar = fullscreen_.load(std::memory_order_relaxed) ? 0.0f : kTopBarH;
+        float region_y = bar;
+        float wh = static_cast<float>(win_height_) - bar;
         if (sw <= 0.0f || sh <= 0.0f || ww <= 0.0f || wh <= 0.0f)
-            return D3D11_VIEWPORT{ 0.0f, 0.0f, ww, wh, 0.0f, 1.0f };
+            return D3D11_VIEWPORT{ 0.0f, 0.0f, static_cast<float>(win_width_),
+                                   static_cast<float>(win_height_), 0.0f, 1.0f };
         float scale = (ww / sw < wh / sh) ? (ww / sw) : (wh / sh);
         float dw = sw * scale;
         float dh = sh * scale;
-        return D3D11_VIEWPORT{ (ww - dw) * 0.5f, (wh - dh) * 0.5f, dw, dh, 0.0f, 1.0f };
+        return D3D11_VIEWPORT{ (ww - dw) * 0.5f, region_y + (wh - dh) * 0.5f, dw, dh, 0.0f, 1.0f };
     }
 
     void draw_and_present(Source source, UINT slot)
@@ -3169,6 +3516,7 @@ private:
     bool closed_ = false;
     bool opened_ = false;
     bool ui_ready_ = false;
+    bool in_ui_tick_ = false; // re-entrancy guard for ui_tick() (see its header comment)
 
     // ---- UI draw-data handoff (M2) -- ui_pending_ is main-thread-written/present-moved-out,
     // ui_active_ is present-thread-exclusive (never touched under ui_mutex_ once moved into).
@@ -3190,7 +3538,11 @@ private:
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
-    bool fullscreen_ = false;
+    // Atomic: written on the main thread (toggle_fullscreen()) but read on the PRESENT thread by
+    // fit_viewport() (whether to reserve the title-bar strip) as well as the main thread
+    // (build_top_bar()'s auto-hide, is_fullscreen(), resize_window_for_video()). relaxed is
+    // enough -- it only gates a per-frame layout choice, no other state is published through it.
+    std::atomic<bool> fullscreen_{ false };
     RECT windowed_rect_{};  // saved pre-fullscreen window rect, for restore
     LONG windowed_style_ = 0; // saved pre-fullscreen GWL_STYLE, for restore
 
@@ -3245,6 +3597,51 @@ private:
     CUdeviceptr ai_in_cu_buf_ = 0;   // persistent, single-slot, tightly-packed NV12 dest buffer
     size_t ai_in_cu_buf_pitch_ = 0;  // == src_width_ (tightly packed)
     size_t ai_in_cu_buf_size_ = 0;
+
+    // ---- M4: seekbar hover scrub-thumbnail preview -----------------------------------------
+    // An INDEPENDENT decode path (own Decoder = own NVDEC session) inside this Player -- NOT a
+    // second Player instance (see get_thumbnail()'s header for why). get_thumbnail() runs on the
+    // MAIN thread inside ui_tick()/build_bottom_bar() (which never touches d3d_mutex_, see
+    // ui_tick():867) -- it only reads scrub_cache_ under scrub_cache_mutex_ and posts the hovered
+    // bucket to scrub_thread_ via scrub_request_frame_ + scrub_cv_; it NEVER decodes or does GPU
+    // work, so hovering can't perturb present pacing. scrub_thread_ does the slow seek WITHOUT
+    // any Player lock (Decoder self-serializes its own d3d11va pool, exactly like decode_loop()),
+    // then takes d3d_mutex_ ONLY for the brief NV12->RGB blit (same shader pipeline as
+    // draw_and_present(): vs_ + ps_nv12_ + sampler_ + slice_cb_), then publishes the result under
+    // scrub_cache_mutex_ (never held together with d3d_mutex_ -> no lock cycle).
+    static constexpr int kThumbW = 256;          // 16:9 preview RTV; sampler_ (LINEAR) downscales
+    static constexpr int kThumbH = 144;
+    static constexpr size_t kScrubCacheCap = 12;  // ~2MB VRAM; enough to re-hover a region instantly
+
+    // One pre-allocated, reused RGBA8 thumbnail texture (+ its RTV to render into and SRV to hand
+    // to ImGui::AddImage). Ring-recycled: only `bucket` changes as slots are reused; the ComPtrs
+    // persist so an SRV baked into the live ImGui draw snapshot stays valid until present renders
+    // it. bucket == -1 means the slot is empty.
+    struct ThumbEntry {
+        int64_t bucket = -1;
+        ComPtr<ID3D11Texture2D> tex;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        ComPtr<ID3D11RenderTargetView> rtv;
+    };
+    std::vector<ThumbEntry> scrub_cache_;   // capacity kScrubCacheCap; guarded by scrub_cache_mutex_
+    size_t scrub_cache_next_ = 0;           // round-robin write cursor; guarded by scrub_cache_mutex_
+    std::mutex scrub_cache_mutex_;
+
+    // Single-slice NV12 blit source (scrub decoder's frame is CopySubresourceRegion'd here, then
+    // sampled by ps_nv12_) -- session-scoped, sized src_width_ x src_height_, built/torn down
+    // alongside pt_ring_tex_ in create_ring_resources()/close_session().
+    ComPtr<ID3D11Texture2D> scrub_nv12_tex_;
+    ComPtr<ID3D11ShaderResourceView> scrub_srv_y_;
+    ComPtr<ID3D11ShaderResourceView> scrub_srv_uv_;
+
+    Decoder scrub_decoder_;
+    std::thread scrub_thread_;
+    // Latest hovered bucket the scrub thread should serve; -1 = nothing pending. Coalescing: the
+    // main thread just overwrites this with the newest bucket, so a fast drag drops intermediate
+    // buckets and the thread always chases the most recent hover position.
+    std::atomic<int64_t> scrub_request_frame_{ -1 };
+    std::condition_variable scrub_cv_;
+    std::mutex scrub_cv_mutex_;
 
     std::mutex ready_mutex_;
     std::mutex push_mutex_;
@@ -3463,9 +3860,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp != SIZE_MINIMIZED) {
             UINT w = LOWORD(lp);
             UINT h = HIWORD(lp);
-            if (self && w != 0 && h != 0) self->on_resize(w, h);
+            if (self && w != 0 && h != 0) {
+                self->on_resize(w, h);
+                // Rebuild the ImGui overlay (title bar + progress bar) NOW at the new size so
+                // they track the window edge in real time during a drag-resize. Without this
+                // they only refreshed once the modal resize loop exited and Python's ui_tick()
+                // ran again -- the video (rendered by the independent present thread) followed
+                // the resize live, but the self-drawn bars lagged until mouse-up. WM_SIZE is
+                // dispatched on the main thread (both from pump_messages() and from inside the
+                // OS modal resize loop), which is the only thread allowed to call ui_tick(), so
+                // this is thread-safe; the present thread picks up the fresh snapshot next
+                // vblank. ui_tick() self-guards on ui_ready_ (no-op before ui_init()).
+                self->ui_tick();
+            }
         }
         return 0;
+    case WM_GETMINMAXINFO: {
+        // Task: manual resize must not be artificially limited. Lower the minimum track size
+        // (below Windows' default for a WS_THICKFRAME window) so the user can shrink freely; the
+        // floor here is just enough to keep the title-bar buttons usable. Deliberately does NOT
+        // touch ptMaxSize/ptMaxTrackSize/ptMaxPosition -- those govern the maximized rect, which
+        // the borderless WM_NCCALCSIZE path relies on at its default values.
+        MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        UINT dpi = GetDpiForWindow(hwnd);
+        mmi->ptMinTrackSize.x = MulDiv(240, dpi, 96);
+        mmi->ptMinTrackSize.y = MulDiv(135, dpi, 96);
+        return 0;
+    }
     case WM_DPICHANGED: {
         RECT* rc = reinterpret_cast<RECT*>(lp);
         if (rc) {

@@ -14,7 +14,7 @@
 # several seconds for TRT compilation) before showing anything. The window appears immediately
 # and stays responsive (pump_messages() every tick) while warmup runs on a background daemon
 # thread; an open/drop-file prompt is shown until the user picks a file, and a small
-# "正在预热中…" status float (native build_status_float(), driven by set_status_text()) tracks
+# "正在预热模型…" status float (native build_status_float(), driven by set_status_text()) tracks
 # warmup progress. Opening a file no longer waits on the models -- player.open() plus play()
 # starts original-passthrough playback immediately (present's AI-absent fallback, see
 # DESIGN.md I9); the Scheduler is only constructed once warmup finishes, at which point AI
@@ -91,9 +91,14 @@ def _warmup_worker(state: "_WarmupState") -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video", nargs="?", default=None)
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--maximized", action="store_true", default=True)
+    # Initial windowed size for the open-prompt window (before any video is opened). Once a
+    # video opens, the native side auto-sizes the window to the video (resize_window_for_video()).
+    ap.add_argument("--width", type=int, default=1280)
+    ap.add_argument("--height", type=int, default=720)
+    # Default to windowed. `--maximized` still forces a maximized start. (This previously
+    # defaulted to True, so store_true made the window ALWAYS start maximized -- the flag was a
+    # no-op and there was no way to get a windowed start.)
+    ap.add_argument("--maximized", action="store_true", default=False)
     args = ap.parse_args()
 
     settings = settings_mod.load()
@@ -202,7 +207,7 @@ def main():
             elif warm_ready:
                 status_text = ""
             else:
-                status_text = "正在预热中…"
+                status_text = "正在预热模型…"
             player.set_status_text(status_text)
 
             player.set_ui_config(cfg_clip_length, cfg_max_regions)
