@@ -81,6 +81,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -515,6 +516,13 @@ public:
         // frames once this flips true (see present_loop()).
         session_active_.store(true, std::memory_order_relaxed);
 
+        // Arm the coarse-grid prefetch immediately (the player opens paused, so scrub_loop() starts
+        // filling right away using the idle NVDEC) rather than lazily on first hover -- seekbar
+        // dragging is a high-frequency action and we want coverage ready before the user reaches
+        // for it. The fill self-suspends the moment playback starts (see scrub_loop()).
+        scrub_grid_wanted_.store(true, std::memory_order_relaxed);
+        scrub_cv_.notify_one();
+
         // Auto-size the window to this video (1:1 point-for-point, capped/on-screen -- see the
         // method). Done last, after session_active_ so the synchronous WM_SIZE this triggers
         // (SetWindowPos -> on_resize + WndProc's ui_tick refresh) already renders real frames at
@@ -622,8 +630,14 @@ public:
                 std::lock_guard<std::mutex> scrub_cache_lock(scrub_cache_mutex_);
                 scrub_cache_.clear();
                 scrub_cache_next_ = 0;
+                scrub_grid_.clear();
+                scrub_grid_rank_.clear();
+                scrub_grid_octave_.clear();
+                scrub_grid_stride_ = 0;
+                scrub_grid_done_ = 0;
             }
             scrub_request_frame_.store(-1, std::memory_order_relaxed);
+            scrub_grid_wanted_.store(false, std::memory_order_relaxed);
         }
 
         decoder_.close();
@@ -2117,11 +2131,23 @@ private:
                 IM_COL32(255, 255, 255, 160));
 
             ID3D11ShaderResourceView* thumb = get_thumbnail(frame_for_seekbar_x(hx, x0, x1, fc));
-            if (thumb) { // M3: get_thumbnail() always returns nullptr -- this branch is dead
-                         // until M4 implements it, kept so the hook's call site is real code.
+            if (thumb) {
+                // Draw on the FOREGROUND draw list, NOT this window's `dl`: the bottom bar window
+                // is only bar_h(56px) tall, so its clip rect clips anything above it -- the
+                // thumbnail sits ~100px above the track and would be entirely clipped away
+                // (that was the M4 "thumbnail never shows" bug). The foreground list is clipped
+                // only to the whole viewport and always renders on top.
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
                 ImVec2 tsize(160.0f, 90.0f);
-                ImVec2 tmin(std::clamp(hx - tsize.x * 0.5f, x0, x1 - tsize.x), track_pos.y - 12.0f - tsize.y);
-                dl->AddImage(thumb, tmin, ImVec2(tmin.x + tsize.x, tmin.y + tsize.y));
+                float tx = std::clamp(hx - tsize.x * 0.5f, x0, std::max(x0, x1 - tsize.x));
+                ImVec2 tmin(tx, track_pos.y - 12.0f - tsize.y);
+                ImVec2 tmax(tmin.x + tsize.x, tmin.y + tsize.y);
+                const float pad = 3.0f;
+                fg->AddRectFilled(ImVec2(tmin.x - pad, tmin.y - pad), ImVec2(tmax.x + pad, tmax.y + pad),
+                    IM_COL32(20, 20, 20, 230), 3.0f);
+                fg->AddImage(thumb, tmin, tmax);
+                fg->AddRect(ImVec2(tmin.x - pad, tmin.y - pad), ImVec2(tmax.x + pad, tmax.y + pad),
+                    IM_COL32(230, 230, 230, 200), 3.0f);
             }
         }
 
@@ -2284,27 +2310,53 @@ private:
         return bucket;
     }
 
-    // M4: scrub thumbnail SRV for a given content frame number, or nullptr if not ready yet.
-    // Called ONLY from build_bottom_bar() on the MAIN thread inside ui_tick() (which never
-    // touches d3d_mutex_, see ui_tick()) -- this must never block or do GPU work, so it only
-    // reads the ready cache and posts the hovered bucket to scrub_thread_. A miss returns nullptr
-    // and the call site simply draws the hover cursor line without an image until the thumbnail
-    // lands. The returned raw SRV stays valid until close_session() (which joins scrub_thread_
-    // and clears the cache on this same main thread), long past the present thread rendering the
-    // ImGui draw snapshot it gets baked into.
+    // M4: scrub thumbnail SRV for a given content frame number. Called ONLY from
+    // build_bottom_bar() on the MAIN thread inside ui_tick() (which never touches d3d_mutex_, see
+    // ui_tick()) -- this must never block or do GPU work, so it only reads the ready cache and
+    // posts the hovered bucket to scrub_thread_. Anti-flicker: on an exact miss it returns the
+    // NEAREST already-decoded thumbnail (not nullptr) so a moving hover never blanks between
+    // buckets; nullptr only when the cache is still completely empty. The returned raw SRV stays
+    // valid until close_session() (which joins scrub_thread_ and clears the cache on this same
+    // main thread), long past the present thread rendering the ImGui draw snapshot it gets baked
+    // into.
     ID3D11ShaderResourceView* get_thumbnail(int64_t frame_num)
     {
         if (!session_active_.load(std::memory_order_relaxed)) return nullptr;
         int64_t bucket = scrub_bucket_for_frame(frame_num);
+
+        // Record where the user is looking (grid fills nearest-to-hover first) and, on the first
+        // ever hover this session, arm + kick the background grid fill.
+        scrub_last_hover_frame_.store(frame_num, std::memory_order_relaxed);
+        if (!scrub_grid_wanted_.exchange(true, std::memory_order_relaxed))
+            scrub_cv_.notify_one();
+
+        ID3D11ShaderResourceView* exact = nullptr;
+        ID3D11ShaderResourceView* nearest = nullptr;
+        int64_t nearest_dist = INT64_MAX;
+        auto scan = [&](const std::vector<ThumbEntry>& v) {
+            for (auto& e : v) {
+                if (e.bucket < 0 || !e.srv) continue;
+                if (e.bucket == bucket) { exact = e.srv.Get(); return; }
+                int64_t diff = e.bucket - bucket;
+                int64_t d = diff < 0 ? -diff : diff;
+                if (d < nearest_dist) { nearest_dist = d; nearest = e.srv.Get(); }
+            }
+        };
         {
             std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
-            for (auto& e : scrub_cache_)
-                if (e.bucket == bucket && e.srv) return e.srv.Get();
+            scan(scrub_cache_);              // exact hits live in the on-demand ring
+            if (!exact) scan(scrub_grid_);   // else the coarse grid bounds how far "nearest" can be
         }
-        // Miss: request this bucket (coalescing -- newest hover wins) and wake the scrub thread.
-        scrub_request_frame_.store(bucket, std::memory_order_relaxed);
-        scrub_cv_.notify_one();
-        return nullptr;
+        if (!exact) {
+            // Exact miss: request this bucket (coalescing -- newest hover wins) and wake the scrub
+            // thread so it refines to the exact frame. Return the NEAREST cached thumbnail in the
+            // meantime -- returning nullptr blanks the image for the ~15-64ms the seek+blit takes
+            // (flicker), and the grid tier keeps that nearest within scrub_grid_stride_/2 of the
+            // target so a far jump shows an approximately-correct frame, not a wildly-off one.
+            scrub_request_frame_.store(bucket, std::memory_order_relaxed);
+            scrub_cv_.notify_one();
+        }
+        return exact ? exact : nearest;
     }
 
     // M4: render the NV12 blit source (already holding the just-decoded scrub frame) into a small
@@ -2354,71 +2406,158 @@ private:
     // are never held together, so there is no lock cycle with get_thumbnail() (main thread,
     // scrub_cache_mutex_ only) or the present thread (d3d_mutex_ only). Session-scoped: started by
     // open_session(), joined by close_session() (which sets session_stop_ + notifies the cv).
+    // Blit an already-decoded scrub frame into a thumb slot's RTV. Takes d3d_mutex_ ONLY for the
+    // brief copy + single-triangle NV12->RGB draw (same pipeline as draw_and_present()). Returns
+    // false if the session resources were torn down underneath it. Never held together with
+    // scrub_cache_mutex_ -> no lock cycle with get_thumbnail()/present.
+    bool blit_thumbnail(const DecodedFrame& df, ID3D11RenderTargetView* dst_rtv)
+    {
+        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        if (!scrub_nv12_tex_ || !dst_rtv) return false;
+        context_->CopySubresourceRegion(scrub_nv12_tex_.Get(), 0, 0, 0, 0, df.texture, df.array_slice, nullptr);
+        render_thumbnail(dst_rtv);
+        return true;
+    }
+
+    // Serve one hovered bucket into the on-demand RING tier (the exact preview). Slow seek holds no
+    // Player lock; brief d3d_mutex_ for the blit; scrub_cache_mutex_ only to pick a slot / publish.
+    void serve_hover_bucket(int64_t bucket)
+    {
+        {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            for (auto& e : scrub_cache_)
+                if (e.bucket == bucket) return; // re-hover of a still-cached bucket
+        }
+        DecodedFrame df; std::string err;
+        if (!scrub_decoder_.seek_to_frame(bucket, df, err)) return; // best-effort
+        if (scrub_request_frame_.load(std::memory_order_relaxed) != bucket) return; // coalesced away
+        size_t slot; ComPtr<ID3D11RenderTargetView> rtv;
+        {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            if (scrub_cache_.empty()) return; // torn down
+            slot = scrub_cache_next_;
+            rtv = scrub_cache_[slot].rtv;
+        }
+        if (!blit_thumbnail(df, rtv.Get())) return;
+        {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            if (scrub_cache_.empty() || slot >= scrub_cache_.size()) return;
+            scrub_cache_[slot].bucket = bucket;
+            scrub_cache_next_ = (scrub_cache_next_ + 1) % scrub_cache_.size();
+        }
+    }
+
+    // Fill ONE coarse-GRID slot -- the still-unfilled slot nearest the last hover, so coverage
+    // grows outward from where the user is looking. scrub_grid_done_ (scrub-thread-only) advances
+    // on every definitive outcome so the loop knows when the grid is complete.
+    void fill_next_grid_point()
+    {
+        int64_t hover = scrub_last_hover_frame_.load(std::memory_order_relaxed);
+        size_t pick = SIZE_MAX; int64_t pick_frame = 0;
+        uint32_t best_oct = UINT32_MAX; int64_t best_dist = INT64_MAX;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            int64_t span = (frame_count_ > 0) ? frame_count_ - 1 : 0;
+            for (size_t i = 0; i < scrub_grid_.size(); ++i) {
+                if (scrub_grid_[i].bucket != -1) continue; // already filled (>=0) or failed (-2)
+                // Coarse-to-fine: lowest octave first (whole-video coverage before densifying);
+                // within an octave, nearest the hover first. Map slot i uniformly across the WHOLE
+                // video [0, span] (endpoints included) so the tail is covered -- a plain i*stride
+                // undershoots the end by up to one stride and leaves a large nearest gap there.
+                uint32_t oct = (i < scrub_grid_octave_.size()) ? scrub_grid_octave_[i] : 0;
+                int64_t f = (scrub_grid_slots_ > 1) ? static_cast<int64_t>(i) * span / static_cast<int64_t>(scrub_grid_slots_ - 1) : 0;
+                int64_t diff = f - hover; int64_t d = diff < 0 ? -diff : diff;
+                if (oct < best_oct || (oct == best_oct && d < best_dist)) {
+                    best_oct = oct; best_dist = d; pick = i; pick_frame = f;
+                }
+            }
+            if (pick != SIZE_MAX) rtv = scrub_grid_[pick].rtv;
+        }
+        if (pick == SIZE_MAX) { scrub_grid_done_ = scrub_grid_slots_; return; } // nothing left to attempt
+
+        // Coarse preview: land on the nearest keyframe (one decode), not a full-GOP forward-decode
+        // to exact -- keeps background fill cheap enough to run during playback (see docs sweep).
+        DecodedFrame df; std::string err;
+        if (!scrub_decoder_.seek_to_frame(pick_frame, df, err, /*nearest_keyframe=*/true)) {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            if (pick < scrub_grid_.size()) scrub_grid_[pick].bucket = -2; // give up on this slot
+            scrub_grid_done_++;
+            return;
+        }
+        if (!blit_thumbnail(df, rtv.Get())) return; // torn down -- leave slot -1, session ending
+        // Store the ACTUAL landed keyframe frame (not the requested pick_frame) so get_thumbnail's
+        // nearest-distance is measured against what the slot really shows.
+        int64_t landed = (fps_ > 0.0) ? static_cast<int64_t>(std::llround(df.pts_seconds * fps_)) : pick_frame;
+        std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+        if (pick < scrub_grid_.size()) scrub_grid_[pick].bucket = landed;
+        scrub_grid_done_++;
+    }
+
+    // M4 scrub producer. After priming the PTS origin, it loops: serve the newest hovered bucket
+    // (exact, into the ring) the instant one arrives, else -- once scrubbing has started -- fill
+    // ONE coarse-grid slot for bounded nearest coverage, else sleep. Hover always preempts grid
+    // fill: only one grid slot is decoded before the loop re-checks for a hover.
     void scrub_loop()
     {
+        // Prime the PTS origin BEFORE serving any hover. Decoder::seek_to_frame() refuses to run
+        // until at least one frame has been decoded through next_frame() -- that is the ONLY place
+        // have_first_pts_/first_pts_seconds_ get set (see decoder.cpp). The scrub decoder only ever
+        // seeks, never plays, so without this one throwaway decode of frame 0 EVERY seek_to_frame()
+        // bails at its !have_first_pts_ guard and no thumbnail is ever produced (the "thumbnail
+        // never shows" bug). This runs off the main thread on the independent scrub_decoder_ (its
+        // own d3d11va pool self-serializes, exactly like decode_loop()), so it never touches
+        // d3d_mutex_ nor adds to open_session() latency.
+        {
+            DecodedFrame prime;
+            if (!scrub_decoder_.next_frame(prime)) {
+                fprintf(stderr, "[sumu] scrub decoder prime decode failed -- hover thumbnails disabled\n");
+                return;
+            }
+        }
         int64_t last_handled = -1;
         while (true) {
-            int64_t bucket;
-            {
-                std::unique_lock<std::mutex> lk(scrub_cv_mutex_);
-                scrub_cv_.wait(lk, [&] {
-                    return session_stop_.load(std::memory_order_relaxed) ||
-                           stop_.load(std::memory_order_relaxed) ||
-                           scrub_request_frame_.load(std::memory_order_relaxed) != last_handled;
-                });
-                if (session_stop_.load(std::memory_order_relaxed) || stop_.load(std::memory_order_relaxed))
-                    return;
-                bucket = scrub_request_frame_.load(std::memory_order_relaxed);
-            }
-            last_handled = bucket;
-            if (bucket < 0) continue;
+            if (session_stop_.load(std::memory_order_relaxed) || stop_.load(std::memory_order_relaxed))
+                return;
 
-            // Already produced? (a re-hover of a still-cached bucket)
-            bool cached = false;
-            {
-                std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
-                for (auto& e : scrub_cache_)
-                    if (e.bucket == bucket) { cached = true; break; }
-            }
-            if (cached) continue;
-
-            // Slow part -- no Player lock. scrub_decoder_ is touched ONLY by this thread.
-            DecodedFrame df;
-            std::string err;
-            if (!scrub_decoder_.seek_to_frame(bucket, df, err))
-                continue; // best-effort: leave the cursor line imageless, try the next hover
-
-            // Coalesce: if the hover moved on while we were seeking, drop this frame and let the
-            // next iteration serve the newest bucket rather than spending a blit on a stale one.
-            if (scrub_request_frame_.load(std::memory_order_relaxed) != bucket)
+            int64_t req = scrub_request_frame_.load(std::memory_order_relaxed);
+            if (req != last_handled) {          // a (possibly new) hover -- serve it, exact
+                last_handled = req;
+                if (req >= 0) serve_hover_bucket(req);
                 continue;
-
-            // Pick the round-robin slot to (re)use; copy out its RTV/SRV under the cache lock so
-            // the blit below runs without holding it.
-            size_t slot;
-            ComPtr<ID3D11RenderTargetView> target_rtv;
-            {
-                std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
-                if (scrub_cache_.empty()) continue; // torn down
-                slot = scrub_cache_next_;
-                target_rtv = scrub_cache_[slot].rtv;
-            }
-            if (!target_rtv) continue;
-
-            {
-                std::lock_guard<std::mutex> d3d_lock(d3d_mutex_); // brief -- one copy + one triangle
-                if (!scrub_nv12_tex_) continue;
-                context_->CopySubresourceRegion(scrub_nv12_tex_.Get(), 0, 0, 0, 0,
-                    df.texture, df.array_slice, nullptr);
-                render_thumbnail(target_rtv.Get());
             }
 
-            {
-                std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
-                if (scrub_cache_.empty() || slot >= scrub_cache_.size()) continue;
-                scrub_cache_[slot].bucket = bucket;
-                scrub_cache_next_ = (scrub_cache_next_ + 1) % scrub_cache_.size();
+            // Background grid fill runs DURING PLAYBACK too. What makes this affordable is that each
+            // grid point is decoded nearest-keyframe-only (one frame, not a whole-GOP forward-decode
+            // -- see fill_next_grid_point / Decoder::seek_to_frame): the old full-decode fill
+            // jittered present to stddev 3.17. While PLAYING we still yield grid_play_throttle_ms_
+            // between fills (resolution-aware: ~2ms @1080p, ~12ms @4K -- measured, a 0ms busy-loop
+            // jitters 4K present to stddev 2.23 while any small yield holds baseline ~0.1); while
+            // PAUSED the foreground is idle so we fill flat out (~600-830/s at 1080p).
+            if (scrub_grid_wanted_.load(std::memory_order_relaxed) &&
+                scrub_grid_done_ < scrub_grid_slots_) {
+                fill_next_grid_point();         // background coverage; re-check hover after each one
+                if (playing_.load(std::memory_order_relaxed)) {
+                    std::unique_lock<std::mutex> lk(scrub_cv_mutex_);
+                    scrub_cv_.wait_for(lk, std::chrono::milliseconds(grid_play_throttle_ms_), [&] {
+                        return session_stop_.load(std::memory_order_relaxed) ||
+                               stop_.load(std::memory_order_relaxed) ||
+                               scrub_request_frame_.load(std::memory_order_relaxed) != last_handled;
+                    });
+                }
+                continue;
             }
+
+            // Fully idle (grid complete or not yet armed): sleep until a hover arrives or grid work
+            // becomes possible.
+            std::unique_lock<std::mutex> lk(scrub_cv_mutex_);
+            scrub_cv_.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                return session_stop_.load(std::memory_order_relaxed) ||
+                       stop_.load(std::memory_order_relaxed) ||
+                       scrub_request_frame_.load(std::memory_order_relaxed) != last_handled ||
+                       (scrub_grid_wanted_.load(std::memory_order_relaxed) &&
+                        scrub_grid_done_ < scrub_grid_slots_);
+            });
         }
     }
 
@@ -2512,10 +2651,7 @@ private:
         uvd.Format = DXGI_FORMAT_R8G8_UNORM;
         check_hr(device_->CreateShaderResourceView(scrub_nv12_tex_.Get(), &uvd, &scrub_srv_uv_), "CreateSRV(scrub UV)");
 
-        scrub_cache_.clear();
-        scrub_cache_.resize(kScrubCacheCap);
-        scrub_cache_next_ = 0;
-        for (auto& e : scrub_cache_) {
+        auto alloc_thumb = [&](ThumbEntry& e) {
             D3D11_TEXTURE2D_DESC td{};
             td.Width = kThumbW;
             td.Height = kThumbH;
@@ -2529,7 +2665,53 @@ private:
             check_hr(device_->CreateRenderTargetView(e.tex.Get(), nullptr, &e.rtv), "CreateRTV(thumb)");
             check_hr(device_->CreateShaderResourceView(e.tex.Get(), nullptr, &e.srv), "CreateSRV(thumb)");
             e.bucket = -1;
+        };
+
+        scrub_cache_.clear();
+        scrub_cache_.resize(kScrubCacheCap);
+        scrub_cache_next_ = 0;
+        for (auto& e : scrub_cache_) alloc_thumb(e);
+
+        // Coarse grid tier: uniform coverage of the whole video, slot count scaled to duration
+        // (~one thumb per kGridTargetSpacingSec) but clamped to [kGridSlotsMin, kGridSlotsMax] --
+        // a short clip gets the floor (denser), anything past ~68min flattens at the 1024 ceil (the
+        // ring tier refines exact on hover, so a longer film's coarser grid spacing is acceptable).
+        double dur_s = (fps_ > 0.0 && frame_count_ > 0) ? frame_count_ / fps_ : 0.0;
+        size_t want = static_cast<size_t>(dur_s / kGridTargetSpacingSec);
+        scrub_grid_slots_ = std::min(kGridSlotsMax, std::max(kGridSlotsMin, want));
+        scrub_grid_.clear();
+        scrub_grid_.resize(scrub_grid_slots_);
+        for (auto& e : scrub_grid_) alloc_thumb(e);
+
+        // Progressive (coarse-to-fine) fill order: rank[i] = bit-reversal of the slot index over
+        // enough bits to cover all slots. Filling by ascending rank visits 0, mid, quarters,
+        // eighths... so the whole timeline is coarsely covered first (level 64) and each subsequent
+        // batch bisects the gaps (128/256/512). octave[i] = highest set bit of rank[i]: the scan
+        // ties within an octave break toward the hover, so the scrubbed region densifies first
+        // without starving the global coarse pass.
+        scrub_grid_rank_.assign(scrub_grid_slots_, 0);
+        scrub_grid_octave_.assign(scrub_grid_slots_, 0);
+        int bits = 0;
+        while ((static_cast<size_t>(1) << bits) < scrub_grid_slots_) ++bits;
+        for (size_t i = 0; i < scrub_grid_slots_; ++i) {
+            uint32_t v = static_cast<uint32_t>(i), r = 0;
+            for (int b = 0; b < bits; ++b) { r = (r << 1) | (v & 1u); v >>= 1; }
+            scrub_grid_rank_[i] = r;
+            uint8_t oct = 0;
+            for (uint32_t t = r; t > 1; t >>= 1) ++oct; // floor(log2(r)); 0 for r<=1
+            scrub_grid_octave_[i] = oct;
         }
+
+        // Resolution-aware inter-fill yield while playing (paused fills flat out): 4K needs a small
+        // yield or a back-to-back scrub decode jitters present; 1080p tolerates near-full speed.
+        grid_play_throttle_ms_ = (static_cast<int64_t>(src_width_) * src_height_ > kHiResPixels)
+            ? kGridPlayThrottleHiRes : kGridPlayThrottleLoRes;
+
+        // Reported/nominal spacing between grid points (points span [0, frame_count_-1]).
+        scrub_grid_stride_ = std::max<int64_t>(1, (frame_count_ > 1 ? frame_count_ - 1 : 1) /
+            static_cast<int64_t>(scrub_grid_slots_ > 1 ? scrub_grid_slots_ - 1 : 1));
+        scrub_grid_done_ = 0;
+        scrub_grid_wanted_.store(false, std::memory_order_relaxed);
     }
 
     void create_landing_texture()
@@ -3677,9 +3859,11 @@ private:
     // then takes d3d_mutex_ ONLY for the brief NV12->RGB blit (same shader pipeline as
     // draw_and_present(): vs_ + ps_nv12_ + sampler_ + slice_cb_), then publishes the result under
     // scrub_cache_mutex_ (never held together with d3d_mutex_ -> no lock cycle).
-    static constexpr int kThumbW = 256;          // 16:9 preview RTV; sampler_ (LINEAR) downscales
-    static constexpr int kThumbH = 144;
-    static constexpr size_t kScrubCacheCap = 12;  // ~2MB VRAM; enough to re-hover a region instantly
+    static constexpr int kThumbW = 160;          // == seekbar preview draw size (1:1, no down/upscale)
+    static constexpr int kThumbH = 90;
+    static constexpr size_t kScrubCacheCap = 32;  // on-demand ring; ~1.8MB VRAM. Wider window so
+                                                   // nearest-on-miss stays close during a sweep and
+                                                   // back-and-forth re-hover rarely re-decodes
 
     // One pre-allocated, reused RGBA8 thumbnail texture (+ its RTV to render into and SRV to hand
     // to ImGui::AddImage). Ring-recycled: only `bucket` changes as slots are reused; the ComPtrs
@@ -3693,6 +3877,47 @@ private:
     };
     std::vector<ThumbEntry> scrub_cache_;   // capacity kScrubCacheCap; guarded by scrub_cache_mutex_
     size_t scrub_cache_next_ = 0;           // round-robin write cursor; guarded by scrub_cache_mutex_
+
+    // Coarse background grid: scrub_grid_slots_ thumbnails uniformly spanning the WHOLE video,
+    // filled by scrub_loop() DURING PLAYBACK AND WHEN PAUSED (each point is decoded
+    // nearest-keyframe-only -- one frame, not a GOP -- so it stays at present baseline even at
+    // 4K60; measured, see docs), and NEVER evicted. Armed at open() so prefetch starts immediately.
+    // Bounds get_thumbnail()'s nearest-on-miss error to ~half the grid spacing (+ up to one GOP for
+    // the keyframe snap), so a fast jump to a far position shows an approximately-correct frame at
+    // once (not a wildly-off nearest) and still refines to exact via the ring tier.
+    //
+    // PROGRESSIVE (coarse-to-fine) fill order: slots are filled in ascending bit-reversal rank, so
+    // the FIRST ~64 decodes are spread evenly across the whole timeline (level 64), the next batch
+    // bisects them (128), then 256, 512, 1024 -- every extra decode roughly halves the worst-case
+    // nearest gap ANYWHERE in the video, instead of densely covering one region first and leaving
+    // the far end blank. Within one octave, ties break toward the last hover so the region being
+    // scrubbed densifies first. Measured full-cache-during-playback (1080p30 ~263/s @2ms, 4K60
+    // ~75/s @12ms): a full 1024-slot grid completes in ~4s (1080p) / ~14s (4K); the coarse 64-point
+    // pass lands in <1s -- see docs/scrub_thumbnail.md. entry.bucket: -1 unfilled, >=0 the frame it
+    // holds, -2 failed. Same scrub_cache_mutex_ guards both tiers; get_thumbnail() scans grid+ring.
+    static constexpr double kGridTargetSpacingSec = 4.0; // aim ~one grid thumb per 4s of video
+    static constexpr size_t kGridSlotsMin = 64;          // floor: coarse whole-video coverage (level 64)
+    static constexpr size_t kGridSlotsMax = 1024;        // ceil: ~1024*57KB ~= 58MB VRAM at 160x90; the
+                                                         // ring tier refines to exact on hover so a
+                                                         // long film's coarser spacing is fine. Full-cache
+                                                         // during playback ~= 1024/263 ~= 4s (1080p) /
+                                                         // 1024/75 ~= 14s (4K); coarse pass still <1s.
+    std::vector<ThumbEntry> scrub_grid_;    // capacity scrub_grid_slots_; guarded by scrub_cache_mutex_
+    std::vector<uint32_t> scrub_grid_rank_; // per-slot coarse-to-fine fill order (bit-reversal); const after open
+    std::vector<uint8_t> scrub_grid_octave_;// per-slot densification octave (highest set bit of rank); const after open
+    size_t scrub_grid_slots_ = 0;           // runtime slot count (set in create_scrub_resources)
+    int64_t scrub_grid_stride_ = 0;         // nominal frames between grid points (reporting)
+    size_t scrub_grid_done_ = 0;            // # grid slots attempted (scrub thread only); done==slots -> idle
+    // Inter-fill yield WHILE PLAYING (0 when paused -- foreground idle, fill flat out). A busy-loop
+    // (0ms) while playing 4K jitters present (measured stddev 0.10->2.23, no dropped frames but
+    // visible on the trace); ANY small yield restores baseline. 1080p tolerates full speed, so the
+    // yield is resolution-aware: set at open() from the source pixel count (see create_scrub_resources).
+    static constexpr int kGridPlayThrottleLoRes = 2;   // <=1080p: ~263/s, present stddev 0.09 (measured)
+    static constexpr int kGridPlayThrottleHiRes = 12;  // >1080p (4K): ~75/s, present stddev 0.11 (measured)
+    static constexpr int64_t kHiResPixels = 2100000;   // ~1920x1080; above this use the hi-res yield
+    int grid_play_throttle_ms_ = kGridPlayThrottleLoRes; // set at open() from src_width_*src_height_
+    std::atomic<bool> scrub_grid_wanted_{ false }; // flips true on first hover; gates background fill
+    std::atomic<int64_t> scrub_last_hover_frame_{ 0 }; // newest hovered frame; grid octave-ties break nearest-first
     std::mutex scrub_cache_mutex_;
 
     // Single-slice NV12 blit source (scrub decoder's frame is CopySubresourceRegion'd here, then

@@ -294,7 +294,8 @@ bool Decoder::next_frame(DecodedFrame& out)
     return true;
 }
 
-bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error)
+bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
+                            bool nearest_keyframe)
 {
     if (!have_first_pts_) {
         error = "seek_to_frame called before any frame decoded (no PTS origin yet)";
@@ -323,6 +324,19 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
     // essentially never long enough to need more than a few hundred frames of forward decode
     // even on a deep seek, since av_seek_frame itself did the O(log n) jump to the nearest
     // keyframe regardless of how far away target_frame is.
+    // Coarse-preview fast path: take the keyframe av_seek_frame landed on (one decode) and stop.
+    if (nearest_keyframe) {
+        double raw_pts_s = 0.0;
+        DecodedFrame df;
+        int r = pump_one_raw_frame(df, raw_pts_s);
+        if (r <= 0) { error = "nearest_keyframe: no frame decoded after seek"; return false; }
+        double pts_s = loop_offset_seconds_ + (raw_pts_s - first_pts_seconds_);
+        last_out_pts_seconds_ = pts_s;
+        out = df;
+        out.pts_seconds = pts_s;
+        return true;
+    }
+
     constexpr int kMaxForwardFrames = 600;
     bool have_any = false;
     DecodedFrame last_good{};

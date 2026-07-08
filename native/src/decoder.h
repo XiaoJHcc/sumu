@@ -68,7 +68,12 @@ public:
     // could actually be decoded rather than failing outright, so a near-tail seek degrades
     // gracefully. Returns the actual landed frame via `out`; caller derives the actual
     // frame_num from out.pts_seconds (== llround(out.pts_seconds * fps())).
-    bool seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error);
+    // nearest_keyframe: for coarse previews (scrub grid) -- after the BACKWARD seek, return the
+    // FIRST decoded frame (the keyframe at/before target) instead of decoding forward to the exact
+    // target. Cuts per-seek work from a whole-GOP forward-decode to a single frame, so background
+    // grid fill barely competes with a foreground 4K decode. out lands on that keyframe's real PTS.
+    bool seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
+                       bool nearest_keyframe = false);
 
     double fps() const { return fps_; }
     int width() const { return width_; }
