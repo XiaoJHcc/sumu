@@ -169,7 +169,8 @@ def is_resumable_frame(frame: Optional[int], fps: Optional[float], frame_count: 
     """Resume-gate policy: is `frame` a "meaningful mid-file" position worth seeking back to?
     Skips near-start/near-end positions (more than 5s from both ends required) and unknown/zero
     fps or frame_count. Pure + stdlib-only so it's directly unit-testable without a Player
-    (see scripts/verify_settings.py) -- play.py's maybe_resume() is the only caller."""
+    (see scripts/verify_settings.py). Kept for a future manual "continue watching" UI --
+    app.py no longer auto-seeks on open."""
     if frame is None or not fps or fps <= 0 or not frame_count or frame_count <= 0:
         return False
     margin = 5.0 * fps

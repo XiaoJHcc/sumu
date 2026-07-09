@@ -287,22 +287,10 @@ def main():
         # scheduler down above forces the build step below to re-run against the new file.
         current_path = path
         settings.push_recent(current_path)
-        player.play()  # open_session() starts paused; a freshly reopened file auto-plays
-                       # (matches do_open()'s open->play() sequence above)
-
-    def maybe_resume(path):
-        """M-E: seek back to where the user left off in `path`, if settings has a "meaningful
-        mid-file" position for it (settings_mod.is_resumable_frame -- skips near-start/near-end
-        and unknown fps/frame_count). Same seek order as the UI seek-intent path below
-        (scheduler.notify_seek() then player.seek()). No-op if there's no stored position or it
-        doesn't clear the resume gate. Only called once scheduler is already built, so
-        scheduler.notify_seek() is always valid here."""
-        frame = settings.get_position(path)
-        if frame is None:
-            return
-        if settings_mod.is_resumable_frame(frame, player.fps(), player.frame_count()):
-            scheduler.notify_seek(frame)
-            player.seek(frame)
+        player.play()  # open_session() starts paused at frame 0; auto-play from the start
+                       # (matches do_open()'s open->play() sequence above). Position memory is
+                       # still written (set_position above / finally) but not auto-restored --
+                       # resume wiring is deferred until a manual "continue watching" UI exists.
 
     try:
         while not player.should_quit():
@@ -482,7 +470,9 @@ def main():
                                             max_regions_per_frame=cfg_max_regions)
                 scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
-                maybe_resume(current_path)
+                # Intentionally no auto-resume seek: open/reopen always start at frame 0.
+                # settings.positions still records last frame (do_reopen/finally) for a future
+                # manual "continue watching" path; is_resumable_frame stays available for that.
 
             # 50Hz main loop. NOT 0.008 (125Hz): measured regression (see run_player.py:236 /
             # docs/native_core.md) -- a 125Hz loop starves the present thread, breaking present

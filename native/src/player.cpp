@@ -971,8 +971,8 @@ public:
     // pump_messages()) and from build_top_bar()/build_bottom_bar() (mouse, via ui_tick()) --
     // both run on the SAME Python-owned main thread. NEVER called from the present thread. No
     // lock: see UiIntents' own header comment. A second record_seek() before Python drains
-    // simply overwrites the pending target (last-write-wins, which is what continuous seekbar
-    // dragging wants).
+    // simply overwrites the pending target (last-write-wins). build_bottom_bar only records
+    // on click / when the drag maps to a new frame -- not every hold-still ui_tick.
     void record_toggle_play() { ui_intents_.toggle_play = true; }
     void record_seek(int64_t f) { ui_intents_.seek = f; }
     // M-C2: WM_DROPFILES (a file dropped on the window) and the top-bar "open" button -- see
@@ -2103,9 +2103,17 @@ private:
         float x1 = track_pos.x + track_w;
         float bar_y = track_pos.y + track_h * 0.5f;
 
-        if (track_active) { // covers both the initial click and continued dragging
+        // Seek only on the initial click (IsItemActivated) or when the mapped frame changes
+        // during a drag. Holding still on the bar must NOT re-fire seek every ui_tick -- that
+        // repositions to the same frame repeatedly and makes playback twitch in place.
+        if (track_active) {
             int64_t target = frame_for_seekbar_x(ImGui::GetIO().MousePos.x, x0, x1, fc);
-            record_seek(target);
+            if (ImGui::IsItemActivated() || target != seekbar_last_seek_frame_) {
+                record_seek(target);
+                seekbar_last_seek_frame_ = target;
+            }
+        } else {
+            seekbar_last_seek_frame_ = -1; // next press always counts as a fresh click
         }
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -3607,6 +3615,9 @@ private:
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
     int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
     bool ui_settings_open_ = false;
+    // Seekbar scrub: last frame we already recorded a seek for during the current press.
+    // -1 when the bar is not active. Suppresses hold-still re-seeks (see build_bottom_bar).
+    int64_t seekbar_last_seek_frame_ = -1;
     // Model-warmup status line, see set_status_text()'s header comment -- empty hides
     // build_status_float() entirely, non-empty text shown regardless of session_active_.
     std::string status_text_;
