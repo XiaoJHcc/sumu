@@ -41,6 +41,33 @@
       ],
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
+    },
+    {
+      "label": "sumu: build dist (no smoke)",
+      "detail": "Same pipeline as 'sumu: build dist' but skips the smoke test (-SkipSmoke) -- dist\\sumu is built but not verified to start.",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy", "Bypass",
+        "-File", "scripts/build_dist.ps1",
+        "-SkipSmoke"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "sumu: build dist (fast)",
+      "detail": "Iteration path for small sumu-only changes (-FastFreeze -SkipSmoke): skips PyInstaller COLLECT's full ~9-10GB _internal re-copy (only relinks sumu.exe + refreshes native pyd/ffmpeg DLLs) and skips the smoke test -- dist\\sumu is built but not verified to start. Requires a prior full 'sumu: build dist' and is unsafe if the dependency set (torch/cv2/tensorrt/mmengine) changed.",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy", "Bypass",
+        "-File", "scripts/build_dist.ps1",
+        "-FastFreeze",
+        "-SkipSmoke"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
     }
   ]
 }

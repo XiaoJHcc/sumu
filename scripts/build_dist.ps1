@@ -4,7 +4,15 @@
 # One-command build pipeline for the daily-use frozen player (PyInstaller onedir bundle):
 #   native build -> patch third-party deps -> pyinstaller freeze -> stage weights -> smoke test.
 # Usage:
-#   powershell -File scripts/build_dist.ps1 [-WeightsSrc <dir>] [-SkipNative]
+#   powershell -File scripts/build_dist.ps1 [-WeightsSrc <dir>] [-SkipNative] [-SkipSmoke] [-FastFreeze]
+# -FastFreeze: skip PyInstaller's COLLECT stage (which unconditionally wipes and
+#   re-copies the whole ~9-10GB dist\sumu\_internal tree every run -- see the
+#   comment in packaging/sumu.spec). Only rebuilds dist\sumu\sumu.exe (sumu's own
+#   Python source) plus the native pyd/ffmpeg DLLs, and hand-copies just those
+#   over an EXISTING dist\sumu tree. Requires a prior full build (dist\sumu\_internal
+#   must already exist) and is only correct when the dependency set itself hasn't
+#   changed (no new/updated torch/cv2/tensorrt/mmengine binaries or data files) --
+#   i.e. when only sumu's own source or native extension changed.
 # Weights source resolution (anyone building this, not just the original dev machine):
 #   1. -WeightsSrc if passed explicitly
 #   2. $env:SUMU_WEIGHTS_SRC if set (setx SUMU_WEIGHTS_SRC "C:\path\to\model_weights" once, persists
@@ -13,7 +21,9 @@
 #   3. the original dev machine's path, as a last-resort fallback for this repo's own history.
 param(
     [string]$WeightsSrc = $(if ($env:SUMU_WEIGHTS_SRC) { $env:SUMU_WEIGHTS_SRC } else { "D:/Git/lada-realtime/model_weights" }),
-    [switch]$SkipNative
+    [switch]$SkipNative,
+    [switch]$SkipSmoke,
+    [switch]$FastFreeze
 )
 
 $ErrorActionPreference = "Stop"
@@ -78,13 +88,42 @@ Invoke-Native "`"$bashExe`" scripts/apply_patches.sh" "scripts/apply_patches.sh 
 Write-Host "patches applied OK" -ForegroundColor Green
 
 # --- 3. pyinstaller freeze ---------------------------------------------------
-Write-Host "== [3/5] freezing with PyInstaller (packaging/sumu.spec) ==" -ForegroundColor Cyan
-Invoke-Native "`"$RepoRoot\.venv\Scripts\python.exe`" -m PyInstaller packaging/sumu.spec --noconfirm" "PyInstaller freeze failed" | Out-Null
 $distDir = Join-Path $RepoRoot "dist\sumu"
-if (-not (Test-Path (Join-Path $distDir "sumu.exe"))) {
-    Fail "expected dist\sumu\sumu.exe not found after freeze"
+$internalDir = Join-Path $distDir "_internal"
+
+if ($FastFreeze -and -not (Test-Path (Join-Path $internalDir "sumu_core.cp313-win_amd64.pyd"))) {
+    Fail "-FastFreeze requires an existing full build (dist\sumu\_internal not found) -- run once without -FastFreeze first"
 }
-Write-Host "freeze OK: $distDir" -ForegroundColor Green
+
+if ($FastFreeze) {
+    Write-Host "== [3/5] fast-freezing (skip COLLECT, only relink sumu.exe) ==" -ForegroundColor Cyan
+    $env:SUMU_FAST_FREEZE = "1"
+    try {
+        Invoke-Native "`"$RepoRoot\.venv\Scripts\python.exe`" -m PyInstaller packaging/sumu.spec --noconfirm" "PyInstaller fast freeze failed" | Out-Null
+    } finally {
+        Remove-Item Env:\SUMU_FAST_FREEZE -ErrorAction SilentlyContinue
+    }
+    $builtExe = Join-Path $RepoRoot "build\sumu\sumu.exe"
+    if (-not (Test-Path $builtExe)) {
+        Fail "expected build\sumu\sumu.exe not found after fast freeze"
+    }
+    Copy-Item -Path $builtExe -Destination (Join-Path $distDir "sumu.exe") -Force
+    # native ext + ffmpeg DLLs land in _internal\ (see COLLECT dest logic) -- refresh
+    # them directly too, since -FastFreeze never re-runs COLLECT to pick them up.
+    $nativeSumuDir = Join-Path $RepoRoot "python\sumu"
+    foreach ($f in @("sumu_core.cp313-win_amd64.pyd", "avcodec-63.dll", "avformat-63.dll", "avutil-61.dll",
+                     "swresample-7.dll", "avdevice-63.dll", "avfilter-12.dll", "swscale-10.dll")) {
+        Copy-Item -Path (Join-Path $nativeSumuDir $f) -Destination (Join-Path $internalDir $f) -Force
+    }
+    Write-Host "fast freeze OK: $distDir (sumu.exe relinked, _internal left untouched)" -ForegroundColor Green
+} else {
+    Write-Host "== [3/5] freezing with PyInstaller (packaging/sumu.spec) ==" -ForegroundColor Cyan
+    Invoke-Native "`"$RepoRoot\.venv\Scripts\python.exe`" -m PyInstaller packaging/sumu.spec --noconfirm" "PyInstaller freeze failed" | Out-Null
+    if (-not (Test-Path (Join-Path $distDir "sumu.exe"))) {
+        Fail "expected dist\sumu\sumu.exe not found after freeze"
+    }
+    Write-Host "freeze OK: $distDir" -ForegroundColor Green
+}
 
 # --- 4. stage model weights next to the exe ---------------------------------
 Write-Host "== [4/5] staging model weights from $WeightsSrc ==" -ForegroundColor Cyan
@@ -120,6 +159,12 @@ Copy-Item -Path (Join-Path $RepoRoot "LICENSE.md") -Destination (Join-Path $dist
 Write-Host "LICENSE.md staged OK" -ForegroundColor Green
 
 # --- 5. bounded, non-interactive smoke test ---------------------------------
+if ($SkipSmoke) {
+    Write-Host "== [5/5] -SkipSmoke set, skipping smoke test ==" -ForegroundColor Yellow
+    Write-Host "dist\sumu built but NOT verified to actually start -- run it manually before shipping" -ForegroundColor Yellow
+    return
+}
+
 Write-Host "== [5/5] smoke testing dist\sumu\sumu.exe ==" -ForegroundColor Cyan
 # test_video.mp4 is .gitignore'd (it's a local dev fixture, not distributed with the repo), so
 # on a fresh clone -- another machine, a teammate, CI -- it won't exist. Passing a nonexistent

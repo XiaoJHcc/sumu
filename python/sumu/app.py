@@ -383,6 +383,13 @@ def main():
                 compile_ui_text = f"正在编译加速引擎 {cs_step}/{cs_total}…（首次，需数分钟）"
             elif compile_state is not None and cs_done and not cs_ok:
                 compile_ui_state, compile_progress, compile_ui_text = _COMPILE_UI_FAILED, 0.0, "编译失败"
+            elif compile_requested:
+                # Latched click, waiting on warmup/model readiness before the compile thread can
+                # actually spawn (below) -- show the progress bar right away so the button
+                # disappears on the very next tick instead of staying clickable while queued.
+                compile_ui_state = _COMPILE_UI_RUNNING
+                compile_progress = 0.0
+                compile_ui_text = "准备编译加速引擎…"
             else:
                 compile_ui_state = _COMPILE_UI_IDLE
                 compile_progress = 0.0

@@ -1,19 +1,16 @@
 # SPDX-FileCopyrightText: sumu Authors
 # SPDX-License-Identifier: AGPL-3.0
 #
-# Throwaway verification driver for Phase 6 M-D (present-side view controls: de-mosaic on/off
-# + A/B compare, both native atomics -- see native/src/player.cpp's set_ai_enabled/is_ai_enabled/
-# set_compare/is_compare). Reuses run_player.py's build_models()/print_status() and the
-# Scheduler wiring, same import pattern as stress_reopen.py -- does NOT modify run_player.py or
-# stress_seek_ai.py.
+# Throwaway verification driver for Phase 6 M-D (present-side view control: de-mosaic on/off,
+# a native atomic -- see native/src/player.cpp's set_ai_enabled/is_ai_enabled). Reuses
+# run_player.py's build_models()/print_status() and the Scheduler wiring, same import pattern
+# as stress_reopen.py -- does NOT modify run_player.py or stress_seek_ai.py.
 #
 # Sequence (per task brief):
 #   a. open test_video_4k.mp4, build models, Scheduler, start, play.
 #   b. pump ~5s with ai_enabled_ default True -- confirm n_ai_fresh > 0.
 #   c. set_ai_enabled(False); pump ~5s -- confirm n_ai_fresh barely moves and n_pt_fresh grows.
-#   d. set_ai_enabled(True) + set_compare(True); pump ~5s -- confirm no crash and present_count
-#      keeps advancing.
-#   e. dump present trace, print present_stats() (median/p99/max).
+#   d. dump present trace, print present_stats() (median/p99/max).
 #
 # Usage:
 #   .venv/Scripts/python.exe scripts/verify_md.py
@@ -121,32 +118,7 @@ def main():
               f"n_ai_fresh delta={st_c1['n_ai_fresh']-st_c0['n_ai_fresh']} "
               f"n_pt_fresh delta={st_c1['n_pt_fresh']-st_c0['n_pt_fresh']}", file=sys.stderr)
 
-    # d. set_ai_enabled(True) + set_compare(True) -- pump ~5s, confirm no crash + present_count
-    # keeps advancing.
-    if not quit_early:
-        player.set_ai_enabled(True)
-        player.set_compare(True)
-        st_d0 = player.stats()
-        crashed = False
-        try:
-            quit_early = pump_for(player, scheduler, 5.0, "d-compare", t0)
-        except Exception as e:  # noqa: BLE001
-            crashed = True
-            result["steps"]["d_compare_exception"] = repr(e)
-            print(f"[step d] EXCEPTION: {e!r}", file=sys.stderr)
-        st_d1 = player.stats()
-        result["steps"]["d_compare_mode"] = {
-            "ai_enabled": player.is_ai_enabled(),
-            "compare": player.is_compare(),
-            "crashed": crashed,
-            "present_count_before": st_d0["present_count"],
-            "present_count_after": st_d1["present_count"],
-            "present_count_advanced": st_d1["present_count"] - st_d0["present_count"],
-        }
-        print(f"[step d] compare={player.is_compare()} crashed={crashed} "
-              f"present_count {st_d0['present_count']} -> {st_d1['present_count']}", file=sys.stderr)
-
-    # e. dump present trace + present_stats().
+    # d. dump present trace + present_stats().
     final_stats = player.stats()
     present_stats = player.present_stats()
     trace_out = os.path.join(TRACE_DIR, "present_verify_md.csv")

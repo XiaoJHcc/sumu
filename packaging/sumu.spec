@@ -102,6 +102,22 @@ a = Analysis(
     cipher=block_cipher,
 )
 
+# SUMU_FAST_FREEZE (set by scripts/build_dist.ps1 -FastFreeze): skip COLLECT.
+# COLLECT.assemble() unconditionally _make_clean_directory()s the whole onedir
+# tree and re-copies every binary/data file every run (PyInstaller has no
+# incremental copy there -- see PyInstaller/building/api.py COLLECT._check_guts,
+# which always returns True "in order to clean the output directory"). That's
+# a full re-copy of ~9-10GB of torch/cv2/tensorrt payload that never changes
+# between ordinary dev iterations. EXE(exclude_binaries=True) itself only
+# writes the thin bootloader+PYZ exe (our own compiled Python) to
+# build/sumu/sumu.exe and does NOT touch dist/ -- so when only sumu's own
+# source or the native extension changed, build_dist.ps1's fast path runs the
+# spec with COLLECT skipped, then hand-copies just that exe (and the native
+# pyd/ffmpeg DLLs) over the existing dist/sumu tree. This is UNSAFE if the
+# dependency set itself changed (new/updated torch/cv2/tensorrt/mmengine
+# binaries or data files) -- those require a real COLLECT to land in dist/.
+_fast_freeze = bool(os.environ.get("SUMU_FAST_FREEZE"))
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
@@ -120,13 +136,14 @@ exe = EXE(
     disable_windowed_traceback=False,
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="sumu",
-)
+if not _fast_freeze:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="sumu",
+    )
