@@ -461,6 +461,18 @@ public:
 
         pt_tag_.assign(kRingCapacity, -1);
         ai_tag_.assign(kRingCapacity, -1);
+        // Must reset before starting decode_thread_ / the start-buffer wait: otherwise a
+        // reopen() inherits the previous session's high-water (e.g. 10000) and the wait
+        // returns immediately with an empty ring -- green/black first frames.
+        pt_high_water_.store(-1, std::memory_order_relaxed);
+        present_head_frame_.store(0, std::memory_order_relaxed);
+        anchor_frame_.store(0, std::memory_order_relaxed);
+        clock_frame_.store(0, std::memory_order_relaxed);
+        playing_.store(false, std::memory_order_relaxed);
+        seek_slot_hint_.store(0, std::memory_order_relaxed);
+        // Bump seek_version so present_loop/audio_loop treat the new session like a seek
+        // (drop last_frame_local / stale slot / audio FIFO from the previous file).
+        seek_version_.fetch_add(1, std::memory_order_relaxed);
 
         // Decode thread starts immediately and races ahead (throttled) of the present head.
         // present_thread_ is already running by this point (started in the constructor, see
@@ -499,13 +511,18 @@ public:
         }
 
         // Start paused at frame 0 -- caller must call play() to start the wall clock.
+        // (Clock / playing_ / seek_version_ already zeroed above before decode started.)
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        anchor_qpc_ticks_.store(now.QuadPart, std::memory_order_relaxed);
+        // Re-assert frame 0 after the start-buffer wait: present was in splash the whole time
+        // and must not inherit the previous file's head when session_active_ flips true.
         anchor_frame_.store(0, std::memory_order_relaxed);
         clock_frame_.store(0, std::memory_order_relaxed);
         present_head_frame_.store(0, std::memory_order_relaxed);
         playing_.store(false, std::memory_order_relaxed);
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        anchor_qpc_ticks_.store(now.QuadPart, std::memory_order_relaxed);
+        seek_slot_hint_.store(0, std::memory_order_relaxed);
+        seek_version_.fetch_add(1, std::memory_order_relaxed);
 
         if (has_audio_)
             audio_thread_ = std::thread(&Player::audio_loop, this);
@@ -2844,32 +2861,38 @@ private:
             // + tag-ready is one atomic unit with respect to seek()'s own reposition, so a
             // frame decoded from the OLD position can never land in the ring after a seek's
             // fresh write to the same slot.
-            std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
-            if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
+            {
+                std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
+                if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
 
-            DecodedFrame df;
-            if (!decoder_.next_frame(df)) {
-                // Unrecoverable decode error. Stop the whole run rather than spin; present
-                // thread will keep re-presenting the last good frame forever via the
-                // stale-fallback path rather than hitching.
-                stop_.store(true, std::memory_order_relaxed);
+                DecodedFrame df;
+                if (!decoder_.next_frame(df)) {
+                    // EOF (pause-on-last-frame) or rare unrecoverable decode error. Drop the
+                    // decoder lock before sleeping so Player::seek() is not blocked while we
+                    // idle; present keeps redrawing the last good ring slot.
+                    goto decode_idle;
+                }
+
+                int64_t frame_num = static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
+                UINT slot = wrap_slot(frame_num);
+
+                {
+                    std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+                    context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
+                        df.texture, df.array_slice, nullptr);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(ready_mutex_);
+                    pt_tag_[slot] = frame_num;
+                }
+                pt_high_water_.store(frame_num, std::memory_order_relaxed);
+                ++decode_frame_count_;
+                continue;
+            }
+        decode_idle:
+            if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))
                 return;
-            }
-
-            int64_t frame_num = static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
-            UINT slot = wrap_slot(frame_num);
-
-            {
-                std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-                context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
-                    df.texture, df.array_slice, nullptr);
-            }
-            {
-                std::lock_guard<std::mutex> lk(ready_mutex_);
-                pt_tag_[slot] = frame_num;
-            }
-            pt_high_water_.store(frame_num, std::memory_order_relaxed);
-            ++decode_frame_count_;
+            Sleep(5);
         }
     }
 
@@ -2914,6 +2937,13 @@ private:
                 local_pace_epoch = pe;
                 QueryPerformanceCounter(&pace_origin_qpc_);
                 tick_idx = 0;
+                // New open_session() (incl. reopen): drop the previous file's present head so
+                // the monotonic guard below cannot force the new timeline to last_frame+1 of
+                // the old video (seekbar past end / green-slot / "fast-forward" on drop-open).
+                last_frame_local = -1;
+                last_actual_slot = 0;
+                last_actual_source = Source::PassthroughFresh;
+                local_seek_version = seek_version_.load(std::memory_order_relaxed);
             }
             ++tick_idx;
             LARGE_INTEGER target_qpc;
@@ -2971,10 +3001,21 @@ private:
                     int64_t computed = af + static_cast<int64_t>(std::llround(elapsed_s * fps_));
                     if (!just_seeked && computed <= last_frame_local) computed = last_frame_local + 1;
                     frame = computed;
+                    // End of file: freeze on the last frame and auto-pause (no loop). Without
+                    // this the wall-clock head keeps climbing past frame_count while the decoder
+                    // sits at EOF, so the seekbar runs off the end and seeks land in a broken
+                    // domain. frame_count_==0 (unknown duration) skips the clamp.
+                    if (frame_count_ > 0 && frame >= frame_count_) {
+                        frame = frame_count_ - 1;
+                        anchor_frame_.store(frame, std::memory_order_relaxed);
+                        playing_.store(false, std::memory_order_relaxed);
+                    }
                 } else {
                     // Paused: frozen at anchor_frame_, present thread keeps redrawing it so the
                     // heartbeat (present cadence) never stops even though content doesn't advance.
                     frame = anchor_frame_.load(std::memory_order_relaxed);
+                    if (frame_count_ > 0)
+                        frame = std::min(frame, frame_count_ - 1);
                 }
                 last_frame_local = frame;
                 clock_frame_.store(frame, std::memory_order_relaxed);

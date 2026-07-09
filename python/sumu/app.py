@@ -419,11 +419,29 @@ def main():
                     else:
                         player.play()
 
-            seek = intents["seek"]
-            if seek is not None and opened:
-                if scheduler is not None:
-                    scheduler.notify_seek(seek)
-                player.seek(seek)
+            path = None
+            if intents["open_dialog"]:
+                path = player.pick_open_file()  # modal, main thread; present keeps showing the
+                                                 # current video (or the open-prompt) meanwhile
+            elif intents["open_path"]:
+                path = intents["open_path"]
+            elif pending_open_path:
+                path = pending_open_path
+            pending_open_path = None
+
+            if path:
+                # Open/reopen first so a same-tick seek intent (from the previous file's
+                # seekbar) cannot land on the new session. open_session always starts at 0.
+                if not opened:
+                    do_open(path)
+                else:
+                    do_reopen(path)
+            else:
+                seek = intents["seek"]
+                if seek is not None and opened:
+                    if scheduler is not None:
+                        scheduler.notify_seek(seek)
+                    player.seek(seek)
 
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
@@ -440,22 +458,6 @@ def main():
                                             max_regions_per_frame=cfg_max_regions)
                 scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
-
-            path = None
-            if intents["open_dialog"]:
-                path = player.pick_open_file()  # modal, main thread; present keeps showing the
-                                                 # current video (or the open-prompt) meanwhile
-            elif intents["open_path"]:
-                path = intents["open_path"]
-            elif pending_open_path:
-                path = pending_open_path
-            pending_open_path = None
-
-            if path:
-                if not opened:
-                    do_open(path)
-                else:
-                    do_reopen(path)
 
             # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
             # scheduler is already running. Deliberately re-checked every tick (not just right

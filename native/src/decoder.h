@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0
 //
 // Promoted from spikes/spike0_d3d11_present/src/decoder.{h,cpp} (verbatim decode path) and
-// spikes/spike2_clock_mixing/src/decoder.{h,cpp} (loop-on-EOF behavior), plus a new
-// seek_to_frame() for sumu's I6 ("seek = reposition, not teardown"): FFmpeg d3d11va hardware
-// decode of HEVC (or anything FFmpeg + the installed D3D11VA hwaccel supports) straight into
-// GPU-resident NV12 D3D11 textures shared with the caller's device -- no readback, no re-upload.
+// spikes/spike2_clock_mixing/src/decoder.{h,cpp}, plus a new seek_to_frame() for sumu's I6
+// ("seek = reposition, not teardown"). Product EOF policy is pause-on-last-frame (no loop);
+// FFmpeg d3d11va hardware decode of HEVC (or anything FFmpeg + the installed D3D11VA hwaccel
+// supports) straight into GPU-resident NV12 D3D11 textures shared with the caller's device --
+// no readback, no re-upload.
 //
 // AVFrame with format == AV_PIX_FMT_D3D11:
 //   frame->data[0] -> ID3D11Texture2D*  (a texture ARRAY; one physical texture backs the
@@ -54,9 +55,10 @@ public:
     // Returns false + fills `error` on failure. Populates fps()/width()/height()/frame_count().
     bool open(const std::string& path, ID3D11Device* device, std::string& error);
 
-    // Decode (and internally loop back to the start on EOF) until one frame is available.
-    // Returns false only on unrecoverable error. The returned DecodedFrame is only valid
-    // until the next call to next_frame() or seek_to_frame() (we keep exactly one AVFrame
+    // Decode until one frame is available. Returns false on EOF or unrecoverable error --
+    // does NOT loop back to the start (product policy: pause on last frame; decode_loop idles
+    // until Player::seek() repositions via seek_to_frame()). The returned DecodedFrame is only
+    // valid until the next call to next_frame() or seek_to_frame() (we keep exactly one AVFrame
     // "in flight" to bound VRAM use / decoder pool pressure).
     bool next_frame(DecodedFrame& out);
 
@@ -139,9 +141,9 @@ private:
     bool seek_to_start();
 
     // Shared "pull one hw frame out of the demuxer/decoder" pump, used by both next_frame()
-    // and seek_to_frame()'s forward-decode-to-target loop. Does NOT loop-on-EOF (that policy
-    // differs between the two callers -- next_frame() restarts playback, seek_to_frame()
-    // clamps). Returns 1 = got a frame (out filled, pts fields NOT yet remapped through
+    // and seek_to_frame()'s forward-decode-to-target loop. Does NOT loop-on-EOF (both callers
+    // treat r==0 as end-of-stream: next_frame returns false, seek_to_frame clamps to last
+    // good). Returns 1 = got a frame (out filled, pts fields NOT yet remapped through
     // loop_offset_/first_pts_ -- caller does that), 0 = EOF, -1 = unrecoverable error.
     int pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out);
 
@@ -164,7 +166,7 @@ private:
     // every existing read/write site unchanged).
     std::atomic<bool> have_first_pts_{ false };
     std::atomic<double> first_pts_seconds_{ 0.0 };
-    double loop_offset_seconds_ = 0.0; // added to raw pts so the clock keeps climbing across loops
+    double loop_offset_seconds_ = 0.0; // stays 0 (pause-on-last-frame); kept for pts formula
     double last_out_pts_seconds_ = -1.0;
 
     ID3D11Device* d3d_device_ = nullptr; // not owned
@@ -175,8 +177,9 @@ private:
     // One queued audio packet plus the loop_offset_seconds_ that was in effect (decode thread,
     // pump_one_raw_frame()) the moment it was read off fmt_ctx_ -- needed so the audio thread
     // can compute audio_s = loop_offset + (raw_pts - first_pts), the SAME formula next_frame()
-    // uses for video's pts_seconds, so audio stays in sync with video across an EOF loop wrap
-    // (loop_offset_seconds_ only changes on those wraps, never on a seek -- see seek_to_frame()).
+    // uses for video's pts_seconds. loop_offset_seconds_ is legacy of the old loop-on-EOF path
+    // and stays 0 for the whole session now (pause-on-last-frame); the field is kept so seek/
+    // audio math stays one formula.
     struct AudioPacketEntry {
         AVPacket* pkt;
         double loop_offset;

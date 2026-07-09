@@ -256,9 +256,7 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
         if (recv == AVERROR_EOF) {
             // Decoder is fully drained (this is the steady-state EOF signal once the drain
             // path above has already run out): genuinely nothing left, same as the drain==0
-            // case a few lines up. Must NOT fall through to the generic failure below, or
-            // next_frame() sees r<0 and stops the decode thread permanently instead of
-            // taking its existing loop-to-start path.
+            // case a few lines up. Must NOT fall through to the generic failure below.
             return 0;
         }
         fprintf(stderr, "avcodec_receive_frame failed: %d\n", recv);
@@ -272,16 +270,12 @@ bool Decoder::next_frame(DecodedFrame& out)
     int r = pump_one_raw_frame(out, raw_pts_s);
     if (r < 0) return false;
     if (r == 0) {
-        // EOF with nothing left to drain: loop playback back to time 0 (matches spike0/2
-        // behavior -- natural end-of-stream during ordinary playback restarts rather than
-        // stopping; explicit seek_to_frame() below is the reposition path used by Player::seek).
-        if (!seek_to_start()) {
-            fprintf(stderr, "seek_to_start failed, stopping\n");
-            return false;
-        }
-        loop_offset_seconds_ = last_out_pts_seconds_ + 1.0 / fps_;
-        r = pump_one_raw_frame(out, raw_pts_s);
-        if (r <= 0) return false;
+        // EOF: do NOT loop back to t=0. Product policy is pause-on-last-frame (present_loop
+        // clamps the clock and clears playing_); decode_loop treats false as "idle until seek
+        // repositions". Loop-on-EOF used to bump loop_offset_seconds_ past the real timeline,
+        // so the seekbar clock ran past frame_count and seek targets mapped into the wrong
+        // PTS domain.
+        return false;
     }
 
     if (!have_first_pts_) {
@@ -306,8 +300,8 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
     // Map the requested content frame number back into the raw stream PTS domain using the
     // ORIGINAL first_pts_seconds_/loop_offset_ established at open() -- frame numbers stay
     // globally anchored to that one origin across any number of seeks (I5). A seek never
-    // touches loop_offset_seconds_/first_pts_seconds_: those only change when next_frame()
-    // itself wraps on natural EOF during ordinary playback.
+    // touches loop_offset_seconds_/first_pts_seconds_ (loop_offset stays 0 for the session
+    // under pause-on-last-frame; the term remains in the formula for a single code path).
     double target_seconds_local = static_cast<double>(target_frame) / fps_; // in loop_offset_ domain
     double target_seconds_raw = (target_seconds_local - loop_offset_seconds_) + first_pts_seconds_;
     int64_t seek_ts = static_cast<int64_t>(std::llround(target_seconds_raw / av_q2d(time_base_)));
