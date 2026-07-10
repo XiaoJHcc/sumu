@@ -36,6 +36,18 @@ void Decoder::close()
     if (fmt_ctx_) avformat_close_input(&fmt_ctx_);
     video_stream_idx_ = -1;
     audio_stream_idx_ = -1;
+    // Reset session-derived state so a subsequent open() (reopen path, or a retry after a
+    // partial open failure) starts from a clean slate -- without this, have_first_pts_ stays
+    // true and the next session would inherit the previous file's PTS origin (I5 break).
+    fps_ = 60.0;
+    width_ = 0;
+    height_ = 0;
+    frame_count_ = 0;
+    have_first_pts_.store(false, std::memory_order_relaxed);
+    first_pts_seconds_.store(0.0, std::memory_order_relaxed);
+    loop_offset_seconds_ = 0.0;
+    last_out_pts_seconds_ = -1.0;
+    d3d_device_ = nullptr;
 }
 
 AVPixelFormat Decoder::get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts)
@@ -93,14 +105,19 @@ bool Decoder::ensure_hw_frames_ctx(AVCodecContext* ctx)
 
 bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& error)
 {
+    // Always start from a clean slate -- a previous partial failure (or a reopen after
+    // close_session) must not leave half-allocated FFmpeg contexts for the next attempt.
+    close();
     d3d_device_ = device;
 
     if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, nullptr) < 0) {
         error = "avformat_open_input failed for " + path;
+        close();
         return false;
     }
     if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
         error = "avformat_find_stream_info failed";
+        close();
         return false;
     }
 
@@ -108,6 +125,7 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     int idx = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if (idx < 0) {
         error = "no video stream found";
+        close();
         return false;
     }
     video_stream_idx_ = idx;
@@ -141,10 +159,12 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     codec_ctx_ = avcodec_alloc_context3(decoder);
     if (!codec_ctx_) {
         error = "avcodec_alloc_context3 failed";
+        close();
         return false;
     }
     if (avcodec_parameters_to_context(codec_ctx_, stream->codecpar) < 0) {
         error = "avcodec_parameters_to_context failed";
+        close();
         return false;
     }
 
@@ -154,6 +174,7 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     hw_device_ref_ = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
     if (!hw_device_ref_) {
         error = "av_hwdevice_ctx_alloc failed";
+        close();
         return false;
     }
     AVHWDeviceContext* device_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ref_->data);
@@ -163,6 +184,7 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
 
     if (av_hwdevice_ctx_init(hw_device_ref_) < 0) {
         error = "av_hwdevice_ctx_init failed";
+        close();
         return false;
     }
 
@@ -175,6 +197,7 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     if (avcodec_open2(codec_ctx_, decoder, &opts) < 0) {
         av_dict_free(&opts);
         error = "avcodec_open2 failed";
+        close();
         return false;
     }
     av_dict_free(&opts);
@@ -183,6 +206,7 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     frame_ = av_frame_alloc();
     return true;
 }
+
 
 bool Decoder::seek_to_start()
 {

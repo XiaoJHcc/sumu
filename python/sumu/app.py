@@ -20,6 +20,7 @@
 # DESIGN.md I9); the Scheduler is only constructed once warmup finishes, at which point AI
 # frames start covering the passthrough ones with no playback interruption.
 import argparse
+import os
 import re
 import sys
 import threading
@@ -83,6 +84,9 @@ _COMPILE_UI_HIDDEN = 0
 _COMPILE_UI_IDLE = 1       # engines absent: show prompt + "compile" button
 _COMPILE_UI_RUNNING = 2    # compiling: show progress bar + step text
 _COMPILE_UI_FAILED = 3     # compile failed: show error + "retry" button
+
+# How long the "无法打开" float stays visible after a failed open/reopen (seconds).
+_OPEN_ERROR_HOLD_S = 4.0
 
 
 def _compile_worker(cstate: "_CompileState", res_model, res_path, device, fp16) -> None:
@@ -228,6 +232,11 @@ def main():
     compile_state = None
     trt_activated = False
 
+    # Failed open/reopen status float. open_error_until is a monotonic deadline; empty text /
+    # deadline in the past means "no open error to show". Cleared on the next successful open.
+    open_error_text = ""
+    open_error_until = 0.0
+
     # Startup fast-path for the first-screen compile prompt. The prompt's visibility depends on
     # (a) is TRT applicable on this machine, (b) are engines already on disk -- and until now both
     # were only known AFTER the background warmup imported torch + probed the disk, so the prompt
@@ -252,17 +261,32 @@ def main():
     compile_requested = False   # latches a first-screen "compile" click that lands before warmup
     trt_reconciled = False      # flips once warmup's real applicable/active have been folded in
 
+    def _report_open_failed(path, err):
+        """Surface a failed open/reopen without killing the main loop. Incomplete downloads /
+        unsupported containers land here (native decoder.open throws RuntimeError)."""
+        nonlocal open_error_text, open_error_until
+        name = os.path.basename(path) if path else ""
+        open_error_text = f"无法打开：{name}" if name else "无法打开该视频"
+        open_error_until = time.monotonic() + _OPEN_ERROR_HOLD_S
+        print(f"== open failed == {path!r}: {err}", file=sys.stderr)
+
     def do_open(path):
         """First-ever open (opened is False): player.open() is decode-only and fast (no model
         dependency), so this starts original/passthrough playback immediately -- the Scheduler
         is deliberately NOT built here, only once warmup finishes (see the main loop's
         "延迟建 scheduler" step below)."""
-        nonlocal opened, current_path
-        player.open(path)
+        nonlocal opened, current_path, open_error_text, open_error_until
+        try:
+            player.open(path)
+        except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
+            _report_open_failed(path, e)
+            return
         print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
               f"dims={player.dims()}", file=sys.stderr)
         opened = True
         current_path = path
+        open_error_text = ""
+        open_error_until = 0.0
         settings.push_recent(current_path)
         # video_meta is NOT computed here (get_video_meta_data lives on the warmup worker and may
         # not be handed over yet -- the user can open a file mid-warmup). It's computed lazily in
@@ -274,23 +298,41 @@ def main():
         player.cpp's Player::reopen()): swap the playing file without tearing down
         present_thread_/the window. The scheduler (if any -- warmup may still be in flight) is
         torn down and rebuilt against the new file's video_meta once we get back to the "延迟建
-        scheduler" step below."""
-        nonlocal scheduler, current_path
-        settings.set_position(current_path, player.current_frame())
+        scheduler" step below.
+
+        On failure (unsupported / half-downloaded file): native reopen() has already closed the
+        previous session and left the player unopened (opened_=false); we mirror that here so the
+        open-prompt comes back and the user can pick another file -- never crash the process."""
+        nonlocal scheduler, current_path, opened, open_error_text, open_error_until
+        if current_path is not None:
+            try:
+                settings.set_position(current_path, player.current_frame())
+            except Exception:  # noqa: BLE001 -- position save must not block the reopen attempt
+                pass
         if scheduler is not None:
             scheduler.stop()
             scheduler = None
-        new_frame_count = player.reopen(path)
+        try:
+            new_frame_count = player.reopen(path)
+        except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
+            # Native close_session() already ran; open_session() failed -> no live session.
+            opened = False
+            current_path = None
+            _report_open_failed(path, e)
+            return
         print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
               file=sys.stderr)
         # video_meta recomputed lazily at scheduler-build time (see do_open's note) -- tearing the
         # scheduler down above forces the build step below to re-run against the new file.
         current_path = path
+        open_error_text = ""
+        open_error_until = 0.0
         settings.push_recent(current_path)
         player.play()  # open_session() starts paused at frame 0; auto-play from the start
                        # (matches do_open()'s open->play() sequence above). Position memory is
                        # still written (set_position above / finally) but not auto-restored --
                        # resume wiring is deferred until a manual "continue watching" UI exists.
+
 
     try:
         while not player.should_quit():
@@ -309,7 +351,13 @@ def main():
                 warm_device = warmup.device
                 warm_fp16 = warmup.fp16
 
-            if warm_error is not None:
+            now_mono = time.monotonic()
+            if open_error_text and now_mono < open_error_until:
+                status_text = open_error_text
+            elif open_error_text and now_mono >= open_error_until:
+                open_error_text = ""
+                status_text = ""
+            elif warm_error is not None:
                 status_text = "预热失败（将播放原片）"
             elif scheduler is not None or warm_ready:
                 status_text = ""
@@ -445,19 +493,23 @@ def main():
 
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
+            # Always commit knobs into the Python-owned cfg_* mirrors (including first-screen
+            # Apply before any file is open). Scheduler rebuild is separate and only runs when
+            # a scheduler already exists for the current file.
+            if clip_length is not None:
+                cfg_clip_length = clip_length
+            if max_regions is not None:
+                cfg_max_regions = max_regions
             if (clip_length is not None or max_regions is not None) and scheduler is not None:
                 # scheduler is not None => warmup already succeeded, so warm_sched_cls/cfg_cls are
                 # set (captured in the build step below). Rebuild against a fresh SchedulerConfig
                 # carrying the updated knobs; video_meta is unchanged (same open file).
                 scheduler.stop()
-                if clip_length is not None:
-                    cfg_clip_length = clip_length
-                if max_regions is not None:
-                    cfg_max_regions = max_regions
                 config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                             max_regions_per_frame=cfg_max_regions)
                 scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
+
 
             # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
             # scheduler is already running. Deliberately re-checked every tick (not just right
@@ -467,11 +519,17 @@ def main():
                 det_model, res_model, pad_mode = warm_models
                 # Lazy, off the startup path: compute video_meta now (get_video_meta_data came from
                 # the warmup worker) and build the config from the committed int knobs.
-                video_meta = warm_meta_fn(current_path)
-                config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
-                                            max_regions_per_frame=cfg_max_regions)
-                scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
-                scheduler.start()
+                try:
+                    video_meta = warm_meta_fn(current_path)
+                except Exception as e:  # noqa: BLE001 -- meta probe failure must not kill playback
+                    # File is already open and playing passthrough; just skip AI for this file.
+                    print(f"== video_meta failed == {current_path!r}: {e}", file=sys.stderr)
+                    video_meta = None
+                if video_meta is not None:
+                    config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
+                                                max_regions_per_frame=cfg_max_regions)
+                    scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
+                    scheduler.start()
                 # Intentionally no auto-resume seek: open/reopen always start at frame 0.
                 # settings.positions still records last frame (do_reopen/finally) for a future
                 # manual "continue watching" path; is_resumable_frame stays available for that.

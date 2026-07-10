@@ -696,6 +696,13 @@ public:
     //
     // Returns the new session's frame_count() (Python rebuilds its Scheduler from this plus its
     // own get_video_meta_data(path) probe -- see play.py).
+    //
+    // Failure contract: close_session() has already torn the previous file down before
+    // open_session() is attempted. If open_session() throws (unsupported/corrupt/partial file),
+    // the previous session is gone and opened_ is cleared so require_open() fails cleanly and
+    // the open-prompt overlay returns -- Python catches the exception and shows "无法打开"
+    // rather than exiting the process. Deliberately does NOT try to restore the previous file
+    // (would need a full re-open of a path we no longer hold a live session for).
     int64_t reopen(const std::string& video_path)
     {
         require_open(); // reopen is "open a different file into an already-open Player"
@@ -715,7 +722,15 @@ public:
         }
 
         close_session();
-        open_session(video_path);
+        try {
+            open_session(video_path);
+        } catch (...) {
+            // Previous session already closed; new one never became active. Drop opened_ so
+            // play()/seek()/etc. refuse cleanly and the splash shows the open-prompt again.
+            opened_ = false;
+            video_path_.clear();
+            throw;
+        }
         return frame_count_;
     }
 
@@ -1705,15 +1720,23 @@ private:
     void build_ui()
     {
         // M-C1 / warmup-UX: no session open yet (or one was just closed) -- the normal
-        // top/bottom bars read session-scoped state (video_path_, frame_count_, seekbar
-        // position, ...) that isn't meaningful yet. Two sub-cases: never opened a file at all
-        // (show the interactive "drop/open a file" prompt so the user isn't staring at a dead
-        // window) vs. a reopen()-driven brief teardown/rebuild of an already-opened file (fall
-        // back to the old plain "loading" splash -- opened_ stays true across reopen()).
+        // bottom bar / seekbar read session-scoped state (frame_count_, seekbar position, ...)
+        // that isn't meaningful yet. Two sub-cases: never opened a file at all (full title bar
+        // + interactive "drop/open a file" prompt so the user isn't staring at a dead window;
+        // settings sidebar is available here too) vs. a reopen()-driven brief teardown/rebuild
+        // of an already-opened file (plain "loading" splash -- opened_ stays true across reopen()).
         bool active = session_active_.load(std::memory_order_relaxed);
         if (!active) {
-            if (!opened_) build_open_prompt_overlay();
-            else          build_splash_overlay();
+            if (!opened_) {
+                float top_bar_h = 0.0f;
+                build_top_bar(top_bar_h);
+                // Open prompt first so the settings panel (when open) stacks above it and
+                // receives clicks -- same chrome layering as the live-session branch below.
+                build_open_prompt_overlay(top_bar_h);
+                if (ui_settings_open_) build_settings_panel(top_bar_h);
+            } else {
+                build_splash_overlay();
+            }
         } else {
             float top_bar_h = 0.0f;
             build_top_bar(top_bar_h);
@@ -1744,14 +1767,14 @@ private:
         ImGui::End();
     }
 
-    // Warmup-UX: shown instead of build_splash_overlay() while !session_active_ AND !opened_,
-    // i.e. before the user has ever opened a file (build_ui()'s branch above). Unlike the plain
-    // splash this one takes input -- WM_DROPFILES already records an open_path intent
-    // unconditionally in WndProc regardless of what's on screen, so this overlay only needs to
-    // give the user a visible target plus an explicit "open file" button, a close button (this
-    // is a borderless window with no OS titlebar), and a draggable region so the window can
-    // still be moved before any content is loaded.
-    void build_open_prompt_overlay()
+    // Warmup-UX: shown while !session_active_ AND !opened_, i.e. before the user has ever
+    // opened a file (build_ui()'s branch above). Title bar + optional settings panel are drawn
+    // by the caller (same chrome as a live session); this overlay only owns the center prompt.
+    // WM_DROPFILES already records an open_path intent unconditionally in WndProc regardless of
+    // what's on screen, so this overlay only needs to give the user a visible target plus an
+    // explicit "open file" button. top_bar_h is the strip already occupied by build_top_bar() so
+    // the prompt stays vertically centered in the remaining client area.
+    void build_open_prompt_overlay(float top_bar_h)
     {
         ImGuiIO& io = ImGui::GetIO();
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -1759,32 +1782,9 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground;
             // (deliberately NOT ImGuiWindowFlags_NoInputs -- this overlay must accept clicks)
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, std::max(0.0f, io.DisplaySize.y - top_bar_h)));
         ImGui::Begin("##sumu_open_prompt", nullptr, flags);
-
-        const float btn_w = 28.0f, btn_h = 28.0f;
-        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
-
-        { // top-right close button -- same X glyph as build_top_bar()'s close_btn
-            ImGui::SetCursorPos(ImVec2(io.DisplaySize.x - btn_w - 4.0f, 4.0f));
-            IconButtonResult r = icon_button("##open_prompt_close_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) PostMessageA(hwnd_, WM_CLOSE, 0, 0);
-            float cx = (r.min.x + r.max.x) * 0.5f;
-            float cy = (r.min.y + r.max.y) * 0.5f;
-            const float half = 5.0f;
-            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, 1.5f);
-            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, 1.5f);
-        }
-
-        // Draggable caption region: the whole top strip minus the close button (same mechanism
-        // as build_top_bar()'s ##drag_region -- publishing these three floats is what makes
-        // WM_NCHITTEST report HTCAPTION there, see point_in_caption_drag()'s header comment).
-        // This overlay has no InvisibleButton standing in for the drag area (nothing else is
-        // there to eat the click), so the rect is just published directly.
-        caption_drag_x0_ = 0.0f;
-        caption_drag_x1_ = io.DisplaySize.x - btn_w - 4.0f;
-        caption_drag_y1_ = 32.0f;
 
         const char* prompt = u8"拖入视频文件到此处，或";
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
@@ -1805,8 +1805,10 @@ private:
             compile_block_h = region_gap + compile_text_h + ctrl_gap + ctrl_h;
         }
 
+        float content_h = std::max(0.0f, io.DisplaySize.y - top_bar_h);
         float block_h = tsize.y + gap + open_btn_h + compile_block_h;
-        float top = (io.DisplaySize.y - block_h) * 0.5f;
+        float top = (content_h - block_h) * 0.5f;
+        if (top < 0.0f) top = 0.0f;
 
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, top));
         ImGui::TextUnformatted(prompt);
