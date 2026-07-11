@@ -63,12 +63,12 @@ desync 或抛异常）。
 这个映射（`rgba[...,0]=bgr[...,2]`），并在实测中用独立通道相等性检查验证过（见下「正确性验证」）
 ——写反就是任务里点名的"蓝脸"故障。
 
-## Config（`SchedulerConfig`，全部可调）
+## Config（`SchedulerConfig`）
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `clip_length` | 30 | BasicVSR++ clip 长度（TRT 引擎上限 180） |
-| `clip_size` | 256 | 送入 BasicVSR++ 的方形 crop/resize 尺寸 |
+| `clip_size` | 256 | 送入 BasicVSR++ 的方形 crop/resize 尺寸。**锁死 256，非可调降级旋钮**——烧进 TRT 引擎编译 shape（`INPUT_SIZE`），改动需重新编译引擎 |
 | `max_regions_per_frame` | 1 | 每帧转成 scene 的 YOLO 检测数上限 |
 | `lead` | `max(clip_length, round(1.2*clip_length))` = 36 | frontier 闸门上界：`ai_frontier ∈ [head, head+lead]` |
 | `frame_cache_capacity` | `lead+clip_length+frame_cache_margin` = 82 | 见上「frame_cache」 |

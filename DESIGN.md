@@ -33,7 +33,7 @@
 | I6 | **seek = reposition，不是 teardown** | seek 只把 present clock + decode-ahead 缓冲 + AI 前沿**重定位**到新帧号；**不销毁不重建**线程/解码器。这从根上消掉 lada 的 seek 多秒黑屏和解码器 churn 堆损坏。 |
 | I7 | **单一解码头 + decode-ahead 环缓冲** | 一个 NVDEC 会话跑在 AI 前沿，原片帧进 GPU 环形缓冲供 present 消费，同批帧喂 AI。省 NVDEC 名额、免重复解码。**VRAM 要显式预算**（见 I8）。 |
 | I8 | **VRAM 是一等约束** | 4K 帧缓一个 lookahead 窗口（~180 帧）≈ 2–4GB 显存。环缓冲存 **NV12**（减半），present 时才转；按 VRAM 上限动态压 lookahead。设计里必须带预算，不能事后补。 |
-| I9 | **降级而非停顿** | GPU 跟不上时，手段是：回退原片、缩小 max_clip_length、降 clip_size、fp16、YOLO 跳帧——**永远不停时钟**。 |
+| I9 | **降级而非停顿** | GPU 跟不上时，手段是：回退原片、缩小 max_clip_length、fp16、YOLO 跳帧——**永远不停时钟**。（`clip_size` 已锁死 256，与 TRT 引擎编译 shape 绑定，不是可调旋钮） |
 | I10 | **先埋点，再优化；实测推翻直觉** | lada 史上多个「听起来合理」的结论被实测推翻（如「AI GIL 争用饿死呈现」实为帧时钟空转）。sumu 从第一天带 present/AI trace，任何优化先量后改。 |
 
 ### C. 要照搬的 README 核心机制（全部保留，只换承载层）
@@ -46,7 +46,7 @@
 - **模型预热（warmup）**：加载后跑一次 dummy forward，把 CUDA/cuDNN 初始化在加载期付清。
 - **TRT 加速 BasicVSR++**：拆 6 子引擎，独占 3–4x；非 cuda/非 fp16/引擎缺失无缝回退 PyTorch。缓存键编 arch+TRT 版本+精度+OS+clip 上界（自愈、不跨机分发）。
 - **GPU 解码后端**：NVDEC/PyNvVideoCodec 零拷贝（sumu 里升级为「解码后帧全程不下 GPU 直到 present」）。
-- **降级旋钮**：max_clip_length / clip_size / fp16 / （新增）YOLO 跳帧。
+- **降级旋钮**：max_clip_length / fp16 / （新增）YOLO 跳帧。（`clip_size` 锁死 256，烧进 TRT 引擎编译 shape，非运行时旋钮）
 - **诊断卡片**：检测/修复 fps、缓冲窗口横条、AI 命中率、丢弃帧数——作为调参仪表盘。
 - **落后重定位（reposition）**：lada 中因帧号问题默认关闭；sumu 帧号锚定后应能正确工作，纳入设计。
 
@@ -81,11 +81,11 @@
 
 ## 第二部分 · 验证方案（spike，用实测决定选型）
 
-### 待决选型（本文件不锁定，由下面的 spike 拿数据定）
+### 待决选型（本文件不锁定，由下面的 spike 拿数据定）——均已由后续 spike/开发落定，见 CLAUDE.md「已锁定选型」
 
-1. **播放器宿主 + present 面**：Qt(PySide6/QRhi) ／ GTK4+叠加原生 HWND ／ 内嵌 libmpv ／ Win32·GLFW+D3D11。
-2. **present + CUDA 互操作的语言**：小原生模块(C++/Rust) ／ 尽量纯 Python(cupy·pycuda + CUDA↔GL)。
-3. **音频 / A-V 同步是否进 v1**。
+1. **播放器宿主 + present 面**：Qt(PySide6/QRhi) ／ GTK4+叠加原生 HWND ／ 内嵌 libmpv ／ Win32·GLFW+D3D11。→ 已定：Win32 + 原生 D3D11 flip-model swapchain（变体 B）。
+2. **present + CUDA 互操作的语言**：小原生模块(C++/Rust) ／ 尽量纯 Python(cupy·pycuda + CUDA↔GL)。→ 已定：C++（VS2022 BuildTools）+ pybind11。
+3. **音频 / A-V 同步是否进 v1**。→ 已进 v1：`native/src/player.cpp` 的 `audio_loop()`（WASAPI），以 QPC 主时钟为准的纯附加从属时钟，已实测验证不扰动 present。
 
 **成败 100% 押在「4K60 全 GPU present 从可选宿主/语言里能否做到上屏稳定」。** 所以先只验证这个，AI 一概不接。
 
