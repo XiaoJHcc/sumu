@@ -196,6 +196,7 @@ def main():
     player = sumu_core.Player(args.width, args.height, args.maximized)
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
+    player.set_fps_div(int(settings.fps_div))
 
     # Kick off model warmup in the background immediately -- the window is already up (Player's
     # ctor starts present_thread_) and the main loop below starts pumping messages right away, so
@@ -224,6 +225,7 @@ def main():
     cfg_clip_length = 30
     cfg_max_regions = 1
     cfg_cold_start_s = float(settings.cold_start_s)
+    cfg_fps_div = int(settings.fps_div)
     scheduler = None
     det_model = res_model = pad_mode = None
 
@@ -433,7 +435,7 @@ def main():
                 compile_ui_text = "尚未为你的显卡编译去码加速引擎（首次约数分钟，编完自动生效）"
             player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
 
-            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s)
+            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s, cfg_fps_div)
             player.ui_tick()
 
             intents = player.take_ui_intents()
@@ -495,6 +497,7 @@ def main():
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
             cold_start_s = intents.get("cold_start_s")
+            fps_div = intents.get("fps_div")
             # Always commit knobs into the Python-owned cfg_* mirrors (including first-screen
             # Apply before any file is open). Scheduler rebuild is separate and only runs when
             # a scheduler already exists for the current file.
@@ -505,10 +508,14 @@ def main():
             if cold_start_s is not None:
                 cfg_cold_start_s = float(cold_start_s)
                 settings.cold_start_s = cfg_cold_start_s
-            if (clip_length is not None or max_regions is not None or cold_start_s is not None) and scheduler is not None:
-                # scheduler is not None => warmup already succeeded, so warm_sched_cls/cfg_cls are
-                # set (captured in the build step below). Rebuild against a fresh SchedulerConfig
-                # carrying the updated knobs; video_meta is unchanged (same open file).
+            if fps_div is not None:
+                cfg_fps_div = int(fps_div)
+                settings.fps_div = cfg_fps_div
+                player.set_fps_div(cfg_fps_div)
+            if (clip_length is not None or max_regions is not None or cold_start_s is not None
+                    or fps_div is not None) and scheduler is not None:
+                # fps_div retimes the session (native); rebuild scheduler so cold-start/lead
+                # recompute against the new player.fps()/frame_count().
                 scheduler.stop()
                 config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                             max_regions_per_frame=cfg_max_regions,
@@ -532,6 +539,16 @@ def main():
                     print(f"== video_meta failed == {current_path!r}: {e}", file=sys.stderr)
                     video_meta = None
                 if video_meta is not None:
+                    # Align AI meta with the retimed session (player.fps/frame_count after fps_div).
+                    try:
+                        from fractions import Fraction
+                        sess_fps = float(player.fps())
+                        video_meta.video_fps = sess_fps
+                        video_meta.average_fps = sess_fps
+                        video_meta.video_fps_exact = Fraction(sess_fps).limit_denominator(1001)
+                        video_meta.frames_count = int(player.frame_count())
+                    except Exception:  # noqa: BLE001
+                        pass
                     config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                                 max_regions_per_frame=cfg_max_regions,
                                                 cold_start_s=cfg_cold_start_s)

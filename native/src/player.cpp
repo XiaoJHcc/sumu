@@ -322,6 +322,7 @@ struct UiIntents {
     std::optional<int> clip_length;
     std::optional<int> max_regions;
     std::optional<float> cold_start_s; // cold-start skip seconds (0–3); Python clamps
+    std::optional<int> fps_div; // 1=full, 2=half, 3/4; Python clamps 1–4
     // M-C2: a file the user wants opened (reopen), recorded by either the WM_DROPFILES handler
     // (open_path, UTF-8 path of the dropped file -- empty means none pending) or the top-bar
     // "open" button (open_dialog -- Python responds by calling the blocking pick_open_file()
@@ -410,7 +411,12 @@ public:
         std::string decode_err;
         if (!decoder_.open(video_path, device_.Get(), decode_err))
             throw std::runtime_error("decoder.open failed: " + decode_err);
-        fps_ = decoder_.fps();
+        source_fps_ = decoder_.fps();
+        source_frame_count_ = decoder_.frame_count();
+        // Session timeline = source retimed by fps_div (1 = identity). Downstream present/AI/
+        // wrap_slot see a dense 0..N-1 stream at fps_=source_fps/div -- same as opening a
+        // native lower-fps file. Decode still runs every GOP frame; only every Nth is kept.
+        recompute_session_rate();
         // M-C2: fps_ just (re)set for this session and may DIFFER from the previous session's
         // (reopen 4K60 <-> 1080p30) or from the constructor's default 60.0 (first open of a
         // 30fps file). present_loop()'s fixed-cadence formula is pace_origin_qpc_ + tick_idx/
@@ -423,7 +429,6 @@ public:
         pace_epoch_.fetch_add(1, std::memory_order_release);
         src_width_ = decoder_.width();
         src_height_ = decoder_.height();
-        frame_count_ = decoder_.frame_count();
         if (src_width_ <= 0 || src_height_ <= 0)
             throw std::runtime_error("decoder reported invalid dimensions");
 
@@ -950,6 +955,33 @@ public:
     void set_ai_enabled(bool v) { ai_enabled_.store(v, std::memory_order_relaxed); }
     bool is_ai_enabled() const { return ai_enabled_.load(std::memory_order_relaxed); }
 
+    // Temporal downsample 1/N. Decode still runs every source frame; only every Nth is written
+    // into the ring as a dense session frame (0,1,2,...). Session fps_/frame_count_ are retimed
+    // so present + AI look identical to a native source_fps/N file. Apply may require a seek
+    // remap when a session is already open.
+    void set_fps_div(int v)
+    {
+        if (v < 1) v = 1;
+        if (v > 4) v = 4;
+        int old = fps_div_.load(std::memory_order_relaxed);
+        if (v == old) return;
+        fps_div_.store(v, std::memory_order_relaxed);
+        if (!opened_) return;
+        // Map current session position back to source, retime, seek onto the new grid.
+        int64_t cur = clock_frame_.load(std::memory_order_relaxed);
+        int64_t source_pos = cur * std::max(1, old);
+        recompute_session_rate();
+        pace_epoch_.fetch_add(1, std::memory_order_release);
+        int64_t new_session = source_pos / std::max(1, v);
+        try {
+            seek(new_session);
+        } catch (...) {
+            // Best-effort: rate already updated; next play tick uses new fps.
+        }
+    }
+    int fps_div() const { return fps_div_.load(std::memory_order_relaxed); }
+    double source_fps() const { return source_fps_; }
+
     // ---- UI (M2): main thread only -- NewFrame/build/Render/CloneOutput, publish snapshot ---
     //
     // Called once per Python-driven tick (pybind's ui_tick()). Never touches d3d_mutex_ (see
@@ -1025,11 +1057,12 @@ public:
     // (pump input via WndProc/pump_messages(), build UI, record intents) -> take_ui_intents()
     // (drain + execute). All three run on Python's single main thread, never the present
     // thread, so ui_intents_/ui_cfg_* need no lock.
-    void set_ui_config(int clip_length, int max_regions, float cold_start_s)
+    void set_ui_config(int clip_length, int max_regions, float cold_start_s, int fps_div = 1)
     {
         ui_cfg_clip_length_ = clip_length;
         ui_cfg_max_regions_ = max_regions;
         ui_cfg_cold_start_s_ = cold_start_s;
+        ui_cfg_fps_div_ = fps_div;
     }
 
     // Model-warmup-in-background status line (left-bottom float, build_status_float()):
@@ -1056,6 +1089,7 @@ public:
         d["clip_length"] = ui_intents_.clip_length.has_value() ? py::cast(*ui_intents_.clip_length) : py::none();
         d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
         d["cold_start_s"] = ui_intents_.cold_start_s.has_value() ? py::cast(*ui_intents_.cold_start_s) : py::none();
+        d["fps_div"] = ui_intents_.fps_div.has_value() ? py::cast(*ui_intents_.fps_div) : py::none();
         d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
         d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
         d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
@@ -1095,12 +1129,20 @@ public:
         // held_frame/fifo/codec-buffer reset independently -- see audio_loop()'s seek handling.
         decoder_.flush_audio_queue();
 
+        // Session frame -> source frame for the decoder (which still speaks source timeline).
+        int div = fps_div_.load(std::memory_order_relaxed);
+        if (div < 1) div = 1;
+        int64_t source_target = frame_num * div;
+
         DecodedFrame df;
         std::string err;
-        if (!decoder_.seek_to_frame(frame_num, df, err))
+        if (!decoder_.seek_to_frame(source_target, df, err))
             throw std::runtime_error("seek_to_frame failed: " + err);
 
-        int64_t actual_frame = static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
+        int64_t source_landed = static_cast<int64_t>(std::llround(df.pts_seconds * source_fps_));
+        int64_t actual_frame = source_landed / div; // session index
+        if (frame_count_ > 0)
+            actual_frame = std::max<int64_t>(0, std::min<int64_t>(actual_frame, frame_count_ - 1));
         UINT slot = wrap_slot(actual_frame);
 
         {
@@ -2247,6 +2289,7 @@ private:
             settings_edit_clip_length_ = ui_cfg_clip_length_;
             settings_edit_max_regions_ = ui_cfg_max_regions_;
             settings_edit_cold_start_s_ = ui_cfg_cold_start_s_;
+            settings_edit_fps_div_ = ui_cfg_fps_div_;
             settings_edit_init_ = true;
         }
 
@@ -2259,6 +2302,11 @@ private:
             ImGui::SetTooltip("%s",
                 u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
                 u8"受解码缓冲限制，高帧率时实际跳过可能短于设定。");
+        ImGui::SliderInt(u8"帧率倍率 1/N", &settings_edit_fps_div_, 1, 4);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s",
+                u8"1 = 原速；2 = 半速（60→30，只保留偶数源帧）；\n"
+                u8"解码全解，输出给播放/AI 的已是降采样后的帧序列。");
 
         // Phase 6 M-D: instant native toggle (NOT staged/Apply like the two sliders above) --
         // each frame the local bool is re-seeded from the atomic present_loop() reads, and a
@@ -2269,11 +2317,12 @@ private:
 
         if (ImGui::Button(u8"应用")) {
             // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
-            // scheduler when it sees a non-null clip_length/max_regions/cold_start_s, never on
-            // every slider tick.
+            // scheduler when it sees a non-null clip_length/max_regions/cold_start_s/fps_div,
+            // never on every slider tick.
             ui_intents_.clip_length = settings_edit_clip_length_;
             ui_intents_.max_regions = settings_edit_max_regions_;
             ui_intents_.cold_start_s = settings_edit_cold_start_s_;
+            ui_intents_.fps_div = settings_edit_fps_div_;
         }
 
         ImGui::Separator();
@@ -2451,8 +2500,11 @@ private:
             for (auto& e : scrub_cache_)
                 if (e.bucket == bucket) return; // re-hover of a still-cached bucket
         }
+        // bucket is a session frame; scrub decoder speaks source timeline.
+        int div = fps_div_.load(std::memory_order_relaxed);
+        if (div < 1) div = 1;
         DecodedFrame df; std::string err;
-        if (!scrub_decoder_.seek_to_frame(bucket, df, err)) return; // best-effort
+        if (!scrub_decoder_.seek_to_frame(bucket * div, df, err)) return; // best-effort
         if (scrub_request_frame_.load(std::memory_order_relaxed) != bucket) return; // coalesced away
         size_t slot; ComPtr<ID3D11RenderTargetView> rtv;
         {
@@ -2501,17 +2553,21 @@ private:
 
         // Coarse preview: land on the nearest keyframe (one decode), not a full-GOP forward-decode
         // to exact -- keeps background fill cheap enough to run during playback (see docs sweep).
+        // pick_frame is session index; scrub decoder needs source frame.
+        int div = fps_div_.load(std::memory_order_relaxed);
+        if (div < 1) div = 1;
         DecodedFrame df; std::string err;
-        if (!scrub_decoder_.seek_to_frame(pick_frame, df, err, /*nearest_keyframe=*/true)) {
+        if (!scrub_decoder_.seek_to_frame(pick_frame * div, df, err, /*nearest_keyframe=*/true)) {
             std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
             if (pick < scrub_grid_.size()) scrub_grid_[pick].bucket = -2; // give up on this slot
             scrub_grid_done_++;
             return;
         }
         if (!blit_thumbnail(df, rtv.Get())) return; // torn down -- leave slot -1, session ending
-        // Store the ACTUAL landed keyframe frame (not the requested pick_frame) so get_thumbnail's
-        // nearest-distance is measured against what the slot really shows.
-        int64_t landed = (fps_ > 0.0) ? static_cast<int64_t>(std::llround(df.pts_seconds * fps_)) : pick_frame;
+        // Store the ACTUAL landed session frame (source PTS / div).
+        int64_t landed_src = (source_fps_ > 0.0)
+            ? static_cast<int64_t>(std::llround(df.pts_seconds * source_fps_)) : (pick_frame * div);
+        int64_t landed = landed_src / div;
         std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
         if (pick < scrub_grid_.size()) scrub_grid_[pick].bucket = landed;
         scrub_grid_done_++;
@@ -2885,7 +2941,15 @@ private:
                     goto decode_idle;
                 }
 
-                int64_t frame_num = static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
+                // Source timeline -> session timeline. Decode every GOP frame (required for
+                // HEVC/H.264); only keep every fps_div-th as a dense session frame so the rest
+                // of the player is identical to a native lower-fps file.
+                int div = fps_div_.load(std::memory_order_relaxed);
+                if (div < 1) div = 1;
+                int64_t source_frame = static_cast<int64_t>(std::llround(df.pts_seconds * source_fps_));
+                if (div > 1 && (source_frame % div) != 0)
+                    continue;
+                int64_t frame_num = source_frame / div;
                 UINT slot = wrap_slot(frame_num);
 
                 {
@@ -3602,6 +3666,22 @@ private:
 
     // ---- helpers -----------------------------------------------------------------------------
 
+    void recompute_session_rate()
+    {
+        int div = fps_div_.load(std::memory_order_relaxed);
+        if (div < 1) div = 1;
+        // Session fps/count: dense retimed timeline. source_fps_/source_frame_count_ stay fixed
+        // for the open file; only div changes at set_fps_div / open_session.
+        if (source_fps_ > 0.0)
+            fps_ = source_fps_ / static_cast<double>(div);
+        else
+            fps_ = 60.0 / static_cast<double>(div);
+        if (source_frame_count_ > 0)
+            frame_count_ = (source_frame_count_ + div - 1) / div; // ceil
+        else
+            frame_count_ = 0;
+    }
+
     static UINT wrap_slot(int64_t frame_num)
     {
         int64_t m = frame_num % static_cast<int64_t>(kRingCapacity);
@@ -3668,6 +3748,7 @@ private:
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
     int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
     float ui_cfg_cold_start_s_ = 1.0f; // cold-start skip seconds (0–3)
+    int ui_cfg_fps_div_ = 1;
     bool ui_settings_open_ = false;
     // Seekbar scrub: last frame we already recorded a seek for during the current press.
     // -1 when the bar is not active. Suppresses hold-still re-seeks (see build_bottom_bar).
@@ -3685,6 +3766,7 @@ private:
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
     float settings_edit_cold_start_s_ = 1.0f;
+    int settings_edit_fps_div_ = 1;
     // Atomic: written on the main thread (toggle_fullscreen()) but read on the PRESENT thread by
     // fit_viewport() (whether to reserve the title-bar strip) as well as the main thread
     // (build_top_bar()'s auto-hide, is_fullscreen(), resize_window_for_video()). relaxed is
@@ -3842,8 +3924,13 @@ private:
     std::mutex decoder_mutex_;
 
     Decoder decoder_;
-    double fps_ = 60.0;
-    int64_t frame_count_ = 0;
+    double source_fps_ = 60.0;       // container fps (fixed for the open file)
+    int64_t source_frame_count_ = 0; // container frame count
+    double fps_ = 60.0;              // session fps = source_fps_ / fps_div (retimed)
+    int64_t frame_count_ = 0;        // session frame count after retiming
+    // Temporal downsample 1/N. Decode still full-rate; only every Nth source frame becomes a
+    // dense session frame. Written by set_fps_div (main); read by decode/seek/open_session.
+    std::atomic<int> fps_div_{ 1 };
 
     std::thread decode_thread_;
     std::thread present_thread_;
@@ -4128,11 +4215,15 @@ PYBIND11_MODULE(sumu_core, m)
         .def("is_muted", &Player::is_muted)
         .def("set_ai_enabled", &Player::set_ai_enabled, py::arg("enabled")) // Phase 6 M-D
         .def("is_ai_enabled", &Player::is_ai_enabled)
+        .def("set_fps_div", &Player::set_fps_div, py::arg("fps_div"))
+        .def("fps_div", &Player::fps_div)
+        .def("source_fps", &Player::source_fps)
         .def("ui_tick", &Player::ui_tick) // M2: main-thread NewFrame/build/Render/publish tick
         .def("ui_ready", &Player::ui_ready)
         .def("path", &Player::path)
         .def("set_ui_config", &Player::set_ui_config,
-             py::arg("clip_length"), py::arg("max_regions"), py::arg("cold_start_s") = 1.0f)
+             py::arg("clip_length"), py::arg("max_regions"),
+             py::arg("cold_start_s") = 1.0f, py::arg("fps_div") = 1)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("set_compile_ui", &Player::set_compile_ui,
              py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
