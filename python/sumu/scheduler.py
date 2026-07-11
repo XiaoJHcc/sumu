@@ -41,23 +41,29 @@ from typing import Optional
 
 import torch
 
-from sumu.ai.restorationpipeline.blend import blend_back_frame, restore_clip
+from sumu.ai.restorationpipeline.blend import blend_back_frame, blend_regions_into_frame, restore_clip
 from sumu.ai.restorationpipeline.scene_clip import (
     Clip,
     Scene,
     append_or_create_scenes,
     materialize_completed_clips,
 )
+from sumu.ai.utils import image_utils
 from sumu.ai.utils.cuda_dlpack import wrap_nv12_cuda_buffer_as_tensor
 from sumu.ai.utils.video_utils import _nv12_to_bgr_hwc_gpu
+import cv2
 
 logger = logging.getLogger(__name__)
 
-# Native passthrough ring is kRingCapacity=64 with kDecodeAheadMax=54 (player.cpp). AI can only
-# pull frames that still sit in that ring ahead of present head -- so cold-start skip must not
-# ask for a frame further ahead than this, or get_cuda_nv12_by_frame stays ready=False until the
-# playhead itself advances (defeating the skip). Keep a small margin under 54.
-_DECODE_AHEAD_SAFE = 50
+# Fallback when Player has no ring_capacity/decode_ahead_max (older builds / tests).
+# Live values: PT ring is resolution-aware (1080p/4K both aim ~180 NV12); AI display ring
+# may be shorter at 4K (sparse crop stockpile + JIT push). See player.cpp pick_ring_capacities.
+_DECODE_AHEAD_SAFE_FALLBACK = 50
+# DESIGN.md I8 / lookahead_frames: stockpile ~180 frames of AI work for hard segments.
+_DEFAULT_LEAD_FRAMES = 180
+# How far ahead of present head we JIT-push into the (possibly short) native AI ring.
+# Leave margin under ai_ring_capacity so present can still hit the slot.
+_AI_PUSH_MARGIN = 8
 
 
 def clamp_cold_start_s(value) -> float:
@@ -87,9 +93,9 @@ class SchedulerConfig:
     cold_start_s: float = 1.0
 
     # AI frontier gate (README mechanism "处理前沿闸门"): keep ai_frontier in
-    # [head, head + lead]. lead is a frame count, tied to clip_length so a clip has a chance
-    # to complete and restore before playback catches up to its start. At runtime the gate also
-    # never sits below cold-start skip frames (see Scheduler._effective_lead).
+    # [head, head + lead]. Default ~180 (DESIGN.md lookahead) so easy segments can stockpile
+    # restored frames for hard multi-region segments. Runtime-clamped to native decode-ahead
+    # (see Scheduler._effective_lead) so AI never races past the passthrough ring.
     lead: Optional[int] = None  # computed in __post_init__ if left None
 
     # Bounded frame_cache: holds CUDA-resident BGR frames from get_cuda_nv12_by_frame until
@@ -125,7 +131,16 @@ class SchedulerConfig:
     def __post_init__(self):
         self.cold_start_s = clamp_cold_start_s(self.cold_start_s)
         if self.lead is None:
-            self.lead = max(self.clip_length, round(1.2 * self.clip_length))
+            # Prefer DESIGN.md ~180 lookahead; never below clip_length so a full clip can finish.
+            self.lead = max(self.clip_length, _DEFAULT_LEAD_FRAMES)
+        else:
+            try:
+                self.lead = int(self.lead)
+            except (TypeError, ValueError):
+                self.lead = _DEFAULT_LEAD_FRAMES
+            self.lead = max(1, min(_DEFAULT_LEAD_FRAMES, self.lead))
+            # A lead shorter than one clip still works but starves restore; keep at least clip_length.
+            self.lead = max(self.clip_length, self.lead)
         if self.frame_cache_capacity is None:
             self.frame_cache_capacity = self.lead + self.clip_length + self.frame_cache_margin
 
@@ -220,6 +235,9 @@ class Scheduler:
         self.scenes: list[Scene] = []
         self.clip_counter = 0
         self.frame_cache: "OrderedDict[int, torch.Tensor]" = OrderedDict()
+        # Sparse restored regions: fnum -> list of (crop_bgr, mask, box) ready to blend.
+        # Full-frame RGBA stays out of VRAM until JIT push into the short native AI ring.
+        self.pending_regions: "OrderedDict[int, list]" = OrderedDict()
         self.ai_frontier = 0
         self._last_head = 0
         self._eof_flushed_at: Optional[int] = None
@@ -256,10 +274,51 @@ class Scheduler:
         d["ai_frontier"] = self.ai_frontier
         d["scenes_open"] = len(self.scenes)
         d["frame_cache_size"] = len(self.frame_cache)
+        d["pending_frames"] = len(self.pending_regions)
         d["cold_start_skip_frames"] = self._cold_start_frames()
+        d["effective_lead"] = self._effective_lead()
+        d["decode_ahead_safe"] = self._decode_ahead_safe()
+        d["ai_push_window"] = self._ai_push_window()
         return d
 
     # ---- cold-start helpers ----------------------------------------------------------------
+
+    def _decode_ahead_safe(self) -> int:
+        """Max frames AI may sit ahead of present head and still hit the passthrough ring.
+
+        Reads live Player.decode_ahead_max() (resolution-aware ring); falls back to a
+        conservative constant if the binding is missing. Keeps a small margin under the
+        native throttle so get_cuda_nv12_by_frame is ready before the slot is overwritten.
+        """
+        try:
+            if hasattr(self.player, "decode_ahead_max"):
+                n = int(self.player.decode_ahead_max())
+                if n > 0:
+                    return max(0, n - 4)
+            if hasattr(self.player, "ring_capacity"):
+                n = int(self.player.ring_capacity())
+                if n > 0:
+                    return max(0, n - 14)
+        except Exception:  # noqa: BLE001 -- never fail the producer on a stats/probe path
+            pass
+        return _DECODE_AHEAD_SAFE_FALLBACK
+
+    def _ai_push_window(self) -> int:
+        """Max frames ahead of present head that may sit in the native AI ready-map.
+
+        At 4K the AI ring is intentionally short (~64); restored crops live in pending_regions
+        until the playhead approaches, then we blend+push. 1080p keeps a deep AI ring so the
+        window can match the PT lead.
+        """
+        try:
+            if hasattr(self.player, "ai_ring_capacity"):
+                n = int(self.player.ai_ring_capacity())
+                if n > 0:
+                    return max(1, n - _AI_PUSH_MARGIN)
+        except Exception:  # noqa: BLE001
+            pass
+        # Symmetric legacy / missing binding: use PT-safe lead.
+        return self._decode_ahead_safe()
 
     def _cold_start_frames(self) -> int:
         """Frames to skip after open/seek before AI starts. Fixed seconds × fps, clamped to the
@@ -269,13 +328,18 @@ class Scheduler:
             fps = 30.0
         s = clamp_cold_start_s(self.config.cold_start_s)
         raw = int(round(s * fps))
-        return max(0, min(raw, _DECODE_AHEAD_SAFE))
+        return max(0, min(raw, self._decode_ahead_safe()))
 
     def _effective_lead(self) -> int:
-        """Frontier gate upper bound: base lead, but never below cold-start skip (otherwise
-        ai_frontier = head + skip would immediately hit frontier > head+lead and sleep forever)."""
+        """Frontier gate upper bound: config lead (default ~180), never below cold-start skip,
+        and never past the native decode-ahead ring (otherwise AI spins on ready=False)."""
         base = int(self.config.lead or 0)
-        return max(base, self._cold_start_frames())
+        lead = max(base, self._cold_start_frames())
+        safe = self._decode_ahead_safe()
+        if safe <= 0:
+            return lead
+        return min(lead, max(self._cold_start_frames(), safe))
+
 
     def _frame_cache_cap(self) -> int:
         cfg = self.config
@@ -292,6 +356,7 @@ class Scheduler:
         use this -- catch-up jumps to head with no extra skip."""
         self.scenes = []
         self.frame_cache.clear()
+        self.pending_regions.clear()
         skip = self._cold_start_frames()
         self.ai_frontier = int(frame_num) + skip
         self._last_head = int(frame_num)
@@ -339,7 +404,12 @@ class Scheduler:
                 self.scenes = []
                 self.ai_frontier = head
                 self.stats.backlog_resyncs += 1
+                # Still JIT-push any pending stockpile that is now in the near-head window.
+                self._flush_pending_to_native(head)
                 continue
+
+            # Push stockpiled restorations that have entered the short AI display window.
+            self._flush_pending_to_native(head)
 
             if self.ai_frontier > head + self._effective_lead():
                 time.sleep(cfg.sleep_step_s)
@@ -420,24 +490,73 @@ class Scheduler:
             self.stats.restore_seconds += dt
         self.stats.clips_restored += 1
 
+        # Drain clip into sparse pending (not full-frame RGBA in the native AI ring yet).
+        # Multi-region: multiple clips may contribute regions to the same fnum; JIT flush
+        # blends them all onto the cached original before push_ai_frame.
         for fnum in range(frame_start, frame_end + 1):
-            orig = self.frame_cache.get(fnum)
-            if orig is None:
-                # Should not happen given frame_cache_capacity's sizing (see SchedulerConfig
-                # docstring), but blend_back_frame's pop() must still be drained in lockstep
-                # to keep the clip's internal bookkeeping consistent for the next fnum in this
-                # loop - so degrade by skipping the push (frame stays passthrough for fnum)
-                # rather than desyncing or throwing.
+            if fnum not in self.frame_cache:
                 logger.warning(
-                    "scheduler: frame_cache miss for fnum=%d (evicted before blend) - skipping push, "
-                    "frame stays on passthrough", fnum,
+                    "scheduler: frame_cache miss for fnum=%d before sparse store - dropping region",
+                    fnum,
                 )
                 clip.pop()
                 self.stats.frame_cache_misses += 1
                 continue
+            clip_img, clip_mask, orig_clip_box, orig_crop_shape, pad_after_resize = clip.pop()
+            clip_img = image_utils.unpad_image(clip_img, pad_after_resize)
+            clip_mask = image_utils.unpad_image(clip_mask, pad_after_resize)
+            clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
+            clip_mask = image_utils.resize(
+                clip_mask, orig_crop_shape[:2], interpolation=cv2.INTER_NEAREST
+            )
+            # Contiguous clones so pending outlives clip buffer reuse.
+            region = (clip_img.contiguous(), clip_mask.contiguous(), orig_clip_box)
+            bucket = self.pending_regions.get(fnum)
+            if bucket is None:
+                self.pending_regions[fnum] = [region]
+            else:
+                bucket.append(region)
 
+        try:
+            head = int(self.player.current_frame())
+        except Exception:  # noqa: BLE001
+            head = 0
+        self._flush_pending_to_native(head)
+
+    def _flush_pending_to_native(self, head: int) -> None:
+        """Blend pending sparse regions for frames in [head, head+ai_push_window] and push.
+
+        Frames behind head are dropped (present already passed). Frames beyond the AI display
+        window stay in pending until the playhead approaches (4K short AI ring).
+        """
+        if not self.pending_regions:
+            return
+        window = self._ai_push_window()
+        hi = head + window
+        # Drop anything already behind the playhead.
+        while self.pending_regions:
+            fnum = next(iter(self.pending_regions))
+            if fnum >= head:
+                break
+            self.pending_regions.popitem(last=False)
+            self.frame_cache.pop(fnum, None)
+
+        # Push in frame order within the near-head window.
+        to_push = [f for f in self.pending_regions if f <= hi]
+        to_push.sort()
+        for fnum in to_push:
+            regions = self.pending_regions.pop(fnum, None)
+            if not regions:
+                continue
+            orig = self.frame_cache.get(fnum)
+            if orig is None:
+                logger.warning(
+                    "scheduler: frame_cache miss for fnum=%d at JIT push - skip", fnum,
+                )
+                self.stats.frame_cache_misses += 1
+                continue
             original_for_capture = orig.clone() if self._capture_budget > 0 else None
-            final_bgr = blend_back_frame(orig, fnum, [clip], self.res_model)
+            final_bgr = blend_regions_into_frame(orig, regions, self.res_model)
             rgba = self._to_rgba(final_bgr)
 
             if self._capture_budget > 0:
@@ -451,7 +570,8 @@ class Scheduler:
 
             h, w = rgba.shape[0], rgba.shape[1]
             self.player.push_ai_frame(fnum, rgba.data_ptr(), w, h, w * 4)
-            self.frame_cache.pop(fnum, None)
+            # Keep frame_cache until head advances so a later multi-region clip can re-blend
+            # onto the already-restored frame and re-push (same fnum).
 
             self.stats.frames_pushed += 1
             if self.stats.first_push_at is None:
@@ -459,9 +579,27 @@ class Scheduler:
 
     def _cache_put(self, n: int, frame: torch.Tensor) -> None:
         self.frame_cache[n] = frame
+        # Drop frames already behind the present head (no clip can still need them for blend).
+        head = 0
+        try:
+            head = int(self.player.current_frame())
+        except Exception:  # noqa: BLE001
+            pass
+        while self.frame_cache:
+            oldest = next(iter(self.frame_cache))
+            if oldest >= head:
+                break
+            self.frame_cache.popitem(last=False)
+        # Bound pending + cache to lead span (sparse crops are cheap; full BGR is not).
+        while self.pending_regions:
+            oldest = next(iter(self.pending_regions))
+            if oldest >= head:
+                break
+            self.pending_regions.popitem(last=False)
         cap = self._frame_cache_cap()
         while len(self.frame_cache) > cap:
             evicted_n, _ = self.frame_cache.popitem(last=False)
+            self.pending_regions.pop(evicted_n, None)
             logger.debug("scheduler: frame_cache evicted frame %d before it was blended", evicted_n)
 
     @staticmethod

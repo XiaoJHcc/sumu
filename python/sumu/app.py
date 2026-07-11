@@ -219,12 +219,13 @@ def main():
     opened = False
     current_path = None
     video_meta = None
-    # Committed config values as plain ints (defaults mirror SchedulerConfig's clip_length /
-    # max_regions_per_frame). A real SchedulerConfig is only built at scheduler-build time, once
-    # warmup has handed the class over -- so nothing here forces the torch import onto startup.
-    cfg_clip_length = 30
-    cfg_max_regions = 1
+    # Committed config values as plain ints (defaults from settings.json / Settings defaults).
+    # A real SchedulerConfig is only built at scheduler-build time, once warmup has handed the
+    # class over -- so nothing here forces the torch import onto startup.
+    cfg_clip_length = settings_mod.clamp_clip_length(settings.clip_length)
+    cfg_max_regions = settings_mod.clamp_max_regions(settings.max_regions)
     cfg_cold_start_s = float(settings.cold_start_s)
+    cfg_lead = settings_mod.clamp_lead(settings.lead)
     cfg_target_fps = int(settings_mod.clamp_target_fps(settings.target_fps))
     scheduler = None
     det_model = res_model = pad_mode = None
@@ -459,7 +460,7 @@ def main():
                 except Exception:  # noqa: BLE001 -- diagnostics must never break the main loop
                     pass
             player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s, cfg_target_fps,
-                                 ai_restore_fps)
+                                 ai_restore_fps, cfg_lead)
 
             player.ui_tick()
 
@@ -522,21 +523,34 @@ def main():
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
             cold_start_s = intents.get("cold_start_s")
+            lead = intents.get("lead")
             target_fps = intents.get("target_fps")
             # Always commit knobs into the Python-owned cfg_* mirrors (including first-screen
             # edits before any file is open). Scheduler rebuild is separate and only runs when
             # a scheduler already exists for the current file. Native commits on slider release
             # / combo change (not every drag tick), so rebuild cost matches one former Apply click.
+            # Persist AI knobs (not ai_enabled) immediately so a crash mid-session still keeps them.
+            knobs_changed = False
             if clip_length is not None:
-                cfg_clip_length = clip_length
+                cfg_clip_length = settings_mod.clamp_clip_length(clip_length)
+                settings.clip_length = cfg_clip_length
+                knobs_changed = True
             if max_regions is not None:
-                cfg_max_regions = max_regions
+                cfg_max_regions = settings_mod.clamp_max_regions(max_regions)
+                settings.max_regions = cfg_max_regions
+                knobs_changed = True
             if cold_start_s is not None:
                 cfg_cold_start_s = float(cold_start_s)
                 settings.cold_start_s = cfg_cold_start_s
+                knobs_changed = True
+            if lead is not None:
+                cfg_lead = settings_mod.clamp_lead(lead)
+                settings.lead = cfg_lead
+                knobs_changed = True
             if target_fps is not None:
                 cfg_target_fps = settings_mod.clamp_target_fps(target_fps)
                 settings.target_fps = cfg_target_fps
+                knobs_changed = True
                 if opened:
                     apply_target_fps_for_open()
                     if video_meta is not None:
@@ -549,14 +563,17 @@ def main():
                             video_meta.frames_count = int(player.frame_count())
                         except Exception:  # noqa: BLE001
                             pass
+            if knobs_changed:
+                settings_mod.save(settings)
             if (clip_length is not None or max_regions is not None or cold_start_s is not None
-                    or target_fps is not None) and scheduler is not None:
+                    or lead is not None or target_fps is not None) and scheduler is not None:
                 # target_fps may retime the session (native fps_div); rebuild scheduler so
                 # cold-start/lead recompute against the new player.fps()/frame_count().
                 scheduler.stop()
                 config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                             max_regions_per_frame=cfg_max_regions,
-                                            cold_start_s=cfg_cold_start_s)
+                                            cold_start_s=cfg_cold_start_s,
+                                            lead=cfg_lead)
                 scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
 
@@ -588,9 +605,11 @@ def main():
                         pass
                     config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                                 max_regions_per_frame=cfg_max_regions,
-                                                cold_start_s=cfg_cold_start_s)
+                                                cold_start_s=cfg_cold_start_s,
+                                                lead=cfg_lead)
                     scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                     scheduler.start()
+
                 # Intentionally no auto-resume seek: open/reopen always start at frame 0.
                 # settings.positions still records last frame (do_reopen/finally) for a future
                 # manual "continue watching" path; is_resumable_frame stays available for that.

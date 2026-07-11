@@ -268,12 +268,12 @@ def main():
                 print_status("seek-recovery", player, scheduler, t_seek_obs0)
                 last_print = now
             # 50Hz main loop. NOT 0.008 (125Hz): measured (M3 cadence forensics, docs/native_core.md)
-        # a 125Hz loop starves the present thread of CPU/scheduling under timeBeginPeriod(1),
-        # producing a periodic ~30ms present hitch (steady stddev 0.23->4.39, one 177ms tick) in
-        # pure passthrough -- i.e. it breaks the crown present-cadence invariant. 20ms input
-        # latency is imperceptible for transport/seek/keyboard, so 0.02 stays. See also smoke_player
-        # (no ui_tick) staying pristine on the same busy desktop, which localized the cause here.
-        time.sleep(0.02)
+            # a 125Hz loop starves the present thread of CPU/scheduling under timeBeginPeriod(1),
+            # producing a periodic ~30ms present hitch (steady stddev 0.23->4.39, one 177ms tick) in
+            # pure passthrough -- i.e. it breaks the crown present-cadence invariant. 20ms input
+            # latency is imperceptible for transport/seek/keyboard, so 0.02 stays. See also smoke_player
+            # (no ui_tick) staying pristine on the same busy desktop, which localized the cause here.
+            time.sleep(0.02)
         player.pump_messages()
         st_after = player.stats()
         seek_result = {

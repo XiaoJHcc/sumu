@@ -34,7 +34,7 @@ def main():
         # 1. Round-trip
         s = settings_mod.Settings(
             volume=0.5, muted=True, recent=["a", "b", "c"], positions={"x": 1234},
-            cold_start_s=1.5, target_fps=30,
+            cold_start_s=1.5, target_fps=30, clip_length=45, max_regions=3, lead=120,
         )
         settings_mod.save(s, settings_path)
         loaded = settings_mod.load(settings_path)
@@ -44,6 +44,9 @@ def main():
         check("round-trip positions", loaded.positions == {"x": 1234})
         check("round-trip cold_start_s", loaded.cold_start_s == 1.5)
         check("round-trip target_fps", loaded.target_fps == 30)
+        check("round-trip clip_length", loaded.clip_length == 45)
+        check("round-trip max_regions", loaded.max_regions == 3)
+        check("round-trip lead", loaded.lead == 120)
 
         # 2. Corrupt/missing
         with open(settings_path, "wb") as f:
@@ -55,6 +58,9 @@ def main():
         check("corrupt file -> defaults (positions)", corrupt_loaded.positions == {})
         check("corrupt file -> defaults (cold_start_s)", corrupt_loaded.cold_start_s == 1.0)
         check("corrupt file -> defaults (target_fps)", corrupt_loaded.target_fps == 0)
+        check("corrupt file -> defaults (clip_length)", corrupt_loaded.clip_length == 30)
+        check("corrupt file -> defaults (max_regions)", corrupt_loaded.max_regions == 1)
+        check("corrupt file -> defaults (lead)", corrupt_loaded.lead == 180)
 
         os.remove(settings_path)
         missing_loaded = settings_mod.load(settings_path)
@@ -69,6 +75,18 @@ def main():
         settings_mod.save(s_lo, settings_path)
         loaded_lo = settings_mod.load(settings_path)
         check("cold_start_s clamp low -> 0.0", loaded_lo.cold_start_s == 0.0)
+
+        # 2b2. clip_length / max_regions / lead clamps
+        settings_mod.save(settings_mod.Settings(clip_length=999, max_regions=0, lead=0), settings_path)
+        c = settings_mod.load(settings_path)
+        check("clip_length clamp high -> 180", c.clip_length == 180)
+        check("max_regions clamp low -> 1", c.max_regions == 1)
+        check("lead clamp low -> 1", c.lead == 1)
+        settings_mod.save(settings_mod.Settings(clip_length=0, max_regions=99, lead=999), settings_path)
+        c2 = settings_mod.load(settings_path)
+        check("clip_length clamp low -> 1", c2.clip_length == 1)
+        check("max_regions clamp high -> 8", c2.max_regions == 8)
+        check("lead clamp high -> 180", c2.lead == 180)
 
         # 2c. target_fps clamp + legacy fps_div migrate
         s_bad = settings_mod.Settings(target_fps=99)
@@ -132,6 +150,8 @@ def main():
             data = json.load(f)
         check("atomic write: target parses as valid JSON", isinstance(data, dict))
         check("save writes target_fps not fps_div", "target_fps" in data and "fps_div" not in data)
+        check("save writes clip_length/max_regions/lead",
+              data.get("clip_length") == 30 and data.get("max_regions") == 1 and data.get("lead") == 180)
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

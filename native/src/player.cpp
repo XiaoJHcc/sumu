@@ -19,7 +19,7 @@
 // Protected(TRUE)):
 //   - decode thread:  FFmpeg d3d11va decode -> CopySubresourceRegion into a persistent NV12
 //                     "passthrough ring" Texture2DArray, throttled to stay within
-//                     kDecodeAheadMax frames of the present head.
+//                     decode_ahead_max_ frames of the present head.
 //   - AI-push thread (Python, not owned here): push_ai_frame() does the CUDA<->D3D11
 //                     zero-copy bridge into a landing texture, then a CopySubresourceRegion
 //                     into the AI ready-map's Texture2DArray slot, THEN marks that slot ready.
@@ -347,6 +347,7 @@ struct UiIntents {
     std::optional<int> clip_length;
     std::optional<int> max_regions;
     std::optional<float> cold_start_s; // cold-start skip seconds (0–3); Python clamps
+    std::optional<int> lead; // AI buffer window (frames, 1–180); Python clamps
     std::optional<int> target_fps; // 0=original, 30, 60; Python maps to per-file fps_div
     // M-C2: a file the user wants opened (reopen), recorded by either the WM_DROPFILES handler
     // (open_path, UTF-8 path of the dropped file -- empty means none pending) or the top-bar
@@ -365,12 +366,35 @@ struct UiIntents {
 class Player
 {
 public:
-    // Ring capacity in frames (~1s at 60fps): both the passthrough decode-ahead buffer and
-    // the AI ready-map share this capacity/indexing scheme (see docs/spike_results.md's
-    // spike2 writeup for the E_OUTOFMEMORY history behind this number).
-    static constexpr UINT kRingCapacity = 64;
-    static constexpr int64_t kDecodeAheadMax = static_cast<int64_t>(kRingCapacity) - 10;
+    // Ring capacities (frames). Passthrough (NV12) and AI (RGBA) may differ (I8 VRAM):
+    // 4K dual×180 RGBA was ~6GB and OOM'd; deep PT alone is ~2.2GB. AI display window can
+    // stay short -- Python holds sparse restored crops and JIT-pushes into the AI ring near
+    // the present head. Indexing: frame_num % capacity per ring (wrap_pt_slot / wrap_ai_slot).
+    static constexpr UINT kRingCapacityMax = 180;
+    static constexpr UINT kAiRingCapacityMax = 64;  // 4K AI display window (~1s@60)
+    static constexpr UINT kRingCapacityDefault = 64; // pre-open / closed
     static constexpr int64_t kStartBufferFrames = 5;
+
+    static void pick_ring_capacities(int width, int height, UINT& pt_cap, UINT& ai_cap)
+    {
+        const int64_t px = static_cast<int64_t>(width) * static_cast<int64_t>(height);
+        if (px <= 1920LL * 1080LL) {
+            // 1080p: dual full-depth still ~2GB -- keep symmetric 180 for max AI stockpile.
+            pt_cap = kRingCapacityMax;
+            ai_cap = kRingCapacityMax;
+        } else if (px <= 2560LL * 1440LL) {
+            pt_cap = kRingCapacityMax;
+            ai_cap = 90;
+        } else {
+            // 4K: deep NV12 PT for AI input lead; short RGBA AI for present near-head only.
+            pt_cap = kRingCapacityMax;
+            ai_cap = kAiRingCapacityMax;
+        }
+    }
+
+    UINT ring_capacity() const { return ring_capacity_; }       // PT (decode-ahead) depth
+    UINT ai_ring_capacity() const { return ai_ring_capacity_; } // AI display ready-map depth
+    int64_t decode_ahead_max() const { return decode_ahead_max_; }
 
     // Base (96-DPI) height of the self-drawn top title bar. Runtime height is
     // top_bar_h() = kTopBarHBase * ui_dpi_scale_ so the strip tracks the monitor scale
@@ -463,6 +487,19 @@ public:
         if (src_width_ <= 0 || src_height_ <= 0)
             throw std::runtime_error("decoder reported invalid dimensions");
 
+        // Resolution-aware ring depths (I8): deep PT for AI input lead; AI ring may be shorter
+        // (Python JIT-pushes near present). Set before create_ring_resources().
+        pick_ring_capacities(src_width_, src_height_, ring_capacity_, ai_ring_capacity_);
+        if (ring_capacity_ < 16) ring_capacity_ = 16;
+        if (ring_capacity_ > kRingCapacityMax) ring_capacity_ = kRingCapacityMax;
+        if (ai_ring_capacity_ < 16) ai_ring_capacity_ = 16;
+        if (ai_ring_capacity_ > kRingCapacityMax) ai_ring_capacity_ = kRingCapacityMax;
+        decode_ahead_max_ = static_cast<int64_t>(ring_capacity_) - 10;
+        if (decode_ahead_max_ < 1) decode_ahead_max_ = 1;
+        fprintf(stderr, "[sumu] pt_ring=%u ai_ring=%u decode_ahead_max=%lld (%dx%d)\n",
+            ring_capacity_, ai_ring_capacity_, static_cast<long long>(decode_ahead_max_),
+            src_width_, src_height_);
+
         // ---- audio (spike, additive) -- software-decode-only AVCodecContext for the audio
         // stream, if any (never touches d3d11va/hw_device_ctx_). Built here on the main
         // thread: FFmpeg contexts have no thread affinity, so this is safe to hand off to
@@ -496,8 +533,8 @@ public:
         register_landing_with_cuda();
         create_ai_input_bridge();
 
-        pt_tag_.assign(kRingCapacity, -1);
-        ai_tag_.assign(kRingCapacity, -1);
+        pt_tag_.assign(ring_capacity_, -1);
+        ai_tag_.assign(ai_ring_capacity_, -1);
         // Must reset before starting decode_thread_ / the start-buffer wait: otherwise a
         // reopen() inherits the previous session's high-water (e.g. 10000) and the wait
         // returns immediately with an empty ring -- green/black first frames.
@@ -1119,13 +1156,14 @@ public:
     // (drain + execute). All three run on Python's single main thread, never the present
     // thread, so ui_intents_/ui_cfg_* need no lock.
     void set_ui_config(int clip_length, int max_regions, float cold_start_s, int target_fps = 0,
-                       float ai_restore_fps = -1.0f)
+                       float ai_restore_fps = -1.0f, int lead = 180)
     {
         ui_cfg_clip_length_ = clip_length;
         ui_cfg_max_regions_ = max_regions;
         ui_cfg_cold_start_s_ = cold_start_s;
         ui_cfg_target_fps_ = target_fps;
         ui_cfg_ai_restore_fps_ = ai_restore_fps; // Python Scheduler net BasicVSR fps; <0 = unknown
+        ui_cfg_lead_ = lead;
     }
 
     // Model-warmup-in-background status line (left-bottom float, build_status_float()):
@@ -1152,6 +1190,7 @@ public:
         d["clip_length"] = ui_intents_.clip_length.has_value() ? py::cast(*ui_intents_.clip_length) : py::none();
         d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
         d["cold_start_s"] = ui_intents_.cold_start_s.has_value() ? py::cast(*ui_intents_.cold_start_s) : py::none();
+        d["lead"] = ui_intents_.lead.has_value() ? py::cast(*ui_intents_.lead) : py::none();
         d["target_fps"] = ui_intents_.target_fps.has_value() ? py::cast(*ui_intents_.target_fps) : py::none();
         d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
         d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
@@ -1206,7 +1245,7 @@ public:
         int64_t actual_frame = source_landed / div; // session index
         if (frame_count_ > 0)
             actual_frame = std::max<int64_t>(0, std::min<int64_t>(actual_frame, frame_count_ - 1));
-        UINT slot = wrap_slot(actual_frame);
+        UINT slot = wrap_pt_slot(actual_frame);
 
         {
             std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
@@ -1295,7 +1334,7 @@ public:
 
             check_cu(cuGraphicsUnmapResources(1, &cu_res_, 0), "cuGraphicsUnmapResources");
 
-            UINT slot = wrap_slot(frame_num);
+            UINT slot = wrap_ai_slot(frame_num);
             context_->CopySubresourceRegion(ai_ring_tex_.Get(), slot, 0, 0, 0,
                 landing_tex_.Get(), 0, nullptr);
 
@@ -1356,7 +1395,7 @@ public:
     py::dict get_cuda_nv12_by_frame(int64_t frame_num)
     {
         require_open();
-        UINT slot = wrap_slot(frame_num);
+        UINT slot = wrap_pt_slot(frame_num);
 
         // Phase 1: fast, lock-minimal cache check. On a miss -- expected to be the common
         // case whenever the AI consumer is behind decode/present (e.g. still warming up, or
@@ -1520,6 +1559,9 @@ public:
         d["ai_hit_rate"] = ai_hit_rate();
         d["is_playing"] = playing_.load(std::memory_order_relaxed);
         d["current_frame"] = current_frame();
+        d["ring_capacity"] = ring_capacity_;
+        d["ai_ring_capacity"] = ai_ring_capacity_;
+        d["decode_ahead_max"] = decode_ahead_max_;
         return d;
     }
 
@@ -2493,6 +2535,7 @@ private:
             settings_edit_clip_length_ = ui_cfg_clip_length_;
             settings_edit_max_regions_ = ui_cfg_max_regions_;
             settings_edit_cold_start_s_ = ui_cfg_cold_start_s_;
+            settings_edit_lead_ = ui_cfg_lead_;
             // Combo index: 0=原始, 1=30, 2=60
             settings_edit_target_fps_idx_ =
                 (ui_cfg_target_fps_ == 30) ? 1 : (ui_cfg_target_fps_ == 60) ? 2 : 0;
@@ -2505,16 +2548,32 @@ private:
 
         ImGui::TextUnformatted(u8"设置");
         ImGui::Separator();
+        ImGui::TextUnformatted(u8"缓冲窗口(帧)");
+        ImGui::SliderInt("##lead", &settings_edit_lead_, 1, 180);
+        if (ImGui::IsItemDeactivatedAfterEdit() &&
+            settings_edit_lead_ != ui_cfg_lead_)
+            ui_intents_.lead = settings_edit_lead_;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s",
+                u8"AI 相对播放头的超前缓冲（帧）。简单段囤去码帧给难段消费。\n"
+                u8"实际不超过解码超前环（PT 环深度；4K 亦约 170）。");
         ImGui::TextUnformatted(u8"处理片段长度(帧)");
         ImGui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_clip_length_ != ui_cfg_clip_length_)
             ui_intents_.clip_length = settings_edit_clip_length_;
-        ImGui::TextUnformatted(u8"每帧最多区块数");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s",
+                u8"BasicVSR++ 每批处理的连续帧数。更短响应更快、画面更易\n"
+                u8"规律抖动；更长更稳但首批延迟更高（TRT 上限 180）。");
+        ImGui::TextUnformatted(u8"同帧最多区块数");
         ImGui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_max_regions_ != ui_cfg_max_regions_)
             ui_intents_.max_regions = settings_edit_max_regions_;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s",
+                u8"同一帧最多同时去码的马赛克区块数。调高消耗近似线性倍增。");
         ImGui::TextUnformatted(u8"冷启动跳过(秒)");
         ImGui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
         if (ImGui::IsItemDeactivatedAfterEdit() &&
@@ -2523,7 +2582,7 @@ private:
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s",
                 u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
-                u8"受解码缓冲限制，高帧率时实际跳过可能短于设定。");
+                u8"跳过帧数 = 秒×帧率，且不超过解码超前环（约 170 帧）。");
         {
             const char* target_fps_items[] = { u8"原始", "30", "60" };
             ImGui::TextUnformatted(u8"目标帧率");
@@ -2873,7 +2932,7 @@ private:
         pt_desc.Width = src_width_;
         pt_desc.Height = src_height_;
         pt_desc.MipLevels = 1;
-        pt_desc.ArraySize = kRingCapacity;
+        pt_desc.ArraySize = ring_capacity_;
         pt_desc.Format = DXGI_FORMAT_NV12;
         pt_desc.SampleDesc.Count = 1;
         pt_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -2885,9 +2944,9 @@ private:
         pt_desc.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
         check_hr(device_->CreateTexture2D(&pt_desc, nullptr, &pt_ring_tex_), "CreateTexture2D(pt_ring_tex_)");
 
-        pt_srv_y_.resize(kRingCapacity);
-        pt_srv_uv_.resize(kRingCapacity);
-        for (UINT i = 0; i < kRingCapacity; ++i) {
+        pt_srv_y_.resize(ring_capacity_);
+        pt_srv_uv_.resize(ring_capacity_);
+        for (UINT i = 0; i < ring_capacity_; ++i) {
             D3D11_SHADER_RESOURCE_VIEW_DESC yd{};
             yd.Format = DXGI_FORMAT_R8_UNORM;
             yd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -2906,15 +2965,15 @@ private:
         ai_desc.Width = src_width_;
         ai_desc.Height = src_height_;
         ai_desc.MipLevels = 1;
-        ai_desc.ArraySize = kRingCapacity;
+        ai_desc.ArraySize = ai_ring_capacity_;
         ai_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         ai_desc.SampleDesc.Count = 1;
         ai_desc.Usage = D3D11_USAGE_DEFAULT;
         ai_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         check_hr(device_->CreateTexture2D(&ai_desc, nullptr, &ai_ring_tex_), "CreateTexture2D(ai_ring_tex_)");
 
-        ai_srv_.resize(kRingCapacity);
-        for (UINT i = 0; i < kRingCapacity; ++i) {
+        ai_srv_.resize(ai_ring_capacity_);
+        for (UINT i = 0; i < ai_ring_capacity_; ++i) {
             D3D11_SHADER_RESOURCE_VIEW_DESC ad{};
             ad.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             ad.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -3140,7 +3199,7 @@ private:
         // open_session() on every reopen), so it must exit on EITHER the whole-Player stop_ OR
         // the session-only session_stop_ -- present_loop() must keep checking only stop_.
         while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
-            // Throttle: never get more than kDecodeAheadMax frames ahead of the present
+            // Throttle: never get more than decode_ahead_max_ frames ahead of the present
             // head, so we never overwrite a ring slot before present has had its one chance
             // to read it. Before the present thread has started, present_head_frame_ is
             // whatever open() initialized it to (0); after a seek it's the seeked frame.
@@ -3148,7 +3207,7 @@ private:
                 if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
                 int64_t head = present_head_frame_.load(std::memory_order_relaxed);
                 int64_t high = pt_high_water_.load(std::memory_order_relaxed);
-                if (high - head < kDecodeAheadMax) break;
+                if (high - head < decode_ahead_max_) break;
                 Sleep(1);
             }
 
@@ -3177,7 +3236,7 @@ private:
                 if (div > 1 && (source_frame % div) != 0)
                     continue;
                 int64_t frame_num = source_frame / div;
-                UINT slot = wrap_slot(frame_num);
+                UINT slot = wrap_pt_slot(frame_num);
 
                 {
                     std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
@@ -3324,7 +3383,8 @@ private:
                 clock_frame_.store(frame, std::memory_order_relaxed);
                 present_head_frame_.store(frame, std::memory_order_relaxed);
 
-                UINT slot = wrap_slot(frame);
+                UINT pt_slot = wrap_pt_slot(frame);
+                UINT ai_slot = wrap_ai_slot(frame);
                 {
                     std::lock_guard<std::mutex> lk(ready_mutex_);
                     // Phase 6 M-D: gates the AI pick on the de-mosaic-on/off toggle, read once
@@ -3334,12 +3394,12 @@ private:
                     // unchanged.
                     bool ai_on = ai_enabled_.load(std::memory_order_relaxed);
 
-                    if (ai_on && ai_tag_[slot] == frame) {
+                    if (ai_on && ai_tag_[ai_slot] == frame) {
                         source = Source::AiFresh;
-                        use_slot = slot;
-                    } else if (pt_tag_[slot] == frame) {
+                        use_slot = ai_slot;
+                    } else if (pt_tag_[pt_slot] == frame) {
                         source = Source::PassthroughFresh;
-                        use_slot = slot;
+                        use_slot = pt_slot;
                     } else {
                         // Neither map has this exact frame number ready. NEVER block -- just
                         // re-present whatever was actually shown last tick (I2/I9). When
@@ -3930,10 +3990,19 @@ private:
         scrub_cv_.notify_one();
     }
 
-    static UINT wrap_slot(int64_t frame_num)
+    UINT wrap_pt_slot(int64_t frame_num) const
     {
-        int64_t m = frame_num % static_cast<int64_t>(kRingCapacity);
-        if (m < 0) m += kRingCapacity;
+        const int64_t cap = static_cast<int64_t>(ring_capacity_ > 0 ? ring_capacity_ : kRingCapacityDefault);
+        int64_t m = frame_num % cap;
+        if (m < 0) m += cap;
+        return static_cast<UINT>(m);
+    }
+
+    UINT wrap_ai_slot(int64_t frame_num) const
+    {
+        const int64_t cap = static_cast<int64_t>(ai_ring_capacity_ > 0 ? ai_ring_capacity_ : kRingCapacityDefault);
+        int64_t m = frame_num % cap;
+        if (m < 0) m += cap;
         return static_cast<UINT>(m);
     }
 
@@ -3973,6 +4042,11 @@ private:
 
     int src_width_ = 0;
     int src_height_ = 0;
+    // Session ring depths (set in open_session from pick_ring_capacities).
+    // PT: decode-ahead + AI input. AI: short present ready-map (may be << PT at 4K).
+    UINT ring_capacity_ = kRingCapacityDefault;
+    UINT ai_ring_capacity_ = kRingCapacityDefault;
+    int64_t decode_ahead_max_ = static_cast<int64_t>(kRingCapacityDefault) - 10;
     UINT win_width_ = 0;
     UINT win_height_ = 0;
     HWND hwnd_ = nullptr;
@@ -4004,6 +4078,7 @@ private:
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config
     int ui_cfg_max_regions_ = 1;  // (settings panel seeds edit buffers from these on open)
     float ui_cfg_cold_start_s_ = 1.0f; // cold-start skip seconds (0–3)
+    int ui_cfg_lead_ = 180; // AI buffer window (frames)
     int ui_cfg_target_fps_ = 0; // 0=original, 30, 60 (Python display mirror)
     float ui_cfg_ai_restore_fps_ = -1.0f; // net BasicVSR fps from Scheduler; <0 = unknown
     bool ui_settings_open_ = false;
@@ -4023,6 +4098,7 @@ private:
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
     float settings_edit_cold_start_s_ = 1.0f;
+    int settings_edit_lead_ = 180;
     int settings_edit_target_fps_idx_ = 0; // 0=原始, 1=30, 2=60
     // Atomic: written on the main thread (toggle_fullscreen()) but read on the PRESENT thread by
     // fit_viewport() (whether to reserve the title-bar strip) as well as the main thread
@@ -4493,7 +4569,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("set_ui_config", &Player::set_ui_config,
              py::arg("clip_length"), py::arg("max_regions"),
              py::arg("cold_start_s") = 1.0f, py::arg("target_fps") = 0,
-             py::arg("ai_restore_fps") = -1.0f)
+             py::arg("ai_restore_fps") = -1.0f, py::arg("lead") = 180)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("set_compile_ui", &Player::set_compile_ui,
              py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
@@ -4507,6 +4583,9 @@ PYBIND11_MODULE(sumu_core, m)
         .def("frame_count", &Player::frame_count)
         .def("fps", &Player::fps)
         .def("dims", &Player::dims)
+        .def("ring_capacity", &Player::ring_capacity)
+        .def("ai_ring_capacity", &Player::ai_ring_capacity)
+        .def("decode_ahead_max", &Player::decode_ahead_max)
         .def("ai_hit_rate", &Player::ai_hit_rate)
         .def("present_stats", &Player::present_stats)
         .def("stats", &Player::stats)

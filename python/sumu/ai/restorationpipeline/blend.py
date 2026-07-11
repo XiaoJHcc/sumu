@@ -120,3 +120,50 @@ def blend_back_frame(frame: ImageTensor, frame_num: int, matched_clips: list[Cli
         blend(blend_mask, clip_img, orig_clip_box)
 
     return frame
+
+
+def blend_regions_into_frame(
+    frame: ImageTensor,
+    regions: list[tuple[torch.Tensor, torch.Tensor, tuple[int, int, int, int]]],
+    restoration_model,
+) -> ImageTensor:
+    """Blend a list of (restored_crop_bgr, mask, orig_box) into `frame` (mutated, returned).
+
+    Same math as blend_back_frame's ROI path, but without Clip.pop() -- used by the scheduler's
+    sparse pending store so multiple regions per frame can accumulate before a JIT push_ai_frame.
+    Each crop/mask is already unpadded and resized to the original crop shape (scheduler job).
+    """
+    if not regions:
+        return frame
+    is_cpu_input = frame.device.type == "cpu"
+    target_dtype = torch.float32 if is_cpu_input else restoration_model.dtype
+
+    def _blend_gpu(blend_mask: torch.Tensor, clip_img: torch.Tensor, orig_clip_box: tuple[int, int, int, int]):
+        t, l, b, r = orig_clip_box
+        frame_roi = frame[t:b + 1, l:r + 1, :]
+        roi_f = frame_roi.to(dtype=restoration_model.dtype)
+        temp = clip_img.to(dtype=restoration_model.dtype, device=frame_roi.device)
+        temp.sub_(roi_f)
+        temp.mul_(blend_mask.unsqueeze(-1))
+        temp.add_(roi_f)
+        temp.round_().clamp_(0, 255)
+        frame_roi[:] = temp
+
+    def _blend_cpu(blend_mask: torch.Tensor, clip_img: torch.Tensor, orig_clip_box: tuple[int, int, int, int]):
+        blend_mask = blend_mask.cpu().numpy()
+        clip_img = clip_img.cpu().numpy()
+        t, l, b, r = orig_clip_box
+        frame_roi = frame[t:b + 1, l:r + 1, :].numpy()
+        temp_buffer = np.empty_like(frame_roi, dtype=np.float32)
+        np.subtract(clip_img, frame_roi, out=temp_buffer, dtype=np.float32)
+        np.multiply(temp_buffer, blend_mask[..., None], out=temp_buffer)
+        np.add(temp_buffer, frame_roi, out=temp_buffer)
+        frame_roi[:] = temp_buffer.astype(np.uint8)
+
+    blend = _blend_cpu if is_cpu_input else _blend_gpu
+    for clip_img, clip_mask, orig_clip_box in regions:
+        blend_mask = mask_utils.create_blend_mask(
+            clip_mask.to(device=restoration_model.device).float()
+        ).to(device=clip_img.device, dtype=target_dtype)
+        blend(blend_mask, clip_img, orig_clip_box)
+    return frame

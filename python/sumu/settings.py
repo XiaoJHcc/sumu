@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0
 #
 # Phase 6 M-E: persisted user state for the daily entrypoint (scripts/play.py) -- last volume,
-# mute state, recent-files list, and per-file last playback position (resume). Deliberately
-# stdlib-only (json/os/pathlib/tempfile + dataclasses/typing), no dependency on sumu_core/torch,
-# so this module is importable and testable in complete isolation (see scripts/verify_settings.py).
+# mute state, recent-files list, per-file last playback position (resume), and AI/scheduler knobs
+# (clip_length / max_regions / cold_start_s / lead / target_fps). Deliberately stdlib-only
+# (json/os/pathlib/tempfile + dataclasses/typing), no dependency on sumu_core/torch, so this
+# module is importable and testable in complete isolation (see scripts/verify_settings.py).
 #
 # Crash-safety invariant: settings.json is user-editable/deletable state living outside the repo.
 # A missing, empty, or corrupt file must NEVER turn a clean run into a crash -- load() always
@@ -27,6 +28,16 @@ RECENT_CAP = 10
 # temporal downsample so source_fps/N is nearest the target (never upsamples).
 TARGET_FPS_ORIGINAL = 0
 TARGET_FPS_CHOICES = (0, 30, 60)
+
+# Scheduler knobs (mirrors SchedulerConfig defaults / UI ranges). Clamps live here so settings
+# stays stdlib-only and importable without torch/scheduler.
+CLIP_LENGTH_DEFAULT = 30
+CLIP_LENGTH_MIN, CLIP_LENGTH_MAX = 1, 180
+MAX_REGIONS_DEFAULT = 1
+MAX_REGIONS_MIN, MAX_REGIONS_MAX = 1, 8
+LEAD_DEFAULT = 180  # DESIGN.md lookahead_frames
+LEAD_MIN, LEAD_MAX = 1, 180
+COLD_START_S_DEFAULT = 1.0
 
 
 def default_path() -> Path:
@@ -60,11 +71,17 @@ class Settings:
     # targets Nvidia) and reconcile against the real value once background warmup finishes.
     trt_applicable: Optional[bool] = None
     # Cold-start skip seconds (0–3): after open/seek, AI starts this many seconds ahead of the
-    # playhead. Default 1.0. Clamped on load/save; see sumu.scheduler.clamp_cold_start_s.
-    cold_start_s: float = 1.0
+    # playhead. Default 1.0. Clamped on load/save.
+    cold_start_s: float = COLD_START_S_DEFAULT
     # Desired session fps: 0 = original (no temporal downsample), 30 or 60 = pick best fps_div
     # so source_fps/div is nearest this target. Applied per-file via fps_div_for_target().
     target_fps: int = TARGET_FPS_ORIGINAL
+    # Scheduler knobs (persisted; ai_enabled is NOT -- present-side view only for the session).
+    clip_length: int = CLIP_LENGTH_DEFAULT
+    max_regions: int = MAX_REGIONS_DEFAULT
+    # AI frontier lead / buffer window (frames): stockpile restored frames for hard segments.
+    # Runtime still clamps to native decode-ahead ring (see Scheduler._effective_lead).
+    lead: int = LEAD_DEFAULT
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by normcase, cap at RECENT_CAP entries (oldest dropped).
@@ -99,10 +116,35 @@ def _clamp_cold_start_s(value) -> float:
     try:
         v = float(value)
     except (TypeError, ValueError):
-        return 1.0
+        return COLD_START_S_DEFAULT
     if v != v:  # NaN
-        return 1.0
+        return COLD_START_S_DEFAULT
     return max(0.0, min(3.0, v))
+
+
+def clamp_clip_length(value) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return CLIP_LENGTH_DEFAULT
+    return max(CLIP_LENGTH_MIN, min(CLIP_LENGTH_MAX, v))
+
+
+def clamp_max_regions(value) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return MAX_REGIONS_DEFAULT
+    return max(MAX_REGIONS_MIN, min(MAX_REGIONS_MAX, v))
+
+
+def clamp_lead(value) -> int:
+    """AI buffer window in frames (1–180). Non-numeric → LEAD_DEFAULT."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return LEAD_DEFAULT
+    return max(LEAD_MIN, min(LEAD_MAX, v))
 
 
 def clamp_target_fps(value) -> int:
@@ -204,8 +246,11 @@ def load(path: Optional[str | Path] = None) -> Settings:
             recent=_coerce_recent(data.get("recent")),
             positions=_coerce_positions(data.get("positions")),
             trt_applicable=_coerce_opt_bool(data.get("trt_applicable")),
-            cold_start_s=_clamp_cold_start_s(data.get("cold_start_s", 1.0)),
+            cold_start_s=_clamp_cold_start_s(data.get("cold_start_s", COLD_START_S_DEFAULT)),
             target_fps=_migrate_target_fps(data),
+            clip_length=clamp_clip_length(data.get("clip_length", CLIP_LENGTH_DEFAULT)),
+            max_regions=clamp_max_regions(data.get("max_regions", MAX_REGIONS_DEFAULT)),
+            lead=clamp_lead(data.get("lead", LEAD_DEFAULT)),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -228,6 +273,9 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "trt_applicable": settings.trt_applicable,
             "cold_start_s": _clamp_cold_start_s(settings.cold_start_s),
             "target_fps": clamp_target_fps(settings.target_fps),
+            "clip_length": clamp_clip_length(settings.clip_length),
+            "max_regions": clamp_max_regions(settings.max_regions),
+            "lead": clamp_lead(settings.lead),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

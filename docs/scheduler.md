@@ -48,7 +48,7 @@ D「重写」清单），但它调用的每一个计算函数（`scene_clip.py` 
 `OrderedDict`（FIFO，超容量从最旧的开始淘汰），供该帧所属 clip 完成后 `blend_back_frame`
 使用。
 
-容量 = `lead + clip_length + frame_cache_margin`（默认 `36 + 30 + 16 = 82`
+容量 = `lead + clip_length + frame_cache_margin`（默认 `180 + 30 + 16 = 226`
 帧）——推导依据：一个 clip 最坏情况在 frontier 的末尾才刚开始，其 `frame_start` 也不会早于
 `head`（否则早被 frontier 闸门追上/重置），所以只要缓存跨度覆盖 `lead + clip_length`，任何
 仍在 in-flight 状态的 clip 所需的原始帧就不会被淘汰。两次真实运行（10s、45s+seek）里
@@ -69,9 +69,9 @@ desync 或抛异常）。
 |---|---|---|
 | `clip_length` | 30 | BasicVSR++ clip 长度（TRT 引擎上限 180） |
 | `clip_size` | 256 | 送入 BasicVSR++ 的方形 crop/resize 尺寸。**锁死 256，非可调降级旋钮**——烧进 TRT 引擎编译 shape（`INPUT_SIZE`），改动需重新编译引擎 |
-| `max_regions_per_frame` | 1 | 每帧转成 scene 的 YOLO 检测数上限 |
-| `lead` | `max(clip_length, round(1.2*clip_length))` = 36 | frontier 闸门上界：`ai_frontier ∈ [head, head+lead]` |
-| `frame_cache_capacity` | `lead+clip_length+frame_cache_margin` = 82 | 见上「frame_cache」 |
+| `max_regions_per_frame` | 1 | 同帧最多同时去码的马赛克区块数（UI：同帧最多区块数） |
+| `lead` | 默认 180（UI：缓冲窗口） | frontier 闸门上界：`ai_frontier ∈ [head, head+lead]`，运行时钳到 native `decode_ahead_max`（PT 环，约 170；4K 与 1080p 同深） |
+| `frame_cache_capacity` | `lead+clip_length+frame_cache_margin` = 226 | 见上「frame_cache」 |
 | `frame_cache_margin` | 16 | 容量公式的安全余量 |
 | `sleep_step_s` | 0.0015 | 无事可做（decode 未到/frontier 太超前）时的节流 sleep |
 | `seek_jump_threshold` | 500 帧 | 兜底 discontinuity 启发式的前跳阈值 |
@@ -172,7 +172,7 @@ NV12→BGR 采集引入的 MAE（0.698-0.700）与 `docs/native_ai_input.md` 已
   长期回归基准维护，建议后续像 `docs/native_core.md` 一样多跑几次取中位数。
 - **`ai_hit_rate` 未达到 1.0**：这不被认为是 bug——`test_video.mp4` 虽然全程马赛克
   （CLAUDE.md），但 clip 化处理天然有批延迟（一个 clip 要攒够/等到场景结束才能 restore+push），
-  加上 frontier 闸门把提前量限制在 `lead=36` 帧以内，个别帧在 present 需要它的那一刻 AI 还没
+  加上 frontier 闸门把提前量限制在 `lead`（默认 180，运行时钳到 decode-ahead）帧以内，个别帧在 present 需要它的那一刻 AI 还没
   处理完，present 会退回 passthrough（`n_pt_fresh`，不是 `n_pt_stale`，即不是重复旧帧，是原始
   未去码帧）。0.96-0.97 且仍在稳定爬升是一个符合"降级不停顿"设计预期的健康结果，而非应该强行
   拉到 1.0 的缺陷。
