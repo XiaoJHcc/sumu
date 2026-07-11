@@ -238,10 +238,16 @@ std::string format_mmss(double seconds)
 {
     if (seconds < 0.0) seconds = 0.0;
     int64_t total = static_cast<int64_t>(seconds + 0.5);
-    int64_t m = total / 60;
+    int64_t h = total / 3600;
+    int64_t m = (total % 3600) / 60;
     int64_t s = total % 60;
     char buf[32];
-    snprintf(buf, sizeof(buf), "%lld:%02lld", static_cast<long long>(m), static_cast<long long>(s));
+    if (h > 0)
+        snprintf(buf, sizeof(buf), "%lld:%02lld:%02lld",
+            static_cast<long long>(h), static_cast<long long>(m), static_cast<long long>(s));
+    else
+        snprintf(buf, sizeof(buf), "%lld:%02lld",
+            static_cast<long long>(m), static_cast<long long>(s));
     return std::string(buf);
 }
 
@@ -1112,12 +1118,14 @@ public:
     // (pump input via WndProc/pump_messages(), build UI, record intents) -> take_ui_intents()
     // (drain + execute). All three run on Python's single main thread, never the present
     // thread, so ui_intents_/ui_cfg_* need no lock.
-    void set_ui_config(int clip_length, int max_regions, float cold_start_s, int target_fps = 0)
+    void set_ui_config(int clip_length, int max_regions, float cold_start_s, int target_fps = 0,
+                       float ai_restore_fps = -1.0f)
     {
         ui_cfg_clip_length_ = clip_length;
         ui_cfg_max_regions_ = max_regions;
         ui_cfg_cold_start_s_ = cold_start_s;
         ui_cfg_target_fps_ = target_fps;
+        ui_cfg_ai_restore_fps_ = ai_restore_fps; // Python Scheduler net BasicVSR fps; <0 = unknown
     }
 
     // Model-warmup-in-background status line (left-bottom float, build_status_float()):
@@ -1890,9 +1898,9 @@ private:
 
     // ---- product UI (M3) -- built on the main thread inside ui_tick(), between NewFrame()
     // and Render(). Only RECORDS intents (record_toggle_play()/record_seek()/ui_intents_.* on
-    // Apply) -- never calls play()/pause()/seek()/anything that touches transport or scheduler
-    // config directly. Python's main thread is the sole executor (see take_ui_intents() and
-    // scripts/run_player.py).
+    // settings release / combo change) -- never calls play()/pause()/seek()/anything that
+    // touches transport or scheduler config directly. Python's main thread is the sole
+    // executor (see take_ui_intents() and scripts/run_player.py).
     void build_ui()
     {
         // M-C1 / warmup-UX: no session open yet (or one was just closed) -- the normal
@@ -2064,10 +2072,10 @@ private:
             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
 
         const float margin = ui_s(12.0f);
-        // Nudge above the bottom bar (build_bottom_bar()'s bar_h) when a real session is active
-        // -- otherwise the float would sit under the auto-hidden bottom bar's hit-zone.
+        // Nudge above the bottom bar (build_bottom_bar()'s bar_h == top_bar_h()) when a real
+        // session is active -- otherwise the float would sit under the auto-hidden bottom bar.
         bool active = session_active_.load(std::memory_order_relaxed);
-        float bottom_clear = active ? ui_s(56.0f) + margin : margin;
+        float bottom_clear = active ? top_bar_h() + margin : margin;
 
         ImGui::SetNextWindowPos(ImVec2(margin, io.DisplaySize.y - bottom_clear), ImGuiCond_Always,
             ImVec2(0.0f, 1.0f));
@@ -2133,12 +2141,15 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
         // Dark gray (not pure black) so the chrome reads as a bar against the video/splash.
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(4.0f), 0.0f));
         ImGui::Begin("##sumu_top_bar", nullptr, flags);
 
         const float btn_w = ui_s(28.0f);
         const float btn_h = bar_h - ui_s(4.0f);
         const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
         const float icon_th = ui_s(1.5f);
+        // Vertically center every control in the bar (ImGui default is top-aligned).
+        ImGui::SetCursorPosY((bar_h - btn_h) * 0.5f);
 
         { // settings toggle: hamburger icon (three horizontal bars), replaces the old text button
             IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h));
@@ -2168,15 +2179,20 @@ private:
             r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(6.0f)), ImVec2(cx - ui_s(1.0f), cy - ui_s(3.0f)), icon_col, 1.0f, 0, icon_th);
         }
         ImGui::SameLine();
-        ImGui::TextUnformatted(basename_of(video_path_).c_str());
+        {
+            float th = ImGui::GetTextLineHeight();
+            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
+            ImGui::TextUnformatted(basename_of(video_path_).c_str());
+        }
         ImGui::SameLine();
+        ImGui::SetCursorPosY((bar_h - btn_h) * 0.5f);
 
         // Blank draggable region (native-titlebar-like drag), sized to leave room for the
         // four right-side buttons so it doesn't eat their clicks.
         const int n_btns = 4; // minimize, maximize/restore, fullscreen, close
         float drag_w = ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * n_btns;
         if (drag_w < 0.0f) drag_w = 0.0f;
-        ImGui::InvisibleButton("##drag_region", ImVec2(drag_w, bar_h - ui_s(4.0f)));
+        ImGui::InvisibleButton("##drag_region", ImVec2(drag_w, btn_h));
         // Publish this frame's drag rect (client-space) for WndProc's WM_NCHITTEST to consume
         // (see point_in_caption_drag()'s header comment) -- WM_NCHITTEST reporting HTCAPTION
         // here gives OS-native drag/double-click-maximize/Aero-Snap, so no synthetic
@@ -2244,17 +2260,18 @@ private:
         }
 
         ImGui::End();
+        ImGui::PopStyleVar(); // WindowPadding
         ImGui::PopStyleColor(); // WindowBg
     }
 
     // Auto-hides when the mouse leaves the bottom ~15% of the client area (simple mouse-Y-zone
     // check, per the task brief). Self-drawn progress bar (InvisibleButton + ImDrawList, not
     // SliderInt): click/drag -> frame_for_seekbar_x() -> record_seek(); playhead position ->
-    // seekbar_x_for_frame(current_frame()).
+    // seekbar_x_for_frame(current_frame()). Height matches the title bar (top_bar_h()).
     void build_bottom_bar()
     {
         ImGuiIO& io = ImGui::GetIO();
-        const float bar_h = ui_s(56.0f);
+        const float bar_h = top_bar_h();
         const float show_zone_y = io.DisplaySize.y * 0.85f;
         bool mouse_in_zone = io.MousePos.y >= show_zone_y && io.MousePos.y <= io.DisplaySize.y &&
             io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
@@ -2267,12 +2284,17 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
         // Match build_status_float(): translucent so the video shows through.
         ImGui::SetNextWindowBgAlpha(0.55f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(4.0f), 0.0f));
         ImGui::Begin("##sumu_bottom_bar", nullptr, flags);
+
+        // Row height for every control -- vertically centered in the bar.
+        const float row_h = bar_h - ui_s(4.0f);
+        ImGui::SetCursorPosY((bar_h - row_h) * 0.5f);
 
         { // play/pause: icon shows the ACTION a click performs (matches the old "Pause"/"Play"
           // text label semantics) -- playing state draws a pause glyph (two bars), paused state
           // draws a play glyph (solid triangle).
-            IconButtonResult r = icon_button("##play_pause_btn", ImVec2(ui_s(40.0f), bar_h - ui_s(8.0f)));
+            IconButtonResult r = icon_button("##play_pause_btn", ImVec2(ui_s(40.0f), row_h));
             if (r.clicked) record_toggle_play();
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
@@ -2296,8 +2318,14 @@ private:
 
         int64_t fc = frame_count();
         double fpsv = fps() > 0.0 ? fps() : 1.0;
-        ImGui::TextUnformatted(format_mmss(static_cast<double>(current_frame()) / fpsv).c_str());
+        // Align time text with the row center (ImGui text is baseline-aligned by default).
+        {
+            float th = ImGui::GetTextLineHeight();
+            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
+            ImGui::TextUnformatted(format_mmss(static_cast<double>(current_frame()) / fpsv).c_str());
+        }
         ImGui::SameLine();
+        ImGui::SetCursorPosY((bar_h - row_h) * 0.5f);
 
         // Reserve space for the trailing total-duration label so the track sizes itself first.
         std::string total_str = format_mmss(static_cast<double>(std::max<int64_t>(fc - 1, 0)) / fpsv);
@@ -2308,12 +2336,13 @@ private:
         // being overdrawn.
         const float vol_icon_w = ui_s(28.0f);
         const float vol_slider_w = ui_s(70.0f);
+        const float right_pad = ui_s(8.0f); // keep volume slider off the window edge
         float vol_ctrl_w = has_audio()
-            ? (ImGui::GetStyle().ItemSpacing.x + vol_icon_w + ImGui::GetStyle().ItemSpacing.x + vol_slider_w)
-            : 0.0f;
+            ? (ImGui::GetStyle().ItemSpacing.x + vol_icon_w + ImGui::GetStyle().ItemSpacing.x + vol_slider_w + right_pad)
+            : right_pad;
         float track_w = ImGui::GetContentRegionAvail().x - total_w - vol_ctrl_w - ImGui::GetStyle().ItemSpacing.x;
         if (track_w < ui_s(10.0f)) track_w = ui_s(10.0f);
-        const float track_h = ui_s(18.0f);
+        const float track_h = row_h;
 
         ImVec2 track_pos = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##seekbar", ImVec2(track_w, track_h));
@@ -2370,16 +2399,21 @@ private:
         }
 
         ImGui::SameLine();
-        ImGui::TextUnformatted(total_str.c_str());
+        {
+            float th = ImGui::GetTextLineHeight();
+            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
+            ImGui::TextUnformatted(total_str.c_str());
+        }
 
         if (has_audio()) {
             ImGui::SameLine();
+            ImGui::SetCursorPosY((bar_h - row_h) * 0.5f);
             { // mute icon: speaker body (small filled rect) + flare (a trapezoid, not a plain
               // triangle -- AddTriangleFilled can't produce a correct cone shape here) with
               // sound-wave arcs when unmuted, or a diagonal slash across the whole glyph when
               // muted. Click toggles native mute state directly (no UiIntents -- see
               // set_muted()'s header comment), same style language as the top-bar icons above.
-                IconButtonResult r = icon_button("##mute_btn", ImVec2(vol_icon_w, track_h));
+                IconButtonResult r = icon_button("##mute_btn", ImVec2(vol_icon_w, row_h));
                 if (r.clicked) toggle_mute();
                 float cx = (r.min.x + r.max.x) * 0.5f;
                 float cy = (r.min.y + r.max.y) * 0.5f;
@@ -2404,6 +2438,7 @@ private:
                 }
             }
             ImGui::SameLine();
+            ImGui::SetCursorPosY((bar_h - row_h) * 0.5f);
             { // volume slider: same self-drawn InvisibleButton+track+fill+handle pattern as the
               // seekbar above, but drag writes volume_ directly via set_volume() -- pure native
               // state, no record_seek()/UiIntents involved (see set_volume()'s header comment).
@@ -2427,17 +2462,19 @@ private:
         }
 
         ImGui::End();
+        ImGui::PopStyleVar(); // WindowPadding
     }
 
     void build_settings_panel(float top_bar_h)
     {
         ImGuiIO& io = ImGui::GetIO();
-        // Wider panel so left-side labels + full-width sliders fit without clipping.
-        const float panel_w = ui_s(300.0f);
+        // ~2/3 of the previous 300px panel; labels still fit with PushItemWidth(-1).
+        const float panel_w = ui_s(200.0f);
         ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
         // Auto-height to content (AlwaysAutoResize) so the panel does not cover the bottom bar.
         // Cap max height so a tiny window still scrolls rather than overflowing the client.
-        const float max_h = std::max(0.0f, io.DisplaySize.y - top_bar_h - ui_s(56.0f));
+        // bottom bar height == title bar height (kTopBarHBase).
+        const float max_h = std::max(0.0f, io.DisplaySize.y - top_bar_h - ui_s(kTopBarHBase));
         ImGui::SetNextWindowSizeConstraints(ImVec2(panel_w, 0.0f), ImVec2(panel_w, max_h));
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
@@ -2449,6 +2486,9 @@ private:
         // Staged locally in settings_edit_*_, seeded from the Python-refreshed ui_cfg_*
         // mirror only once per open (not every frame -- that would clobber an in-progress
         // edit with Python's per-tick refresh of the ACTUAL committed config).
+        // Commit on release (IsItemDeactivatedAfterEdit) / Combo selection change -- never on
+        // every slider tick -- so Python rebuilds the scheduler once per finished edit, not
+        // dozens of times while dragging.
         if (!settings_edit_init_) {
             settings_edit_clip_length_ = ui_cfg_clip_length_;
             settings_edit_max_regions_ = ui_cfg_max_regions_;
@@ -2465,12 +2505,21 @@ private:
 
         ImGui::TextUnformatted(u8"设置");
         ImGui::Separator();
-        ImGui::TextUnformatted(u8"片段长度");
+        ImGui::TextUnformatted(u8"处理片段长度(帧)");
         ImGui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
-        ImGui::TextUnformatted(u8"每帧最大区域数");
+        if (ImGui::IsItemDeactivatedAfterEdit() &&
+            settings_edit_clip_length_ != ui_cfg_clip_length_)
+            ui_intents_.clip_length = settings_edit_clip_length_;
+        ImGui::TextUnformatted(u8"每帧最多区块数");
         ImGui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
+        if (ImGui::IsItemDeactivatedAfterEdit() &&
+            settings_edit_max_regions_ != ui_cfg_max_regions_)
+            ui_intents_.max_regions = settings_edit_max_regions_;
         ImGui::TextUnformatted(u8"冷启动跳过(秒)");
         ImGui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
+        if (ImGui::IsItemDeactivatedAfterEdit() &&
+            settings_edit_cold_start_s_ != ui_cfg_cold_start_s_)
+            ui_intents_.cold_start_s = settings_edit_cold_start_s_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s",
                 u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
@@ -2478,40 +2527,37 @@ private:
         {
             const char* target_fps_items[] = { u8"原始", "30", "60" };
             ImGui::TextUnformatted(u8"目标帧率");
-            ImGui::Combo("##target_fps", &settings_edit_target_fps_idx_, target_fps_items, 3);
+            if (ImGui::Combo("##target_fps", &settings_edit_target_fps_idx_, target_fps_items, 3)) {
+                // Combo is click-select (no drag) -- commit on the selection change itself.
+                static const int kTargetFpsByIdx[] = { 0, 30, 60 };
+                int idx = settings_edit_target_fps_idx_;
+                if (idx < 0 || idx > 2) idx = 0;
+                int fps = kTargetFpsByIdx[idx];
+                if (fps != ui_cfg_target_fps_)
+                    ui_intents_.target_fps = fps;
+            }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
                 ImGui::SetTooltip("%s",
                     u8"原始 = 按片源帧率播；30/60 = 按片源自动选最佳 1/N 抽帧，\n"
                     u8"使有效帧率最接近目标（不会上采样；30fps 片选 30 仍全帧）。");
         }
 
-        // Phase 6 M-D: instant native toggle (NOT staged/Apply like the two sliders above) --
-        // each frame the local bool is re-seeded from the atomic present_loop() reads, and a
-        // change is stored straight back; see ai_enabled_'s member comment.
+        // Phase 6 M-D: instant native toggle -- each frame the local bool is re-seeded from the
+        // atomic present_loop() reads, and a change is stored straight back; see ai_enabled_'s
+        // member comment.
         bool local_ai = ai_enabled_.load(std::memory_order_relaxed);
         if (ImGui::Checkbox(u8"去码", &local_ai))
             ai_enabled_.store(local_ai, std::memory_order_relaxed);
 
-        if (ImGui::Button(u8"应用", ImVec2(-1.0f, 0.0f))) {
-            // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
-            // scheduler when it sees a non-null clip_length/max_regions/cold_start_s/target_fps,
-            // never on every slider tick.
-            ui_intents_.clip_length = settings_edit_clip_length_;
-            ui_intents_.max_regions = settings_edit_max_regions_;
-            ui_intents_.cold_start_s = settings_edit_cold_start_s_;
-            static const int kTargetFpsByIdx[] = { 0, 30, 60 };
-            int idx = settings_edit_target_fps_idx_;
-            if (idx < 0 || idx > 2) idx = 0;
-            ui_intents_.target_fps = kTargetFpsByIdx[idx];
-        }
-
         ImGui::Separator();
         ImGui::TextUnformatted(u8"诊断");
-        ImGui::Text(u8"AI 命中率：%.3f", ai_hit_rate());
-        // backlog_resyncs / clips_restored / frames_pushed are Python Scheduler.get_stats()
-        // fields (python/sumu/scheduler.py) with no native equivalent in Player::stats() and no
-        // channel carrying them into native -- intentionally not displayed here rather than
-        // fabricated (flagged in this milestone's report as a plan-vs-code gap).
+        // Net BasicVSR restore throughput from Python Scheduler (restore_clip wall time only;
+        // excludes frontier-gate sleeps). Pushed each tick via set_ui_config; <0 means no
+        // restore has finished yet (or no scheduler).
+        if (ui_cfg_ai_restore_fps_ >= 0.0f)
+            ImGui::Text(u8"AI 处理速度：%.1f fps", ui_cfg_ai_restore_fps_);
+        else
+            ImGui::TextUnformatted(u8"AI 处理速度：—");
 
         ImGui::PopItemWidth();
         ImGui::End();
@@ -3955,10 +4001,11 @@ private:
     // ---- UI product state (M3) -- main-thread-exclusive, see UiIntents' header comment. ------
     std::string video_path_;
     UiIntents ui_intents_;
-    int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
-    int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
+    int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config
+    int ui_cfg_max_regions_ = 1;  // (settings panel seeds edit buffers from these on open)
     float ui_cfg_cold_start_s_ = 1.0f; // cold-start skip seconds (0–3)
     int ui_cfg_target_fps_ = 0; // 0=original, 30, 60 (Python display mirror)
+    float ui_cfg_ai_restore_fps_ = -1.0f; // net BasicVSR fps from Scheduler; <0 = unknown
     bool ui_settings_open_ = false;
     // Seekbar scrub: last frame we already recorded a seek for during the current press.
     // -1 when the bar is not active. Suppresses hold-still re-seeks (see build_bottom_bar).
@@ -4445,7 +4492,8 @@ PYBIND11_MODULE(sumu_core, m)
         .def("path", &Player::path)
         .def("set_ui_config", &Player::set_ui_config,
              py::arg("clip_length"), py::arg("max_regions"),
-             py::arg("cold_start_s") = 1.0f, py::arg("target_fps") = 0)
+             py::arg("cold_start_s") = 1.0f, py::arg("target_fps") = 0,
+             py::arg("ai_restore_fps") = -1.0f)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("set_compile_ui", &Player::set_compile_ui,
              py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt

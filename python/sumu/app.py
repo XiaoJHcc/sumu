@@ -447,10 +447,20 @@ def main():
             else:
                 compile_ui_state = _COMPILE_UI_IDLE
                 compile_progress = 0.0
-                compile_ui_text = "尚未为你的显卡编译去码加速引擎（首次约数分钟，编完自动生效）"
+                compile_ui_text = "首次使用需要为你的显卡编译去码加速引擎（大约几分钟）"
             player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
 
-            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s, cfg_target_fps)
+            ai_restore_fps = -1.0
+            if scheduler is not None:
+                try:
+                    rfps = scheduler.get_stats().get("restore_fps")
+                    if rfps is not None:
+                        ai_restore_fps = float(rfps)
+                except Exception:  # noqa: BLE001 -- diagnostics must never break the main loop
+                    pass
+            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s, cfg_target_fps,
+                                 ai_restore_fps)
+
             player.ui_tick()
 
             intents = player.take_ui_intents()
@@ -514,8 +524,9 @@ def main():
             cold_start_s = intents.get("cold_start_s")
             target_fps = intents.get("target_fps")
             # Always commit knobs into the Python-owned cfg_* mirrors (including first-screen
-            # Apply before any file is open). Scheduler rebuild is separate and only runs when
-            # a scheduler already exists for the current file.
+            # edits before any file is open). Scheduler rebuild is separate and only runs when
+            # a scheduler already exists for the current file. Native commits on slider release
+            # / combo change (not every drag tick), so rebuild cost matches one former Apply click.
             if clip_length is not None:
                 cfg_clip_length = clip_length
             if max_regions is not None:

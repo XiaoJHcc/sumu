@@ -144,11 +144,21 @@ class SchedulerStats:
         self.backlog_resyncs = 0
         self.started_at: Optional[float] = None
         self.first_push_at: Optional[float] = None
+        # Net BasicVSR restore throughput only: wall time inside restore_clip(), excluding
+        # frontier-gate sleeps / decode-not-ready waits / YOLO / blend. restore_fps =
+        # restore_frames / restore_seconds (None until the first restore finishes).
+        self.restore_frames = 0
+        self.restore_seconds = 0.0
 
     def as_dict(self) -> dict:
         cold_start_s = (
             (self.first_push_at - self.started_at)
             if (self.started_at is not None and self.first_push_at is not None)
+            else None
+        )
+        restore_fps = (
+            (self.restore_frames / self.restore_seconds)
+            if self.restore_seconds > 0.0
             else None
         )
         return {
@@ -159,6 +169,9 @@ class SchedulerStats:
             "seek_resets": self.seek_resets,
             "backlog_resyncs": self.backlog_resyncs,
             "cold_start_s": cold_start_s,
+            "restore_frames": self.restore_frames,
+            "restore_seconds": self.restore_seconds,
+            "restore_fps": restore_fps,
         }
 
 
@@ -392,7 +405,19 @@ class Scheduler:
 
     def _restore_and_push(self, clip: Clip) -> None:
         frame_start, frame_end = clip.frame_start, clip.frame_end  # Clip.pop() mutates these
+        n_frames = frame_end - frame_start + 1
+        # Net BasicVSR wall time only (no gate wait). Synchronize so async GPU work is fully
+        # charged to this clip rather than leaking into the subsequent blend/push path.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         restore_clip(self.res_model, self.config.model_name, clip)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        if dt > 0.0 and n_frames > 0:
+            self.stats.restore_frames += n_frames
+            self.stats.restore_seconds += dt
         self.stats.clips_restored += 1
 
         for fnum in range(frame_start, frame_end + 1):
