@@ -198,12 +198,15 @@ def main():
 
         clip_length = intents["clip_length"]
         max_regions = intents["max_regions"]
-        if clip_length is not None or max_regions is not None:
+        cold_start_s = intents.get("cold_start_s")
+        if clip_length is not None or max_regions is not None or cold_start_s is not None:
             scheduler.stop()
             if clip_length is not None:
                 config.clip_length = clip_length
             if max_regions is not None:
                 config.max_regions_per_frame = max_regions
+            if cold_start_s is not None:
+                config.cold_start_s = float(cold_start_s)
             scheduler = Scheduler(
                 player, det_model, res_model, pad_mode, video_meta, config,
                 capture_correctness_samples=args.capture_samples if args.correctness else 0,
@@ -217,7 +220,7 @@ def main():
     quit_early = False
     while time.perf_counter() - t0 < args.seconds:
         player.pump_messages()
-        player.set_ui_config(config.clip_length, config.max_regions_per_frame)
+        player.set_ui_config(config.clip_length, config.max_regions_per_frame, config.cold_start_s)
         player.ui_tick()
         apply_ui_intents(player.take_ui_intents())
         if player.should_quit():
@@ -254,7 +257,7 @@ def main():
         recovered_hit_rate = None
         while time.perf_counter() - t_seek_obs0 < args.seek_observe_seconds:
             player.pump_messages()
-            player.set_ui_config(config.clip_length, config.max_regions_per_frame)
+            player.set_ui_config(config.clip_length, config.max_regions_per_frame, config.cold_start_s)
             player.ui_tick()
             apply_ui_intents(player.take_ui_intents())
             if player.should_quit():

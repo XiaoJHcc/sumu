@@ -223,6 +223,7 @@ def main():
     # warmup has handed the class over -- so nothing here forces the torch import onto startup.
     cfg_clip_length = 30
     cfg_max_regions = 1
+    cfg_cold_start_s = float(settings.cold_start_s)
     scheduler = None
     det_model = res_model = pad_mode = None
 
@@ -432,7 +433,7 @@ def main():
                 compile_ui_text = "尚未为你的显卡编译去码加速引擎（首次约数分钟，编完自动生效）"
             player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
 
-            player.set_ui_config(cfg_clip_length, cfg_max_regions)
+            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s)
             player.ui_tick()
 
             intents = player.take_ui_intents()
@@ -493,6 +494,7 @@ def main():
 
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
+            cold_start_s = intents.get("cold_start_s")
             # Always commit knobs into the Python-owned cfg_* mirrors (including first-screen
             # Apply before any file is open). Scheduler rebuild is separate and only runs when
             # a scheduler already exists for the current file.
@@ -500,13 +502,17 @@ def main():
                 cfg_clip_length = clip_length
             if max_regions is not None:
                 cfg_max_regions = max_regions
-            if (clip_length is not None or max_regions is not None) and scheduler is not None:
+            if cold_start_s is not None:
+                cfg_cold_start_s = float(cold_start_s)
+                settings.cold_start_s = cfg_cold_start_s
+            if (clip_length is not None or max_regions is not None or cold_start_s is not None) and scheduler is not None:
                 # scheduler is not None => warmup already succeeded, so warm_sched_cls/cfg_cls are
                 # set (captured in the build step below). Rebuild against a fresh SchedulerConfig
                 # carrying the updated knobs; video_meta is unchanged (same open file).
                 scheduler.stop()
                 config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
-                                            max_regions_per_frame=cfg_max_regions)
+                                            max_regions_per_frame=cfg_max_regions,
+                                            cold_start_s=cfg_cold_start_s)
                 scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                 scheduler.start()
 
@@ -527,7 +533,8 @@ def main():
                     video_meta = None
                 if video_meta is not None:
                     config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
-                                                max_regions_per_frame=cfg_max_regions)
+                                                max_regions_per_frame=cfg_max_regions,
+                                                cold_start_s=cfg_cold_start_s)
                     scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                     scheduler.start()
                 # Intentionally no auto-resume seek: open/reopen always start at frame 0.

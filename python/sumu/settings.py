@@ -54,6 +54,9 @@ class Settings:
     # main thread. So we cache the last run's answer (optimistic True on first run, since sumu
     # targets Nvidia) and reconcile against the real value once background warmup finishes.
     trt_applicable: Optional[bool] = None
+    # Cold-start skip seconds (0–3): after open/seek, AI starts this many seconds ahead of the
+    # playhead. Default 1.0. Clamped on load/save; see sumu.scheduler.clamp_cold_start_s.
+    cold_start_s: float = 1.0
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by normcase, cap at RECENT_CAP entries (oldest dropped).
@@ -80,6 +83,18 @@ def _clamp_volume(value) -> float:
     if v != v:  # NaN
         return 1.0
     return max(0.0, min(1.0, v))
+
+
+def _clamp_cold_start_s(value) -> float:
+    """0–3 seconds; non-numeric / NaN → 1.0. Kept here (not imported from scheduler) so
+    settings stays stdlib-only and importable without torch."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if v != v:  # NaN
+        return 1.0
+    return max(0.0, min(3.0, v))
 
 
 def _coerce_bool(value, default: bool) -> bool:
@@ -129,6 +144,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             recent=_coerce_recent(data.get("recent")),
             positions=_coerce_positions(data.get("positions")),
             trt_applicable=_coerce_opt_bool(data.get("trt_applicable")),
+            cold_start_s=_clamp_cold_start_s(data.get("cold_start_s", 1.0)),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -149,6 +165,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "recent": list(settings.recent)[:RECENT_CAP],
             "positions": dict(settings.positions),
             "trt_applicable": settings.trt_applicable,
+            "cold_start_s": _clamp_cold_start_s(settings.cold_start_s),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

@@ -34,6 +34,7 @@ def main():
         # 1. Round-trip
         s = settings_mod.Settings(
             volume=0.5, muted=True, recent=["a", "b", "c"], positions={"x": 1234},
+            cold_start_s=1.5,
         )
         settings_mod.save(s, settings_path)
         loaded = settings_mod.load(settings_path)
@@ -41,6 +42,7 @@ def main():
         check("round-trip muted", loaded.muted is True)
         check("round-trip recent", loaded.recent == ["a", "b", "c"])
         check("round-trip positions", loaded.positions == {"x": 1234})
+        check("round-trip cold_start_s", loaded.cold_start_s == 1.5)
 
         # 2. Corrupt/missing
         with open(settings_path, "wb") as f:
@@ -50,10 +52,21 @@ def main():
         check("corrupt file -> defaults (muted)", corrupt_loaded.muted is False)
         check("corrupt file -> defaults (recent)", corrupt_loaded.recent == [])
         check("corrupt file -> defaults (positions)", corrupt_loaded.positions == {})
+        check("corrupt file -> defaults (cold_start_s)", corrupt_loaded.cold_start_s == 1.0)
 
         os.remove(settings_path)
         missing_loaded = settings_mod.load(settings_path)
         check("missing file -> defaults", missing_loaded == settings_mod.Settings())
+
+        # 2b. cold_start_s clamp
+        s_hi = settings_mod.Settings(cold_start_s=99.0)
+        settings_mod.save(s_hi, settings_path)
+        loaded_hi = settings_mod.load(settings_path)
+        check("cold_start_s clamp high -> 3.0", loaded_hi.cold_start_s == 3.0)
+        s_lo = settings_mod.Settings(cold_start_s=-1.0)
+        settings_mod.save(s_lo, settings_path)
+        loaded_lo = settings_mod.load(settings_path)
+        check("cold_start_s clamp low -> 0.0", loaded_lo.cold_start_s == 0.0)
 
         # 3. push_recent semantics. push_recent stores os.path.abspath(path) (case-preserved,
         # "a real usable absolute path" per the spec) and dedups/orders via the case-insensitive

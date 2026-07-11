@@ -36,7 +36,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -53,6 +53,23 @@ from sumu.ai.utils.video_utils import _nv12_to_bgr_hwc_gpu
 
 logger = logging.getLogger(__name__)
 
+# Native passthrough ring is kRingCapacity=64 with kDecodeAheadMax=54 (player.cpp). AI can only
+# pull frames that still sit in that ring ahead of present head -- so cold-start skip must not
+# ask for a frame further ahead than this, or get_cuda_nv12_by_frame stays ready=False until the
+# playhead itself advances (defeating the skip). Keep a small margin under 54.
+_DECODE_AHEAD_SAFE = 50
+
+
+def clamp_cold_start_s(value) -> float:
+    """UI / settings range: 0–3 seconds. Non-numeric / NaN → default 1.0."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if v != v:  # NaN
+        return 1.0
+    return max(0.0, min(3.0, v))
+
 
 @dataclass
 class SchedulerConfig:
@@ -63,9 +80,16 @@ class SchedulerConfig:
     clip_size: int = 256           # square crop/resize size fed to BasicVSR++
     max_regions_per_frame: int = 1  # cap on YOLO detections turned into scenes per frame
 
+    # Cold-start skip (seconds, not frames/clips): after open/seek, present plays passthrough from
+    # the landing frame while AI starts at landing + round(cold_start_s * fps). Fixed wall time so
+    # UX is consistent across fps/clip_length; clamped at runtime to the native decode-ahead ring.
+    # 0 = previous behaviour (AI starts at the landing frame). UI range 0–3.
+    cold_start_s: float = 1.0
+
     # AI frontier gate (README mechanism "处理前沿闸门"): keep ai_frontier in
     # [head, head + lead]. lead is a frame count, tied to clip_length so a clip has a chance
-    # to complete and restore before playback catches up to its start.
+    # to complete and restore before playback catches up to its start. At runtime the gate also
+    # never sits below cold-start skip frames (see Scheduler._effective_lead).
     lead: Optional[int] = None  # computed in __post_init__ if left None
 
     # Bounded frame_cache: holds CUDA-resident BGR frames from get_cuda_nv12_by_frame until
@@ -99,6 +123,7 @@ class SchedulerConfig:
     model_name: str = "basicvsrpp-v1.2"
 
     def __post_init__(self):
+        self.cold_start_s = clamp_cold_start_s(self.cold_start_s)
         if self.lead is None:
             self.lead = max(self.clip_length, round(1.2 * self.clip_length))
         if self.frame_cache_capacity is None:
@@ -200,6 +225,9 @@ class Scheduler:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("Scheduler already started")
+        # Anchor AI at landing + cold-start skip (same path as seek) so open/play also skips the
+        # first ~cold_start_s of content instead of racing the playhead from frame 0.
+        self._anchor_at(self.player.current_frame())
         self.stats.started_at = time.monotonic()
         self._thread = threading.Thread(target=self._run, name="sumu-ai-scheduler", daemon=True)
         self._thread.start()
@@ -215,23 +243,56 @@ class Scheduler:
         d["ai_frontier"] = self.ai_frontier
         d["scenes_open"] = len(self.scenes)
         d["frame_cache_size"] = len(self.frame_cache)
+        d["cold_start_skip_frames"] = self._cold_start_frames()
         return d
+
+    # ---- cold-start helpers ----------------------------------------------------------------
+
+    def _cold_start_frames(self) -> int:
+        """Frames to skip after open/seek before AI starts. Fixed seconds × fps, clamped to the
+        native decode-ahead ring so the first AI pull can hit a ring slot immediately."""
+        fps = float(self.player.fps() or 0.0)
+        if fps <= 0.0:
+            fps = 30.0
+        s = clamp_cold_start_s(self.config.cold_start_s)
+        raw = int(round(s * fps))
+        return max(0, min(raw, _DECODE_AHEAD_SAFE))
+
+    def _effective_lead(self) -> int:
+        """Frontier gate upper bound: base lead, but never below cold-start skip (otherwise
+        ai_frontier = head + skip would immediately hit frontier > head+lead and sleep forever)."""
+        base = int(self.config.lead or 0)
+        return max(base, self._cold_start_frames())
+
+    def _frame_cache_cap(self) -> int:
+        cfg = self.config
+        return max(
+            int(cfg.frame_cache_capacity or 0),
+            self._effective_lead() + cfg.clip_length + cfg.frame_cache_margin,
+        )
 
     # ---- internals ------------------------------------------------------------------------
 
+    def _anchor_at(self, frame_num: int) -> None:
+        """Drop in-flight AI state and re-anchor frontier at frame_num + cold-start skip.
+        Used on start and on every seek/discontinuity (I6). Mid-stream backlog resync does NOT
+        use this -- catch-up jumps to head with no extra skip."""
+        self.scenes = []
+        self.frame_cache.clear()
+        skip = self._cold_start_frames()
+        self.ai_frontier = int(frame_num) + skip
+        self._last_head = int(frame_num)
+        self._eof_flushed_at = None
+
     def _reset_state(self, frame_num: int) -> None:
         """Seek/discontinuity handling (I6): drop every piece of in-flight AI state and
-        re-anchor the frontier at frame_num. Scenes reference frame numbers that assert
+        re-anchor the frontier with cold-start skip. Scenes reference frame numbers that assert
         strict +1 contiguity (Scene.add_frame), so any discontinuity invalidates them
         outright; frame_cache entries are keyed to frame numbers on the *old* timeline and are
         equally invalid. clip_counter is left monotonically increasing (it is only ever used
         as an opaque id, not a correctness-relevant counter, so there's no need to reset it -
         avoids any chance of colliding with a clip id already in flight through restore/blend)."""
-        self.scenes = []
-        self.frame_cache.clear()
-        self.ai_frontier = frame_num
-        self._last_head = frame_num
-        self._eof_flushed_at = None
+        self._anchor_at(frame_num)
 
     def _run(self) -> None:
         cfg = self.config
@@ -260,13 +321,14 @@ class Scheduler:
             if self.ai_frontier < head:
                 # Fell behind: don't try to catch up frame-by-frame (that would just dig the
                 # hole deeper while present has long since moved on) - jump straight to head
-                # and drop whatever was in flight (I9: degrade, don't stall).
+                # and drop whatever was in flight (I9: degrade, don't stall). No cold-start
+                # re-skip here -- that only applies to explicit open/seek anchors.
                 self.scenes = []
                 self.ai_frontier = head
                 self.stats.backlog_resyncs += 1
                 continue
 
-            if self.ai_frontier > head + cfg.lead:
+            if self.ai_frontier > head + self._effective_lead():
                 time.sleep(cfg.sleep_step_s)
                 continue
 
@@ -372,7 +434,7 @@ class Scheduler:
 
     def _cache_put(self, n: int, frame: torch.Tensor) -> None:
         self.frame_cache[n] = frame
-        cap = self.config.frame_cache_capacity
+        cap = self._frame_cache_cap()
         while len(self.frame_cache) > cap:
             evicted_n, _ = self.frame_cache.popitem(last=False)
             logger.debug("scheduler: frame_cache evicted frame %d before it was blended", evicted_n)

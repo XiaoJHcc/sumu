@@ -321,6 +321,7 @@ struct UiIntents {
     bool toggle_play = false;
     std::optional<int> clip_length;
     std::optional<int> max_regions;
+    std::optional<float> cold_start_s; // cold-start skip seconds (0–3); Python clamps
     // M-C2: a file the user wants opened (reopen), recorded by either the WM_DROPFILES handler
     // (open_path, UTF-8 path of the dropped file -- empty means none pending) or the top-bar
     // "open" button (open_dialog -- Python responds by calling the blocking pick_open_file()
@@ -1024,10 +1025,11 @@ public:
     // (pump input via WndProc/pump_messages(), build UI, record intents) -> take_ui_intents()
     // (drain + execute). All three run on Python's single main thread, never the present
     // thread, so ui_intents_/ui_cfg_* need no lock.
-    void set_ui_config(int clip_length, int max_regions)
+    void set_ui_config(int clip_length, int max_regions, float cold_start_s)
     {
         ui_cfg_clip_length_ = clip_length;
         ui_cfg_max_regions_ = max_regions;
+        ui_cfg_cold_start_s_ = cold_start_s;
     }
 
     // Model-warmup-in-background status line (left-bottom float, build_status_float()):
@@ -1053,6 +1055,7 @@ public:
         d["toggle_play"] = ui_intents_.toggle_play;
         d["clip_length"] = ui_intents_.clip_length.has_value() ? py::cast(*ui_intents_.clip_length) : py::none();
         d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
+        d["cold_start_s"] = ui_intents_.cold_start_s.has_value() ? py::cast(*ui_intents_.cold_start_s) : py::none();
         d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
         d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
         d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
@@ -2243,6 +2246,7 @@ private:
         if (!settings_edit_init_) {
             settings_edit_clip_length_ = ui_cfg_clip_length_;
             settings_edit_max_regions_ = ui_cfg_max_regions_;
+            settings_edit_cold_start_s_ = ui_cfg_cold_start_s_;
             settings_edit_init_ = true;
         }
 
@@ -2250,6 +2254,11 @@ private:
         ImGui::Separator();
         ImGui::SliderInt(u8"片段长度", &settings_edit_clip_length_, 1, 180);
         ImGui::SliderInt(u8"每帧最大区域数", &settings_edit_max_regions_, 1, 8);
+        ImGui::SliderFloat(u8"冷启动跳过(秒)", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s",
+                u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
+                u8"受解码缓冲限制，高帧率时实际跳过可能短于设定。");
 
         // Phase 6 M-D: instant native toggle (NOT staged/Apply like the two sliders above) --
         // each frame the local bool is re-seeded from the atomic present_loop() reads, and a
@@ -2260,10 +2269,11 @@ private:
 
         if (ImGui::Button(u8"应用")) {
             // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
-            // scheduler when it sees a non-null clip_length/max_regions, never on every slider
-            // tick.
+            // scheduler when it sees a non-null clip_length/max_regions/cold_start_s, never on
+            // every slider tick.
             ui_intents_.clip_length = settings_edit_clip_length_;
             ui_intents_.max_regions = settings_edit_max_regions_;
+            ui_intents_.cold_start_s = settings_edit_cold_start_s_;
         }
 
         ImGui::Separator();
@@ -3657,6 +3667,7 @@ private:
     UiIntents ui_intents_;
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
     int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
+    float ui_cfg_cold_start_s_ = 1.0f; // cold-start skip seconds (0–3)
     bool ui_settings_open_ = false;
     // Seekbar scrub: last frame we already recorded a seek for during the current press.
     // -1 when the bar is not active. Suppresses hold-still re-seeks (see build_bottom_bar).
@@ -3673,6 +3684,7 @@ private:
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
+    float settings_edit_cold_start_s_ = 1.0f;
     // Atomic: written on the main thread (toggle_fullscreen()) but read on the PRESENT thread by
     // fit_viewport() (whether to reserve the title-bar strip) as well as the main thread
     // (build_top_bar()'s auto-hide, is_fullscreen(), resize_window_for_video()). relaxed is
@@ -4119,7 +4131,8 @@ PYBIND11_MODULE(sumu_core, m)
         .def("ui_tick", &Player::ui_tick) // M2: main-thread NewFrame/build/Render/publish tick
         .def("ui_ready", &Player::ui_ready)
         .def("path", &Player::path)
-        .def("set_ui_config", &Player::set_ui_config, py::arg("clip_length"), py::arg("max_regions"))
+        .def("set_ui_config", &Player::set_ui_config,
+             py::arg("clip_length"), py::arg("max_regions"), py::arg("cold_start_s") = 1.0f)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("set_compile_ui", &Player::set_compile_ui,
              py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
