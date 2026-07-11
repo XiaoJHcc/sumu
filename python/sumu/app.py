@@ -196,7 +196,7 @@ def main():
     player = sumu_core.Player(args.width, args.height, args.maximized)
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
-    player.set_fps_div(int(settings.fps_div))
+    # fps_div is derived per open from target_fps + source_fps (not a global fixed skip).
 
     # Kick off model warmup in the background immediately -- the window is already up (Player's
     # ctor starts present_thread_) and the main loop below starts pumping messages right away, so
@@ -225,9 +225,19 @@ def main():
     cfg_clip_length = 30
     cfg_max_regions = 1
     cfg_cold_start_s = float(settings.cold_start_s)
-    cfg_fps_div = int(settings.fps_div)
+    cfg_target_fps = int(settings_mod.clamp_target_fps(settings.target_fps))
     scheduler = None
     det_model = res_model = pad_mode = None
+
+    def apply_target_fps_for_open():
+        """Map global target_fps + this file's source_fps → native fps_div (1..4)."""
+        try:
+            src = float(player.source_fps())
+        except Exception:  # noqa: BLE001
+            src = 0.0
+        div = settings_mod.fps_div_for_target(src, cfg_target_fps)
+        player.set_fps_div(div)
+        return div
 
     # On-demand TRT compile (first-screen prompt). compile_state is the live handoff while a
     # compile runs (None otherwise); trt_activated flips True once engines have been hot-swapped
@@ -284,8 +294,11 @@ def main():
         except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
             _report_open_failed(path, e)
             return
+        apply_target_fps_for_open()
         print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
-              f"dims={player.dims()}", file=sys.stderr)
+              f"dims={player.dims()} source_fps={player.source_fps():.4f} "
+              f"fps_div={player.fps_div()} target_fps={cfg_target_fps}",
+              file=sys.stderr)
         opened = True
         current_path = path
         open_error_text = ""
@@ -323,7 +336,9 @@ def main():
             current_path = None
             _report_open_failed(path, e)
             return
-        print(f"== player.reopen == frames={new_frame_count} dims={player.dims()}",
+        apply_target_fps_for_open()
+        print(f"== player.reopen == frames={new_frame_count} dims={player.dims()} "
+              f"fps={player.fps():.4f} fps_div={player.fps_div()} target_fps={cfg_target_fps}",
               file=sys.stderr)
         # video_meta recomputed lazily at scheduler-build time (see do_open's note) -- tearing the
         # scheduler down above forces the build step below to re-run against the new file.
@@ -435,7 +450,7 @@ def main():
                 compile_ui_text = "尚未为你的显卡编译去码加速引擎（首次约数分钟，编完自动生效）"
             player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
 
-            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s, cfg_fps_div)
+            player.set_ui_config(cfg_clip_length, cfg_max_regions, cfg_cold_start_s, cfg_target_fps)
             player.ui_tick()
 
             intents = player.take_ui_intents()
@@ -497,7 +512,7 @@ def main():
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
             cold_start_s = intents.get("cold_start_s")
-            fps_div = intents.get("fps_div")
+            target_fps = intents.get("target_fps")
             # Always commit knobs into the Python-owned cfg_* mirrors (including first-screen
             # Apply before any file is open). Scheduler rebuild is separate and only runs when
             # a scheduler already exists for the current file.
@@ -508,14 +523,25 @@ def main():
             if cold_start_s is not None:
                 cfg_cold_start_s = float(cold_start_s)
                 settings.cold_start_s = cfg_cold_start_s
-            if fps_div is not None:
-                cfg_fps_div = int(fps_div)
-                settings.fps_div = cfg_fps_div
-                player.set_fps_div(cfg_fps_div)
+            if target_fps is not None:
+                cfg_target_fps = settings_mod.clamp_target_fps(target_fps)
+                settings.target_fps = cfg_target_fps
+                if opened:
+                    apply_target_fps_for_open()
+                    if video_meta is not None:
+                        try:
+                            from fractions import Fraction
+                            sess_fps = float(player.fps())
+                            video_meta.video_fps = sess_fps
+                            video_meta.average_fps = sess_fps
+                            video_meta.video_fps_exact = Fraction(sess_fps).limit_denominator(1001)
+                            video_meta.frames_count = int(player.frame_count())
+                        except Exception:  # noqa: BLE001
+                            pass
             if (clip_length is not None or max_regions is not None or cold_start_s is not None
-                    or fps_div is not None) and scheduler is not None:
-                # fps_div retimes the session (native); rebuild scheduler so cold-start/lead
-                # recompute against the new player.fps()/frame_count().
+                    or target_fps is not None) and scheduler is not None:
+                # target_fps may retime the session (native fps_div); rebuild scheduler so
+                # cold-start/lead recompute against the new player.fps()/frame_count().
                 scheduler.stop()
                 config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                             max_regions_per_frame=cfg_max_regions,

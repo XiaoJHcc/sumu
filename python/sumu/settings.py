@@ -23,6 +23,11 @@ from typing import Optional
 
 RECENT_CAP = 10
 
+# Target session fps preference: 0 = keep source rate ("原始"); 30 / 60 = pick best 1/N
+# temporal downsample so source_fps/N is nearest the target (never upsamples).
+TARGET_FPS_ORIGINAL = 0
+TARGET_FPS_CHOICES = (0, 30, 60)
+
 
 def default_path() -> Path:
     """%APPDATA%/sumu/settings.json on Windows; ~/.sumu/settings.json if APPDATA is unset
@@ -57,9 +62,9 @@ class Settings:
     # Cold-start skip seconds (0–3): after open/seek, AI starts this many seconds ahead of the
     # playhead. Default 1.0. Clamped on load/save; see sumu.scheduler.clamp_cold_start_s.
     cold_start_s: float = 1.0
-    # Temporal downsample 1/N for the whole session (1 = full, 2 = half). Decode still full-rate;
-    # only every Nth frame is kept and the session is retimed so present/AI see a native lower-fps stream.
-    fps_div: int = 1
+    # Desired session fps: 0 = original (no temporal downsample), 30 or 60 = pick best fps_div
+    # so source_fps/div is nearest this target. Applied per-file via fps_div_for_target().
+    target_fps: int = TARGET_FPS_ORIGINAL
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by normcase, cap at RECENT_CAP entries (oldest dropped).
@@ -100,15 +105,41 @@ def _clamp_cold_start_s(value) -> float:
     return max(0.0, min(3.0, v))
 
 
-def _clamp_fps_div(value) -> int:
-    """1–4 integer temporal divisor. Non-numeric / out of range → 1 (full rate)."""
+def clamp_target_fps(value) -> int:
+    """0 (original) / 30 / 60. Non-numeric or unknown → 0."""
     try:
         v = int(value)
     except (TypeError, ValueError):
+        return TARGET_FPS_ORIGINAL
+    if v in TARGET_FPS_CHOICES:
+        return v
+    return TARGET_FPS_ORIGINAL
+
+
+def fps_div_for_target(source_fps: float, target_fps: int) -> int:
+    """Best integer 1..4 temporal divisor so source_fps/div is nearest target_fps.
+
+    target_fps <= 0 or unknown source → 1 (identity). Never "upsamples": if source is already
+    at or below target, div stays 1 (e.g. 30fps file + target 30 → full rate, not 15).
+    On equal error, prefers the smaller div (less aggressive skip).
+    """
+    t = clamp_target_fps(target_fps)
+    if t <= 0:
         return 1
-    if v < 1:
+    try:
+        src = float(source_fps)
+    except (TypeError, ValueError):
         return 1
-    return min(4, v)
+    if src <= 0.0 or src != src:
+        return 1
+    best_div = 1
+    best_err = abs(src - t)
+    for div in range(2, 5):
+        err = abs(src / div - t)
+        if err < best_err - 1e-9:
+            best_err = err
+            best_div = div
+    return best_div
 
 
 def _coerce_bool(value, default: bool) -> bool:
@@ -141,6 +172,21 @@ def _coerce_positions(value) -> dict[str, int]:
     return out
 
 
+def _migrate_target_fps(data: dict) -> int:
+    """Prefer target_fps; else map legacy fps_div (>1 → 30, else original)."""
+    if "target_fps" in data:
+        return clamp_target_fps(data.get("target_fps"))
+    if "fps_div" in data:
+        try:
+            d = int(data["fps_div"])
+        except (TypeError, ValueError):
+            return TARGET_FPS_ORIGINAL
+        return 30 if d > 1 else TARGET_FPS_ORIGINAL
+    if int(data.get("max_fps") or 0) > 0:
+        return 30
+    return TARGET_FPS_ORIGINAL
+
+
 def load(path: Optional[str | Path] = None) -> Settings:
     """Read+parse settings.json. NEVER raises: a missing file, unreadable file, or malformed/
     partial JSON all yield an all-defaults Settings (or, for partial JSON that parses but has
@@ -159,10 +205,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             positions=_coerce_positions(data.get("positions")),
             trt_applicable=_coerce_opt_bool(data.get("trt_applicable")),
             cold_start_s=_clamp_cold_start_s(data.get("cold_start_s", 1.0)),
-            fps_div=_clamp_fps_div(
-                data["fps_div"] if "fps_div" in data
-                else (2 if int(data.get("max_fps") or 0) > 0 else 1)
-            ),
+            target_fps=_migrate_target_fps(data),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -184,7 +227,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "positions": dict(settings.positions),
             "trt_applicable": settings.trt_applicable,
             "cold_start_s": _clamp_cold_start_s(settings.cold_start_s),
-            "fps_div": _clamp_fps_div(settings.fps_div),
+            "target_fps": clamp_target_fps(settings.target_fps),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

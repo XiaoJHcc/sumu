@@ -34,7 +34,7 @@ def main():
         # 1. Round-trip
         s = settings_mod.Settings(
             volume=0.5, muted=True, recent=["a", "b", "c"], positions={"x": 1234},
-            cold_start_s=1.5, fps_div=2,
+            cold_start_s=1.5, target_fps=30,
         )
         settings_mod.save(s, settings_path)
         loaded = settings_mod.load(settings_path)
@@ -43,7 +43,7 @@ def main():
         check("round-trip recent", loaded.recent == ["a", "b", "c"])
         check("round-trip positions", loaded.positions == {"x": 1234})
         check("round-trip cold_start_s", loaded.cold_start_s == 1.5)
-        check("round-trip fps_div", loaded.fps_div == 2)
+        check("round-trip target_fps", loaded.target_fps == 30)
 
         # 2. Corrupt/missing
         with open(settings_path, "wb") as f:
@@ -54,7 +54,7 @@ def main():
         check("corrupt file -> defaults (recent)", corrupt_loaded.recent == [])
         check("corrupt file -> defaults (positions)", corrupt_loaded.positions == {})
         check("corrupt file -> defaults (cold_start_s)", corrupt_loaded.cold_start_s == 1.0)
-        check("corrupt file -> defaults (fps_div)", corrupt_loaded.fps_div == 1)
+        check("corrupt file -> defaults (target_fps)", corrupt_loaded.target_fps == 0)
 
         os.remove(settings_path)
         missing_loaded = settings_mod.load(settings_path)
@@ -70,10 +70,25 @@ def main():
         loaded_lo = settings_mod.load(settings_path)
         check("cold_start_s clamp low -> 0.0", loaded_lo.cold_start_s == 0.0)
 
-        # 2c. fps_div clamp
-        s_div = settings_mod.Settings(fps_div=99)
-        settings_mod.save(s_div, settings_path)
-        check("fps_div clamp high -> 4", settings_mod.load(settings_path).fps_div == 4)
+        # 2c. target_fps clamp + legacy fps_div migrate
+        s_bad = settings_mod.Settings(target_fps=99)
+        settings_mod.save(s_bad, settings_path)
+        check("target_fps clamp junk -> 0", settings_mod.load(settings_path).target_fps == 0)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"fps_div": 2}, f)
+        check("legacy fps_div=2 -> target_fps 30", settings_mod.load(settings_path).target_fps == 30)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"fps_div": 1}, f)
+        check("legacy fps_div=1 -> target_fps 0", settings_mod.load(settings_path).target_fps == 0)
+
+        # 2d. fps_div_for_target (nearest 1/N, never upsample)
+        check("div: original -> 1", settings_mod.fps_div_for_target(60.0, 0) == 1)
+        check("div: 60->30 uses 2", settings_mod.fps_div_for_target(60.0, 30) == 2)
+        check("div: 50->30 uses 2 (25 closer than 50)", settings_mod.fps_div_for_target(50.0, 30) == 2)
+        check("div: 30->30 keeps 1", settings_mod.fps_div_for_target(30.0, 30) == 1)
+        check("div: 24->30 keeps 1", settings_mod.fps_div_for_target(24.0, 30) == 1)
+        check("div: 120->60 uses 2", settings_mod.fps_div_for_target(120.0, 60) == 2)
+        check("div: 120->30 uses 4", settings_mod.fps_div_for_target(120.0, 30) == 4)
 
         # 3. push_recent semantics. push_recent stores os.path.abspath(path) (case-preserved,
         # "a real usable absolute path" per the spec) and dedups/orders via the case-insensitive
@@ -116,6 +131,7 @@ def main():
         with open(settings_path, encoding="utf-8") as f:
             data = json.load(f)
         check("atomic write: target parses as valid JSON", isinstance(data, dict))
+        check("save writes target_fps not fps_div", "target_fps" in data and "fps_div" not in data)
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

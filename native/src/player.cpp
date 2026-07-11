@@ -322,7 +322,7 @@ struct UiIntents {
     std::optional<int> clip_length;
     std::optional<int> max_regions;
     std::optional<float> cold_start_s; // cold-start skip seconds (0–3); Python clamps
-    std::optional<int> fps_div; // 1=full, 2=half, 3/4; Python clamps 1–4
+    std::optional<int> target_fps; // 0=original, 30, 60; Python maps to per-file fps_div
     // M-C2: a file the user wants opened (reopen), recorded by either the WM_DROPFILES handler
     // (open_path, UTF-8 path of the dropped file -- empty means none pending) or the top-bar
     // "open" button (open_dialog -- Python responds by calling the blocking pick_open_file()
@@ -972,6 +972,10 @@ public:
         int64_t source_pos = cur * std::max(1, old);
         recompute_session_rate();
         pace_epoch_.fetch_add(1, std::memory_order_release);
+        // Scrub thumbs are keyed in session-frame space; buckets filled under the old div map
+        // to the wrong wall-clock content (e.g. div 1->2 shows ~half-time until exact hover).
+        // Drop both tiers and re-arm the coarse grid so fill_next_grid_point rewrites them.
+        invalidate_scrub_timeline();
         int64_t new_session = source_pos / std::max(1, v);
         try {
             seek(new_session);
@@ -1057,12 +1061,12 @@ public:
     // (pump input via WndProc/pump_messages(), build UI, record intents) -> take_ui_intents()
     // (drain + execute). All three run on Python's single main thread, never the present
     // thread, so ui_intents_/ui_cfg_* need no lock.
-    void set_ui_config(int clip_length, int max_regions, float cold_start_s, int fps_div = 1)
+    void set_ui_config(int clip_length, int max_regions, float cold_start_s, int target_fps = 0)
     {
         ui_cfg_clip_length_ = clip_length;
         ui_cfg_max_regions_ = max_regions;
         ui_cfg_cold_start_s_ = cold_start_s;
-        ui_cfg_fps_div_ = fps_div;
+        ui_cfg_target_fps_ = target_fps;
     }
 
     // Model-warmup-in-background status line (left-bottom float, build_status_float()):
@@ -1089,7 +1093,7 @@ public:
         d["clip_length"] = ui_intents_.clip_length.has_value() ? py::cast(*ui_intents_.clip_length) : py::none();
         d["max_regions"] = ui_intents_.max_regions.has_value() ? py::cast(*ui_intents_.max_regions) : py::none();
         d["cold_start_s"] = ui_intents_.cold_start_s.has_value() ? py::cast(*ui_intents_.cold_start_s) : py::none();
-        d["fps_div"] = ui_intents_.fps_div.has_value() ? py::cast(*ui_intents_.fps_div) : py::none();
+        d["target_fps"] = ui_intents_.target_fps.has_value() ? py::cast(*ui_intents_.target_fps) : py::none();
         d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
         d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
         d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
@@ -2289,7 +2293,9 @@ private:
             settings_edit_clip_length_ = ui_cfg_clip_length_;
             settings_edit_max_regions_ = ui_cfg_max_regions_;
             settings_edit_cold_start_s_ = ui_cfg_cold_start_s_;
-            settings_edit_fps_div_ = ui_cfg_fps_div_;
+            // Combo index: 0=原始, 1=30, 2=60
+            settings_edit_target_fps_idx_ =
+                (ui_cfg_target_fps_ == 30) ? 1 : (ui_cfg_target_fps_ == 60) ? 2 : 0;
             settings_edit_init_ = true;
         }
 
@@ -2302,11 +2308,14 @@ private:
             ImGui::SetTooltip("%s",
                 u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
                 u8"受解码缓冲限制，高帧率时实际跳过可能短于设定。");
-        ImGui::SliderInt(u8"帧率倍率 1/N", &settings_edit_fps_div_, 1, 4);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s",
-                u8"1 = 原速；2 = 半速（60→30，只保留偶数源帧）；\n"
-                u8"解码全解，输出给播放/AI 的已是降采样后的帧序列。");
+        {
+            const char* target_fps_items[] = { u8"原始", "30", "60" };
+            ImGui::Combo(u8"目标帧率", &settings_edit_target_fps_idx_, target_fps_items, 3);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                ImGui::SetTooltip("%s",
+                    u8"原始 = 按片源帧率播；30/60 = 按片源自动选最佳 1/N 抽帧，\n"
+                    u8"使有效帧率最接近目标（不会上采样；30fps 片选 30 仍全帧）。");
+        }
 
         // Phase 6 M-D: instant native toggle (NOT staged/Apply like the two sliders above) --
         // each frame the local bool is re-seeded from the atomic present_loop() reads, and a
@@ -2317,12 +2326,15 @@ private:
 
         if (ImGui::Button(u8"应用")) {
             // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
-            // scheduler when it sees a non-null clip_length/max_regions/cold_start_s/fps_div,
+            // scheduler when it sees a non-null clip_length/max_regions/cold_start_s/target_fps,
             // never on every slider tick.
             ui_intents_.clip_length = settings_edit_clip_length_;
             ui_intents_.max_regions = settings_edit_max_regions_;
             ui_intents_.cold_start_s = settings_edit_cold_start_s_;
-            ui_intents_.fps_div = settings_edit_fps_div_;
+            static const int kTargetFpsByIdx[] = { 0, 30, 60 };
+            int idx = settings_edit_target_fps_idx_;
+            if (idx < 0 || idx > 2) idx = 0;
+            ui_intents_.target_fps = kTargetFpsByIdx[idx];
         }
 
         ImGui::Separator();
@@ -3682,6 +3694,25 @@ private:
             frame_count_ = 0;
     }
 
+    // Drop scrub ring + coarse-grid bucket tags after a session-timeline change (fps_div).
+    // Textures stay allocated; fill_next_grid_point / serve_hover_bucket rewrite content.
+    // Safe to call from the main thread while scrub_thread_ is running (same mutex as producers).
+    void invalidate_scrub_timeline()
+    {
+        {
+            std::lock_guard<std::mutex> lk(scrub_cache_mutex_);
+            for (auto& e : scrub_cache_) e.bucket = -1;
+            for (auto& e : scrub_grid_) e.bucket = -1;
+            scrub_cache_next_ = 0;
+            scrub_grid_done_ = 0;
+            scrub_grid_stride_ = std::max<int64_t>(1, (frame_count_ > 1 ? frame_count_ - 1 : 1) /
+                static_cast<int64_t>(scrub_grid_slots_ > 1 ? scrub_grid_slots_ - 1 : 1));
+        }
+        scrub_request_frame_.store(-1, std::memory_order_relaxed);
+        scrub_grid_wanted_.store(true, std::memory_order_relaxed);
+        scrub_cv_.notify_one();
+    }
+
     static UINT wrap_slot(int64_t frame_num)
     {
         int64_t m = frame_num % static_cast<int64_t>(kRingCapacity);
@@ -3748,7 +3779,7 @@ private:
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config,
     int ui_cfg_max_regions_ = 1;  // shown read-only in the settings panel until Apply.
     float ui_cfg_cold_start_s_ = 1.0f; // cold-start skip seconds (0–3)
-    int ui_cfg_fps_div_ = 1;
+    int ui_cfg_target_fps_ = 0; // 0=original, 30, 60 (Python display mirror)
     bool ui_settings_open_ = false;
     // Seekbar scrub: last frame we already recorded a seek for during the current press.
     // -1 when the bar is not active. Suppresses hold-still re-seeks (see build_bottom_bar).
@@ -3766,7 +3797,7 @@ private:
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
     float settings_edit_cold_start_s_ = 1.0f;
-    int settings_edit_fps_div_ = 1;
+    int settings_edit_target_fps_idx_ = 0; // 0=原始, 1=30, 2=60
     // Atomic: written on the main thread (toggle_fullscreen()) but read on the PRESENT thread by
     // fit_viewport() (whether to reserve the title-bar strip) as well as the main thread
     // (build_top_bar()'s auto-hide, is_fullscreen(), resize_window_for_video()). relaxed is
@@ -4223,7 +4254,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("path", &Player::path)
         .def("set_ui_config", &Player::set_ui_config,
              py::arg("clip_length"), py::arg("max_regions"),
-             py::arg("cold_start_s") = 1.0f, py::arg("fps_div") = 1)
+             py::arg("cold_start_s") = 1.0f, py::arg("target_fps") = 0)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("set_compile_ui", &Player::set_compile_ui,
              py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
