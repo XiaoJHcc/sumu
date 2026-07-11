@@ -134,7 +134,9 @@ exe = EXE(
                     # are redirected to <exe dir>/sumu.log by scripts/sumu_main.py so a
                     # startup/warmup failure is still diagnosable instead of a silent exit.
     disable_windowed_traceback=False,
+    icon=os.path.join(ROOT, "assets", "generated", "sumu.ico"),
 )
+
 
 if not _fast_freeze:
     coll = COLLECT(

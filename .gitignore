@@ -61,3 +61,7 @@ presentmon_*.csv
 
 # --- copied runtime DLLs (fetched deps) ---
 *.dll
+
+# --- design sources (local only, not versioned) ---
+PSD/
+

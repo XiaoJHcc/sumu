@@ -32,6 +32,20 @@ powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1 -FastFreeze
 - `packaging/sumu.spec` — 冻结配方（见下）。
 - `packaging/rthook_dll_path.py` — 运行时 hook，把 bundle 目录塞进 PATH + `os.add_dll_directory`。
 - `scripts/build_dist.ps1` — 编排整条管线。
+- `scripts/gen_logo_assets.py` — Logo 单源流水线（见下）。
+- `assets/sumu-logo-1024.png` — **唯一可改的 Logo 源**（1024×1024 RGBA）；其余尺寸/ico/嵌入用 RGBA 由脚本生成。
+
+## Logo 单源（改一处，打包时自动更新）
+
+| 产物 | 用途 |
+|---|---|
+| `assets/generated/sumu-logo-256.png` 等 | README 标题图 / 文档 |
+| `assets/generated/sumu.ico` | Windows 可执行文件图标（PyInstaller `icon=` 嵌入 PE）+ 窗口/任务栏（`LoadIcon` 读资源 id 1） |
+| `assets/generated/sumu-logo-256.rgba` | native 编译时嵌入首屏 ImGui Logo（`native/cmake/embed_binary.cmake`） |
+
+流程：`build_dist.ps1` 第 0 步跑 `gen_logo_assets.py` → native 构建嵌入 `.rgba` → PyInstaller `icon=` 把 `.ico` 写入 `sumu.exe` 的 PE 资源表（Explorer + 运行时 `LoadIcon(hInstance, MAKEINTRESOURCE(1))`）。**分发包不再附带松散 `sumu.ico`**。开发机（pyd 无 PE 图标）仍把 `.ico` 拷到 `python/sumu/` 作 `LoadImage` 回退。
+
+
 
 ## 依赖（构建期）
 

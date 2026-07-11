@@ -42,7 +42,27 @@ add_custom_command(
     DEPENDS "${PRESENT_HLSL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_shader.cmake"
     COMMENT "Embedding present.hlsl -> present_hlsl.h"
 )
-add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}")
+
+# ---- logo embedding (assets/generated/sumu-logo-256.rgba -> logo_rgba.h) ----
+# Source of truth is assets/sumu-logo-1024.png; scripts/gen_logo_assets.py resizes it to this
+# .rgba dump. Native has no PNG decoder -- embed raw RGBA so the first-screen logo is
+# self-contained inside the pyd (same rationale as the HLSL embed above).
+set(LOGO_RGBA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../assets/generated/sumu-logo-256.rgba")
+set(LOGO_RGBA_HEADER "${GENERATED_DIR}/logo_rgba.h")
+add_custom_command(
+    OUTPUT "${LOGO_RGBA_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DIN=${LOGO_RGBA_SRC}
+        -DOUT=${LOGO_RGBA_HEADER}
+        -DVARNAME=Logo
+        -DWIDTH=256
+        -DHEIGHT=256
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
+    DEPENDS "${LOGO_RGBA_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
+    COMMENT "Embedding sumu-logo-256.rgba -> logo_rgba.h"
+)
+add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}" "${LOGO_RGBA_HEADER}")
+
 
 pybind11_add_module(sumu_core
     src/player.cpp
@@ -104,3 +124,12 @@ foreach(dll ${FFMPEG_DLLS})
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${SUMU_PY_PKG_DIR}"
     )
 endforeach()
+
+# Window/taskbar icon for the Win32 class (LoadImage from module_dir). Same file is also
+# staged next to the frozen exe by scripts/build_dist.ps1 for the PyInstaller icon=.
+add_custom_command(TARGET sumu_core POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/../assets/generated/sumu.ico"
+        "${SUMU_PY_PKG_DIR}/sumu.ico"
+)
+

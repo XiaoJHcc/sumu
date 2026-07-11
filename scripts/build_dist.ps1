@@ -55,9 +55,26 @@ function Invoke-Native([string]$CommandLine, [string]$FailMessage) {
     return $out
 }
 
+# --- 0. regenerate logo assets (single source: assets/sumu-logo-1024.png) ---------------
+# Produces assets/generated/{sumu.ico, sumu-logo-*.png, sumu-logo-256.rgba}. Native build
+# embeds the .rgba; PyInstaller uses the .ico; README points at the PNGs. Idempotent.
+Write-Host "== [0/5] regenerating logo assets (scripts/gen_logo_assets.py) ==" -ForegroundColor Cyan
+$logoSrc = Join-Path $RepoRoot "assets\sumu-logo-1024.png"
+if (-not (Test-Path $logoSrc)) {
+    Fail "source logo missing: $logoSrc (place the master 1024x1024 RGBA PNG there)"
+}
+Invoke-Native "`"$RepoRoot\.venv\Scripts\python.exe`" scripts/gen_logo_assets.py" "scripts/gen_logo_assets.py failed" | Out-Null
+$icoSrc = Join-Path $RepoRoot "assets\generated\sumu.ico"
+if (-not (Test-Path $icoSrc)) {
+    Fail "expected assets\generated\sumu.ico not produced by gen_logo_assets.py"
+}
+Write-Host "logo assets OK" -ForegroundColor Green
+
 # --- 1. native build --------------------------------------------------------
+
 if (-not $SkipNative) {
     Write-Host "== [1/5] building native extension (native/build.bat) ==" -ForegroundColor Cyan
+
     $nativeOut = Invoke-Native "native\build.bat" "native/build.bat exited with a non-zero code"
     if (-not (($nativeOut | Out-String) -match "BUILD_OK")) {
         Fail "native/build.bat did not report BUILD_OK"
@@ -124,6 +141,8 @@ if ($FastFreeze) {
     }
     Write-Host "freeze OK: $distDir" -ForegroundColor Green
 }
+
+
 
 # --- 4. stage model weights next to the exe ---------------------------------
 Write-Host "== [4/5] staging model weights from $WeightsSrc ==" -ForegroundColor Cyan

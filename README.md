@@ -1,11 +1,16 @@
+<p align="center">
+  <img src="assets/generated/sumu-logo-256.png" alt="Sumu" width="128" height="128">
+</p>
+
 <h1 align="center">Sumu</h1>
+
 
 <p align="center">
   <em>一个真正时钟驱动、全程 GPU 处理的<b>实时</b>去马赛克播放器</em>
 </p>
 
 <p align="center">
-  从内核起为「边播边去码」而设计——视频硬解、原生 D3D11 呈现、AI 全链路留 GPU、管线始终在线。
+  从内核起为「边播边去码」而设计——视频硬解、原生 D3D11 呈现、AI 全链路留 GPU、管线始终在线
 </p>
 
 ---
@@ -42,7 +47,8 @@ Sumu 换了个顺序想这件事：
 
 ## 实现
 
-围绕设计主线，sumu 认死几条原则（完整设计要点见 [DESIGN.md](DESIGN.md)）：
+### 设计原则
+围绕设计主线，sumu 认定以下原则（完整设计要点见 [DESIGN.md](DESIGN.md)）：
 
 - **播放器本身先得够好**——4K 流畅、拖动跟手，是地基。绝不为了等 AI 而暂停或拖慢。
 - **画面全程 GPU 处理**——从解码、AI 处理到最终显示，画面始终留在 GPU 显存中。这是为了最高效率。
