@@ -366,13 +366,19 @@ public:
     static constexpr int64_t kDecodeAheadMax = static_cast<int64_t>(kRingCapacity) - 10;
     static constexpr int64_t kStartBufferFrames = 5;
 
-    // Height (in client/backbuffer pixels -- ImGui DisplaySize == physical client pixels here,
-    // FramebufferScale==1) of the self-drawn top title bar. Single source of truth shared by
-    // build_top_bar() (which draws the bar), fit_viewport() (which reserves this strip so the
-    // video is letterboxed BELOW the bar instead of underneath it) and resize_window_for_video()
-    // (which adds it to the target client height so an auto-sized window shows the video 1:1
-    // with the bar sitting just above it).
-    static constexpr float kTopBarH = 32.0f;
+    // Base (96-DPI) height of the self-drawn top title bar. Runtime height is
+    // top_bar_h() = kTopBarHBase * ui_dpi_scale_ so the strip tracks the monitor scale
+    // (fonts/icons/chrome all grow with it; see apply_ui_dpi()). Shared by build_top_bar(),
+    // fit_viewport() (reserves this strip so the video is letterboxed BELOW the bar) and
+    // resize_window_for_video() (adds it to the target client height).
+    static constexpr float kTopBarHBase = 32.0f;
+
+    // UI length at the current monitor DPI (96 DPI → 1.0). Multiplies every fixed-pixel chrome
+    // constant (bars, buttons, icons, padding) so a 150%/200% Windows scale doesn't leave the
+    // overlay looking tiny. Fonts ride style.FontScaleDpi (set by apply_ui_dpi); this helper is
+    // for the self-drawn geometry that FontScaleDpi does not touch.
+    float ui_s(float v) const { return v * ui_dpi_scale_; }
+    float top_bar_h() const { return ui_s(kTopBarHBase); }
 
     Player(int width_hint, int height_hint, bool maximized)
     {
@@ -852,7 +858,7 @@ public:
     // ---- auto-size the window to the just-opened video ------------------------------------
     // Called from open_session() (main thread) once src_width_/src_height_ are known. Sizes the
     // window so the video renders point-for-point (1:1, no scaling) in the letterbox region
-    // BELOW the title bar: client = src_width_ x (src_height_ + kTopBarH). Constraints:
+    // BELOW the title bar: client = src_width_ x (src_height_ + top_bar_h()). Constraints:
     //   * width capped at 80% of the CURRENT monitor's work-area width;
     //   * the whole window must fit within that monitor's work area (height too);
     //   * when the 1:1 size exceeds either budget, the video is scaled down UNIFORMLY (aspect
@@ -862,11 +868,13 @@ public:
     // process is Per-Monitor-DPI-Aware-V2 (see create_window()), so GetMonitorInfo's rcWork and
     // the D3D backbuffer client size are both physical pixels on the SAME monitor -- no HiDPI
     // scaling conversion is needed, and MonitorFromWindow(MONITOR_DEFAULTTONEAREST) picks the
-    // monitor the window currently sits on. No-op while maximized or fullscreen (the user chose
-    // a full-area layout; auto-resizing out from under that would be wrong). Because the window
-    // is borderless (WM_NCCALCSIZE hollows the frame), window rect == client rect, so the
-    // computed client dimensions are passed straight to SetWindowPos. SetWindowPos drives WM_SIZE
-    // synchronously -> on_resize() (swapchain resize) + the WndProc ui_tick() refresh.
+    // monitor the window currently sits on. top_bar_h() already tracks ui_dpi_scale_ so the
+    // reserved strip stays the same physical height as the drawn bar. No-op while maximized or
+    // fullscreen (the user chose a full-area layout; auto-resizing out from under that would be
+    // wrong). Because the window is borderless (WM_NCCALCSIZE hollows the frame), window rect ==
+    // client rect, so the computed client dimensions are passed straight to SetWindowPos.
+    // SetWindowPos drives WM_SIZE synchronously -> on_resize() (swapchain resize) + the WndProc
+    // ui_tick() refresh.
     void resize_window_for_video()
     {
         if (!hwnd_ || fullscreen_.load(std::memory_order_relaxed) || IsZoomed(hwnd_)) return;
@@ -881,18 +889,19 @@ public:
 
         const float sw = static_cast<float>(src_width_);
         const float sh = static_cast<float>(src_height_);
+        const float bar = top_bar_h();
 
         // Budgets: width <= 80% of work area; total client height <= work area height, which
-        // leaves work_h - kTopBarH for the video itself.
+        // leaves work_h - bar for the video itself.
         const float max_w = static_cast<float>(work_w) * 0.80f;
-        const float avail_video_h = static_cast<float>(work_h) - kTopBarH;
+        const float avail_video_h = static_cast<float>(work_h) - bar;
 
         float scale = 1.0f; // 1.0 == point-for-point
         if (sw > max_w) scale = std::min(scale, max_w / sw);
         if (avail_video_h > 0.0f && sh > avail_video_h) scale = std::min(scale, avail_video_h / sh);
 
         int client_w = std::max(1, static_cast<int>(std::lround(sw * scale)));
-        int client_h = std::max(1, static_cast<int>(std::lround(sh * scale + kTopBarH)));
+        int client_h = std::max(1, static_cast<int>(std::lround(sh * scale + bar)));
 
         // Keep the window's current center where it is (don't force-center on the monitor);
         // only nudge it back onto the work area if the new size would spill off an edge.
@@ -1071,6 +1080,29 @@ public:
 
     const std::string& path() const { return video_path_; }
     bool ui_ready() const { return ui_ready_; }
+
+    // Apply Windows monitor DPI to ImGui fonts + spacing and to our self-drawn chrome.
+    // scale = dpi/96 (1.0 at 100%, 1.5 at 150%, 2.0 at 200%). Fonts: style.FontScaleDpi is the
+    // ImGui 1.92 factor that multiplies FontSizeBase without rebuilding the atlas (dynamic font
+    // sizing). Spacing: ScaleAllSizes on a fresh copy of ui_style_base_ so repeated DPI changes
+    // don't compound. Chrome (bars/buttons/icons): ui_dpi_scale_ is read by ui_s()/top_bar_h()
+    // and by fit_viewport()/resize_window_for_video(). Called from ui_init() and WM_DPICHANGED
+    // (public so WndProc can route the message here, same as on_resize/ui_tick).
+    void apply_ui_dpi(float scale)
+    {
+        if (scale < 0.5f) scale = 0.5f;
+        if (scale > 4.0f) scale = 4.0f;
+        if (std::fabs(scale - ui_dpi_scale_) < 0.001f && ui_ready_) return;
+
+        ui_dpi_scale_ = scale;
+
+        ImGuiStyle& style = ImGui::GetStyle();
+        style = ui_style_base_;
+        style.ScaleAllSizes(scale);
+        style.FontScaleDpi = scale;
+
+        fprintf(stderr, "[sumu] UI DPI scale=%.2f (font + chrome)\n", scale);
+    }
 
     // ---- UI config/intents channel (M3): main-thread-exclusive, Python-driven ---------------
     //
@@ -1739,8 +1771,9 @@ private:
         // so no license/redistribution concern. Tries a short candidate list, falling back
         // through progressively less-common CJK fonts. GetGlyphRangesChineseSimplifiedCommon()
         // (ASCII + ~2500 common simplified Han glyphs) keeps the atlas far smaller than
-        // GetGlyphRangesChineseFull() while covering filenames/UI labels. 18.0f is a reasonable
-        // starting size for a 4K target; tune if it reads too small/large in practice.
+        // GetGlyphRangesChineseFull() while covering filenames/UI labels. SizePixels is the
+        // unscaled base (18px at 96 DPI); style.FontScaleDpi multiplies it at runtime so a
+        // 150%/200% Windows scale actually enlarges the glyphs (see apply_ui_dpi()).
         static const char* kCjkFontCandidates[] = {
             "C:\\Windows\\Fonts\\msyh.ttc",
             "C:\\Windows\\Fonts\\simhei.ttf",
@@ -1771,6 +1804,11 @@ private:
         ImGui_ImplDX11_Init(device_.Get(), context_.Get());
         ImGui_ImplDX11_CreateDeviceObjects();
         create_logo_texture(); // first-screen logo SRV; must follow device objects
+        // Capture the post-StyleColorsDark metrics once so every apply_ui_dpi() call can
+        // rebuild from a clean base (ScaleAllSizes is lossy -- see its ImGui docs). Must run
+        // AFTER StyleColorsDark and BEFORE the first apply_ui_dpi below.
+        ui_style_base_ = ImGui::GetStyle();
+        apply_ui_dpi(ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd_));
         ui_ready_ = true;
     }
 
@@ -1924,21 +1962,21 @@ private:
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, std::max(0.0f, io.DisplaySize.y - top_bar_h)));
         ImGui::Begin("##sumu_open_prompt", nullptr, flags);
 
-        const float logo_draw = 160.0f;
-        const float logo_gap = 20.0f;
+        const float logo_draw = ui_s(120.0f);
+        const float logo_gap = ui_s(16.0f);
         bool have_logo = logo_srv_ != nullptr;
 
         const char* prompt = u8"拖入视频文件到此处，或";
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
-        const float open_btn_w = 120.0f, open_btn_h = 32.0f;
-        const float gap = 16.0f;
+        const float open_btn_w = ui_s(120.0f), open_btn_h = ui_s(32.0f);
+        const float gap = ui_s(16.0f);
 
         // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
         // it first so the whole prompt+button+compile block stays vertically centered.
-        const float compile_cw = 380.0f;      // content column width for the compile region
-        const float region_gap = 30.0f;       // gap between open button and the compile region
-        const float ctrl_gap = 10.0f;         // gap between the compile text line and its control
-        const float compile_btn_w = 200.0f, compile_btn_h = 30.0f, compile_bar_h = 18.0f;
+        const float compile_cw = ui_s(380.0f);      // content column width for the compile region
+        const float region_gap = ui_s(30.0f);       // gap between open button and the compile region
+        const float ctrl_gap = ui_s(10.0f);         // gap between the compile text line and its control
+        const float compile_btn_w = ui_s(200.0f), compile_btn_h = ui_s(30.0f), compile_bar_h = ui_s(18.0f);
         bool show_compile = compile_ui_state_ != 0;
         float compile_text_h = 0.0f, compile_block_h = 0.0f;
         if (show_compile) {
@@ -1977,15 +2015,15 @@ private:
             // same filled-bg + border language as the seekbar's hover thumbnail card above.
             // DrawList is screen-space; region_x/cy are window-local (SetCursorPos), so add
             // WindowPos -- without it the box sits top_bar_h above the text/button.
-            const float box_pad = 16.0f;
+            const float box_pad = ui_s(16.0f);
             float ctrl_h = (compile_ui_state_ == 2) ? compile_bar_h : compile_btn_h;
             ImVec2 wpos = ImGui::GetWindowPos();
             ImVec2 box_min(wpos.x + region_x - box_pad, wpos.y + cy - box_pad);
             ImVec2 box_max(wpos.x + region_x + compile_cw + box_pad,
                 wpos.y + cy + compile_text_h + ctrl_gap + ctrl_h + box_pad);
             ImDrawList* box_dl = ImGui::GetWindowDrawList();
-            box_dl->AddRectFilled(box_min, box_max, IM_COL32(30, 30, 30, 160), 6.0f);
-            box_dl->AddRect(box_min, box_max, IM_COL32(120, 120, 120, 180), 6.0f);
+            box_dl->AddRectFilled(box_min, box_max, IM_COL32(30, 30, 30, 160), ui_s(6.0f));
+            box_dl->AddRect(box_min, box_max, IM_COL32(120, 120, 120, 180), ui_s(6.0f));
 
             bool failed = compile_ui_state_ == 3;
             if (failed) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
@@ -2025,11 +2063,11 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs |
             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
 
-        const float margin = 12.0f;
+        const float margin = ui_s(12.0f);
         // Nudge above the bottom bar (build_bottom_bar()'s bar_h) when a real session is active
         // -- otherwise the float would sit under the auto-hidden bottom bar's hit-zone.
         bool active = session_active_.load(std::memory_order_relaxed);
-        float bottom_clear = active ? 56.0f + margin : margin;
+        float bottom_clear = active ? ui_s(56.0f) + margin : margin;
 
         ImGui::SetNextWindowPos(ImVec2(margin, io.DisplaySize.y - bottom_clear), ImGuiCond_Always,
             ImVec2(0.0f, 1.0f));
@@ -2068,7 +2106,7 @@ private:
     void build_top_bar(float& out_height)
     {
         ImGuiIO& io = ImGui::GetIO();
-        const float bar_h = kTopBarH;
+        const float bar_h = top_bar_h();
         out_height = bar_h;
 
         // Fullscreen: the title bar auto-hides and only appears when the mouse nears the TOP edge
@@ -2093,11 +2131,14 @@ private:
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        // Dark gray (not pure black) so the chrome reads as a bar against the video/splash.
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
         ImGui::Begin("##sumu_top_bar", nullptr, flags);
 
-        const float btn_w = 28.0f;
-        const float btn_h = bar_h - 4.0f;
+        const float btn_w = ui_s(28.0f);
+        const float btn_h = bar_h - ui_s(4.0f);
         const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+        const float icon_th = ui_s(1.5f);
 
         { // settings toggle: hamburger icon (three horizontal bars), replaces the old text button
             IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h));
@@ -2107,10 +2148,10 @@ private:
             }
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            const float w = 14.0f;
+            const float w = ui_s(14.0f);
             for (int i = -1; i <= 1; ++i) {
-                float y = cy + i * 5.0f;
-                r.dl->AddLine(ImVec2(cx - w * 0.5f, y), ImVec2(cx + w * 0.5f, y), icon_col, 1.5f);
+                float y = cy + i * ui_s(5.0f);
+                r.dl->AddLine(ImVec2(cx - w * 0.5f, y), ImVec2(cx + w * 0.5f, y), icon_col, icon_th);
             }
         }
         ImGui::SameLine();
@@ -2123,8 +2164,8 @@ private:
             if (r.clicked) record_open_dialog();
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            r.dl->AddRect(ImVec2(cx - 7.0f, cy - 3.0f), ImVec2(cx + 7.0f, cy + 6.0f), icon_col, 1.0f, 0, 1.5f);
-            r.dl->AddRect(ImVec2(cx - 7.0f, cy - 6.0f), ImVec2(cx - 1.0f, cy - 3.0f), icon_col, 1.0f, 0, 1.5f);
+            r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(3.0f)), ImVec2(cx + ui_s(7.0f), cy + ui_s(6.0f)), icon_col, 1.0f, 0, icon_th);
+            r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(6.0f)), ImVec2(cx - ui_s(1.0f), cy - ui_s(3.0f)), icon_col, 1.0f, 0, icon_th);
         }
         ImGui::SameLine();
         ImGui::TextUnformatted(basename_of(video_path_).c_str());
@@ -2135,7 +2176,7 @@ private:
         const int n_btns = 4; // minimize, maximize/restore, fullscreen, close
         float drag_w = ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * n_btns;
         if (drag_w < 0.0f) drag_w = 0.0f;
-        ImGui::InvisibleButton("##drag_region", ImVec2(drag_w, bar_h - 4.0f));
+        ImGui::InvisibleButton("##drag_region", ImVec2(drag_w, bar_h - ui_s(4.0f)));
         // Publish this frame's drag rect (client-space) for WndProc's WM_NCHITTEST to consume
         // (see point_in_caption_drag()'s header comment) -- WM_NCHITTEST reporting HTCAPTION
         // here gives OS-native drag/double-click-maximize/Aero-Snap, so no synthetic
@@ -2153,7 +2194,7 @@ private:
             if (r.clicked) ShowWindow(hwnd_, SW_MINIMIZE);
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            r.dl->AddLine(ImVec2(cx - 6.0f, cy), ImVec2(cx + 6.0f, cy), icon_col, 1.5f);
+            r.dl->AddLine(ImVec2(cx - ui_s(6.0f), cy), ImVec2(cx + ui_s(6.0f), cy), icon_col, icon_th);
         }
         ImGui::SameLine();
 
@@ -2164,10 +2205,10 @@ private:
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
             if (!zoomed) {
-                r.dl->AddRect(ImVec2(cx - 5.0f, cy - 5.0f), ImVec2(cx + 5.0f, cy + 5.0f), icon_col, 0.0f, 0, 1.5f);
+                r.dl->AddRect(ImVec2(cx - ui_s(5.0f), cy - ui_s(5.0f)), ImVec2(cx + ui_s(5.0f), cy + ui_s(5.0f)), icon_col, 0.0f, 0, icon_th);
             } else {
-                r.dl->AddRect(ImVec2(cx - 5.0f, cy - 3.0f), ImVec2(cx + 3.0f, cy + 5.0f), icon_col, 0.0f, 0, 1.5f);
-                r.dl->AddRect(ImVec2(cx - 3.0f, cy - 5.0f), ImVec2(cx + 5.0f, cy + 3.0f), icon_col, 0.0f, 0, 1.5f);
+                r.dl->AddRect(ImVec2(cx - ui_s(5.0f), cy - ui_s(3.0f)), ImVec2(cx + ui_s(3.0f), cy + ui_s(5.0f)), icon_col, 0.0f, 0, icon_th);
+                r.dl->AddRect(ImVec2(cx - ui_s(3.0f), cy - ui_s(5.0f)), ImVec2(cx + ui_s(5.0f), cy + ui_s(3.0f)), icon_col, 0.0f, 0, icon_th);
             }
         }
         ImGui::SameLine();
@@ -2178,7 +2219,7 @@ private:
             if (r.clicked) toggle_fullscreen();
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            const float half = 6.0f, leg = 3.5f;
+            const float half = ui_s(6.0f), leg = ui_s(3.5f);
             const ImVec2 corners[4] = {
                 ImVec2(cx - half, cy - half), ImVec2(cx + half, cy - half),
                 ImVec2(cx - half, cy + half), ImVec2(cx + half, cy + half),
@@ -2186,8 +2227,8 @@ private:
             const float dirx[4] = { 1.0f, -1.0f, 1.0f, -1.0f };
             const float diry[4] = { 1.0f, 1.0f, -1.0f, -1.0f };
             for (int i = 0; i < 4; ++i) {
-                r.dl->AddLine(corners[i], ImVec2(corners[i].x + dirx[i] * leg, corners[i].y), icon_col, 1.5f);
-                r.dl->AddLine(corners[i], ImVec2(corners[i].x, corners[i].y + diry[i] * leg), icon_col, 1.5f);
+                r.dl->AddLine(corners[i], ImVec2(corners[i].x + dirx[i] * leg, corners[i].y), icon_col, icon_th);
+                r.dl->AddLine(corners[i], ImVec2(corners[i].x, corners[i].y + diry[i] * leg), icon_col, icon_th);
             }
         }
         ImGui::SameLine();
@@ -2197,12 +2238,13 @@ private:
             if (r.clicked) PostMessageA(hwnd_, WM_CLOSE, 0, 0);
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            const float half = 5.0f;
-            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, 1.5f);
-            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, 1.5f);
+            const float half = ui_s(5.0f);
+            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
         }
 
         ImGui::End();
+        ImGui::PopStyleColor(); // WindowBg
     }
 
     // Auto-hides when the mouse leaves the bottom ~15% of the client area (simple mouse-Y-zone
@@ -2212,7 +2254,7 @@ private:
     void build_bottom_bar()
     {
         ImGuiIO& io = ImGui::GetIO();
-        const float bar_h = 56.0f;
+        const float bar_h = ui_s(56.0f);
         const float show_zone_y = io.DisplaySize.y * 0.85f;
         bool mouse_in_zone = io.MousePos.y >= show_zone_y && io.MousePos.y <= io.DisplaySize.y &&
             io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
@@ -2223,24 +2265,26 @@ private:
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        // Match build_status_float(): translucent so the video shows through.
+        ImGui::SetNextWindowBgAlpha(0.55f);
         ImGui::Begin("##sumu_bottom_bar", nullptr, flags);
 
         { // play/pause: icon shows the ACTION a click performs (matches the old "Pause"/"Play"
           // text label semantics) -- playing state draws a pause glyph (two bars), paused state
           // draws a play glyph (solid triangle).
-            IconButtonResult r = icon_button("##play_pause_btn", ImVec2(40.0f, bar_h - 8.0f));
+            IconButtonResult r = icon_button("##play_pause_btn", ImVec2(ui_s(40.0f), bar_h - ui_s(8.0f)));
             if (r.clicked) record_toggle_play();
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
             const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
             if (is_playing()) {
-                const float bar_w = 4.0f, bar_gap = 4.0f, bar_hh = 14.0f;
+                const float bar_w = ui_s(4.0f), bar_gap = ui_s(4.0f), bar_hh = ui_s(14.0f);
                 r.dl->AddRectFilled(ImVec2(cx - bar_gap * 0.5f - bar_w, cy - bar_hh * 0.5f),
                     ImVec2(cx - bar_gap * 0.5f, cy + bar_hh * 0.5f), icon_col);
                 r.dl->AddRectFilled(ImVec2(cx + bar_gap * 0.5f, cy - bar_hh * 0.5f),
                     ImVec2(cx + bar_gap * 0.5f + bar_w, cy + bar_hh * 0.5f), icon_col);
             } else {
-                const float tri_w = 12.0f, tri_hh = 14.0f;
+                const float tri_w = ui_s(12.0f), tri_hh = ui_s(14.0f);
                 r.dl->AddTriangleFilled(
                     ImVec2(cx - tri_w * 0.4f, cy - tri_hh * 0.5f),
                     ImVec2(cx - tri_w * 0.4f, cy + tri_hh * 0.5f),
@@ -2262,14 +2306,14 @@ private:
         // total-duration label -- reserve their width the same way total_w already reserves
         // room for the duration text, so the seekbar track shrinks to make room rather than
         // being overdrawn.
-        const float vol_icon_w = 28.0f;
-        const float vol_slider_w = 70.0f;
+        const float vol_icon_w = ui_s(28.0f);
+        const float vol_slider_w = ui_s(70.0f);
         float vol_ctrl_w = has_audio()
             ? (ImGui::GetStyle().ItemSpacing.x + vol_icon_w + ImGui::GetStyle().ItemSpacing.x + vol_slider_w)
             : 0.0f;
         float track_w = ImGui::GetContentRegionAvail().x - total_w - vol_ctrl_w - ImGui::GetStyle().ItemSpacing.x;
-        if (track_w < 10.0f) track_w = 10.0f;
-        const float track_h = 18.0f;
+        if (track_w < ui_s(10.0f)) track_w = ui_s(10.0f);
+        const float track_h = ui_s(18.0f);
 
         ImVec2 track_pos = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##seekbar", ImVec2(track_w, track_h));
@@ -2293,34 +2337,35 @@ private:
         }
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(ImVec2(x0, bar_y - 2.0f), ImVec2(x1, bar_y + 2.0f), IM_COL32(90, 90, 90, 255));
+        const float track_half = ui_s(2.0f);
+        dl->AddRectFilled(ImVec2(x0, bar_y - track_half), ImVec2(x1, bar_y + track_half), IM_COL32(90, 90, 90, 255));
         float played_x = seekbar_x_for_frame(current_frame(), x0, x1, fc);
-        dl->AddRectFilled(ImVec2(x0, bar_y - 2.0f), ImVec2(played_x, bar_y + 2.0f), IM_COL32(200, 200, 60, 255));
-        dl->AddCircleFilled(ImVec2(played_x, bar_y), 5.0f, IM_COL32(230, 230, 230, 255));
+        dl->AddRectFilled(ImVec2(x0, bar_y - track_half), ImVec2(played_x, bar_y + track_half), IM_COL32(200, 200, 60, 255));
+        dl->AddCircleFilled(ImVec2(played_x, bar_y), ui_s(5.0f), IM_COL32(230, 230, 230, 255));
 
         if (track_hovered || track_active) {
             float hx = std::clamp(ImGui::GetIO().MousePos.x, x0, x1);
-            dl->AddLine(ImVec2(hx, track_pos.y - 4.0f), ImVec2(hx, track_pos.y + track_h + 4.0f),
+            dl->AddLine(ImVec2(hx, track_pos.y - ui_s(4.0f)), ImVec2(hx, track_pos.y + track_h + ui_s(4.0f)),
                 IM_COL32(255, 255, 255, 160));
 
             ID3D11ShaderResourceView* thumb = get_thumbnail(frame_for_seekbar_x(hx, x0, x1, fc));
             if (thumb) {
                 // Draw on the FOREGROUND draw list, NOT this window's `dl`: the bottom bar window
-                // is only bar_h(56px) tall, so its clip rect clips anything above it -- the
+                // is only bar_h tall, so its clip rect clips anything above it -- the
                 // thumbnail sits ~100px above the track and would be entirely clipped away
                 // (that was the M4 "thumbnail never shows" bug). The foreground list is clipped
                 // only to the whole viewport and always renders on top.
                 ImDrawList* fg = ImGui::GetForegroundDrawList();
-                ImVec2 tsize(160.0f, 90.0f);
+                ImVec2 tsize(ui_s(160.0f), ui_s(90.0f));
                 float tx = std::clamp(hx - tsize.x * 0.5f, x0, std::max(x0, x1 - tsize.x));
-                ImVec2 tmin(tx, track_pos.y - 12.0f - tsize.y);
+                ImVec2 tmin(tx, track_pos.y - ui_s(12.0f) - tsize.y);
                 ImVec2 tmax(tmin.x + tsize.x, tmin.y + tsize.y);
-                const float pad = 3.0f;
+                const float pad = ui_s(3.0f);
                 fg->AddRectFilled(ImVec2(tmin.x - pad, tmin.y - pad), ImVec2(tmax.x + pad, tmax.y + pad),
-                    IM_COL32(20, 20, 20, 230), 3.0f);
+                    IM_COL32(20, 20, 20, 230), pad);
                 fg->AddImage(thumb, tmin, tmax);
                 fg->AddRect(ImVec2(tmin.x - pad, tmin.y - pad), ImVec2(tmax.x + pad, tmax.y + pad),
-                    IM_COL32(230, 230, 230, 200), 3.0f);
+                    IM_COL32(230, 230, 230, 200), pad);
             }
         }
 
@@ -2339,22 +2384,22 @@ private:
                 float cx = (r.min.x + r.max.x) * 0.5f;
                 float cy = (r.min.y + r.max.y) * 0.5f;
                 const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
-                ImVec2 body_min(cx - 9.0f, cy - 4.0f);
-                ImVec2 body_max(cx - 5.0f, cy + 4.0f);
+                ImVec2 body_min(cx - ui_s(9.0f), cy - ui_s(4.0f));
+                ImVec2 body_max(cx - ui_s(5.0f), cy + ui_s(4.0f));
                 r.dl->AddRectFilled(body_min, body_max, icon_col);
                 ImVec2 flare[4] = {
-                    ImVec2(body_max.x, cy - 2.0f), ImVec2(body_max.x, cy + 2.0f),
-                    ImVec2(body_max.x + 6.0f, cy + 7.0f), ImVec2(body_max.x + 6.0f, cy - 7.0f),
+                    ImVec2(body_max.x, cy - ui_s(2.0f)), ImVec2(body_max.x, cy + ui_s(2.0f)),
+                    ImVec2(body_max.x + ui_s(6.0f), cy + ui_s(7.0f)), ImVec2(body_max.x + ui_s(6.0f), cy - ui_s(7.0f)),
                 };
                 r.dl->AddConvexPolyFilled(flare, 4, icon_col);
                 if (is_muted()) {
-                    r.dl->AddLine(ImVec2(cx - 10.0f, cy - 9.0f), ImVec2(cx + 10.0f, cy + 9.0f),
-                        IM_COL32(230, 80, 80, 255), 1.5f);
+                    r.dl->AddLine(ImVec2(cx - ui_s(10.0f), cy - ui_s(9.0f)), ImVec2(cx + ui_s(10.0f), cy + ui_s(9.0f)),
+                        IM_COL32(230, 80, 80, 255), ui_s(1.5f));
                 } else {
                     for (int i = 0; i < 2; ++i) {
-                        float radius = 4.0f + i * 4.0f;
-                        r.dl->PathArcTo(ImVec2(body_max.x + 6.0f, cy), radius, -0.6f, 0.6f, 8);
-                        r.dl->PathStroke(icon_col, 0, 1.5f);
+                        float radius = ui_s(4.0f) + i * ui_s(4.0f);
+                        r.dl->PathArcTo(ImVec2(body_max.x + ui_s(6.0f), cy), radius, -0.6f, 0.6f, 8);
+                        r.dl->PathStroke(icon_col, 0, ui_s(1.5f));
                     }
                 }
             }
@@ -2375,9 +2420,9 @@ private:
                 float vol = get_volume();
                 float filled_x = vx0 + (vx1 - vx0) * std::clamp(vol, 0.0f, 1.0f);
                 ImDrawList* vdl = ImGui::GetWindowDrawList();
-                vdl->AddRectFilled(ImVec2(vx0, vbar_y - 2.0f), ImVec2(vx1, vbar_y + 2.0f), IM_COL32(90, 90, 90, 255));
-                vdl->AddRectFilled(ImVec2(vx0, vbar_y - 2.0f), ImVec2(filled_x, vbar_y + 2.0f), IM_COL32(200, 200, 60, 255));
-                vdl->AddCircleFilled(ImVec2(filled_x, vbar_y), 5.0f, IM_COL32(230, 230, 230, 255));
+                vdl->AddRectFilled(ImVec2(vx0, vbar_y - track_half), ImVec2(vx1, vbar_y + track_half), IM_COL32(90, 90, 90, 255));
+                vdl->AddRectFilled(ImVec2(vx0, vbar_y - track_half), ImVec2(filled_x, vbar_y + track_half), IM_COL32(200, 200, 60, 255));
+                vdl->AddCircleFilled(ImVec2(filled_x, vbar_y), ui_s(5.0f), IM_COL32(230, 230, 230, 255));
             }
         }
 
@@ -2387,11 +2432,18 @@ private:
     void build_settings_panel(float top_bar_h)
     {
         ImGuiIO& io = ImGui::GetIO();
-        const float panel_w = 260.0f;
+        // Wider panel so left-side labels + full-width sliders fit without clipping.
+        const float panel_w = ui_s(300.0f);
         ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
-        ImGui::SetNextWindowSize(ImVec2(panel_w, io.DisplaySize.y - top_bar_h));
+        // Auto-height to content (AlwaysAutoResize) so the panel does not cover the bottom bar.
+        // Cap max height so a tiny window still scrolls rather than overflowing the client.
+        const float max_h = std::max(0.0f, io.DisplaySize.y - top_bar_h - ui_s(56.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(panel_w, 0.0f), ImVec2(panel_w, max_h));
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse;
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_AlwaysAutoResize;
+        // Match build_status_float(): translucent so the video shows through.
+        ImGui::SetNextWindowBgAlpha(0.55f);
         ImGui::Begin("##sumu_settings", nullptr, flags);
 
         // Staged locally in settings_edit_*_, seeded from the Python-refreshed ui_cfg_*
@@ -2407,18 +2459,26 @@ private:
             settings_edit_init_ = true;
         }
 
+        // Label left, widget full remaining width (ImGui default is label-on-right, which
+        // squeezes long CJK labels out of a narrow panel).
+        ImGui::PushItemWidth(-1.0f);
+
         ImGui::TextUnformatted(u8"设置");
         ImGui::Separator();
-        ImGui::SliderInt(u8"片段长度", &settings_edit_clip_length_, 1, 180);
-        ImGui::SliderInt(u8"每帧最大区域数", &settings_edit_max_regions_, 1, 8);
-        ImGui::SliderFloat(u8"冷启动跳过(秒)", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
+        ImGui::TextUnformatted(u8"片段长度");
+        ImGui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
+        ImGui::TextUnformatted(u8"每帧最大区域数");
+        ImGui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
+        ImGui::TextUnformatted(u8"冷启动跳过(秒)");
+        ImGui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s",
                 u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
                 u8"受解码缓冲限制，高帧率时实际跳过可能短于设定。");
         {
             const char* target_fps_items[] = { u8"原始", "30", "60" };
-            ImGui::Combo(u8"目标帧率", &settings_edit_target_fps_idx_, target_fps_items, 3);
+            ImGui::TextUnformatted(u8"目标帧率");
+            ImGui::Combo("##target_fps", &settings_edit_target_fps_idx_, target_fps_items, 3);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
                 ImGui::SetTooltip("%s",
                     u8"原始 = 按片源帧率播；30/60 = 按片源自动选最佳 1/N 抽帧，\n"
@@ -2432,7 +2492,7 @@ private:
         if (ImGui::Checkbox(u8"去码", &local_ai))
             ai_enabled_.store(local_ai, std::memory_order_relaxed);
 
-        if (ImGui::Button(u8"应用")) {
+        if (ImGui::Button(u8"应用", ImVec2(-1.0f, 0.0f))) {
             // Only committed into ui_intents_ here -- Python only rebuilds the (expensive)
             // scheduler when it sees a non-null clip_length/max_regions/cold_start_s/target_fps,
             // never on every slider tick.
@@ -2453,6 +2513,7 @@ private:
         // channel carrying them into native -- intentionally not displayed here rather than
         // fabricated (flagged in this milestone's report as a plan-vs-code gap).
 
+        ImGui::PopItemWidth();
         ImGui::End();
     }
 
@@ -3289,14 +3350,14 @@ private:
         float sw = static_cast<float>(src_width_);
         float sh = static_cast<float>(src_height_);
         float ww = static_cast<float>(win_width_);
-        // Reserve the top strip for the self-drawn title bar (kTopBarH, drawn by build_top_bar())
+        // Reserve the top strip for the self-drawn title bar (top_bar_h(), drawn by build_top_bar())
         // so the video is letterboxed into the area BELOW it rather than being partly covered by
         // it -- the leftover strip is left black by draw_and_present()'s full-backbuffer clear and
         // the opaque top-bar ImGui window paints over it. The letterbox math runs against this
         // reduced region; region_y offsets the result downward past the bar. In fullscreen the
         // bar auto-hides (build_top_bar()) and only overlays on hover, exactly like the bottom
         // bar -- so no strip is reserved there and the video fills the whole screen.
-        float bar = fullscreen_.load(std::memory_order_relaxed) ? 0.0f : kTopBarH;
+        float bar = fullscreen_.load(std::memory_order_relaxed) ? 0.0f : top_bar_h();
         float region_y = bar;
         float wh = static_cast<float>(win_height_) - bar;
         if (sw <= 0.0f || sh <= 0.0f || ww <= 0.0f || wh <= 0.0f)
@@ -3371,7 +3432,9 @@ private:
         context_->RSSetViewports(1, &vp);
         ID3D11RenderTargetView* rtvs[] = { backbuffer_rtv_.Get() };
         context_->OMSetRenderTargets(1, rtvs, nullptr);
-        const float clear_color[4] = { 0.05f, 0.05f, 0.07f, 1.0f };
+        // Dark gray (not pure black) so first-screen chrome sits on a readable base rather than
+        // a void. Matches the title bar's WindowBg tone above.
+        const float clear_color[4] = { 0.14f, 0.14f, 0.16f, 1.0f };
         context_->ClearRenderTargetView(backbuffer_rtv_.Get(), clear_color);
 
         ui_render_drawdata();
@@ -3872,6 +3935,14 @@ private:
     bool opened_ = false;
     bool ui_ready_ = false;
     bool in_ui_tick_ = false; // re-entrancy guard for ui_tick() (see its header comment)
+    // Monitor DPI scale (dpi/96). Written by apply_ui_dpi() on the main thread; read by
+    // ui_s()/top_bar_h() on the main thread and by fit_viewport() on the present thread. Plain
+    // float is fine: only layout geometry depends on it, and a torn half-update just yields one
+    // frame of slightly-off letterboxing until the next present tick.
+    float ui_dpi_scale_ = 1.0f;
+    // Pre-ScaleAllSizes snapshot of ImGuiStyle (captured once in ui_init after StyleColorsDark).
+    // apply_ui_dpi() copies this then ScaleAllSizes(scale) so repeated DPI changes don't compound.
+    ImGuiStyle ui_style_base_{};
 
     // ---- UI draw-data handoff (M2) -- ui_pending_ is main-thread-written/present-moved-out,
     // ui_active_ is present-thread-exclusive (never touched under ui_mutex_ once moved into).
@@ -4300,6 +4371,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_DPICHANGED: {
+        // HIWORD(wp) = new DPI (Y); recommended new window rect is in *lp (system already
+        // computed it for Per-Monitor-V2). Re-apply ImGui font/style + our chrome scale, then
+        // accept the suggested rect so the client area tracks the new DPI.
+        if (self) {
+            float scale = static_cast<float>(HIWORD(wp)) / 96.0f;
+            self->apply_ui_dpi(scale);
+        }
         RECT* rc = reinterpret_cast<RECT*>(lp);
         if (rc) {
             SetWindowPos(hwnd, nullptr, rc->left, rc->top,
