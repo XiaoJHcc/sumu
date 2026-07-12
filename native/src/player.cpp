@@ -41,6 +41,7 @@
 #define NOMINMAX // windows.h's min/max macros otherwise break std::min/std::max call sites below
 #endif
 #include <windows.h>
+#include <dwmapi.h> // DwmSetWindowAttribute / DwmExtendFrameIntoClientArea (Win11 chrome)
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -51,6 +52,23 @@
 #include <shellapi.h> // DragAcceptFiles/DragQueryFileW/DragFinish (M-C2: WM_DROPFILES)
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM (WndProc's WM_NCHITTEST)
 #pragma comment(lib, "winmm.lib")
+
+// Win11 DWM corner preference (SDK may predate these; values match dwmapi.h since 10.0.22000).
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_DEFAULT
+#define DWMWCP_DEFAULT      0
+#define DWMWCP_DONOTROUND   1
+#define DWMWCP_ROUND        2 // system default rounded corners (~8px at 96 DPI)
+#define DWMWCP_ROUNDSMALL   3
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_COLOR_DEFAULT
+#define DWMWA_COLOR_DEFAULT 0xFFFFFFFF
+#endif
 
 // Audio (spike, additive): WASAPI. initguid.h MUST precede mmdeviceapi.h/audioclient.h/
 // ksmedia.h so their DEFINE_GUID macros actually instantiate storage for
@@ -1678,6 +1696,8 @@ private:
         // class Player's closing brace.
         SetWindowLongPtrA(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
         DragAcceptFiles(hwnd_, TRUE); // M-C2: enables WM_DROPFILES (see WndProc)
+        // Win11 DWM chrome (rounded corners + drop shadow) before first paint -- see apply_dwm_chrome().
+        apply_dwm_chrome(/*fullscreen=*/false);
         ShowWindow(hwnd_, maximized ? SW_SHOWMAXIMIZED : SW_SHOW);
         UpdateWindow(hwnd_);
         // Force one WM_NCCALCSIZE/WM_SIZE recalculation now that GWLP_USERDATA/WndProc's
@@ -1812,6 +1832,9 @@ private:
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         ImGui::StyleColorsDark();
+        // All ImGui::Button / Combo / slider grab chrome: 6px corners at 96 DPI
+        // (ScaleAllSizes in apply_ui_dpi multiplies this with the monitor scale).
+        ImGui::GetStyle().FrameRounding = 6.0f;
 
         // CJK glyph support -- without this, any non-ASCII text (CJK filenames picked via
         // pick_open_file(), the Chinese UI labels below) renders as tofu boxes. MUST run
@@ -2075,13 +2098,44 @@ private:
             box_dl->AddRectFilled(box_min, box_max, IM_COL32(30, 30, 30, 160), ui_s(6.0f));
             box_dl->AddRect(box_min, box_max, IM_COL32(120, 120, 120, 180), ui_s(6.0f));
 
+            // Center each wrapped line (ImGui::TextUnformatted is left-aligned in the wrap column).
             bool failed = compile_ui_state_ == 3;
             if (failed) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
-            ImGui::SetCursorPos(ImVec2(region_x, cy));
-            ImGui::PushTextWrapPos(region_x + compile_cw);
-            ImGui::TextUnformatted(compile_ui_text_.c_str());
-            ImGui::PopTextWrapPos();
+            ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
+            ImFont* font = ImGui::GetFont();
+            const float font_sz = ImGui::GetFontSize();
+            const float line_h = ImGui::GetTextLineHeight();
+            const char* s = compile_ui_text_.c_str();
+            const char* end = s + compile_ui_text_.size();
+            float draw_y = wpos.y + cy;
+            while (s < end) {
+                const char* para_end = s;
+                while (para_end < end && *para_end != '\n') ++para_end;
+                const char* line = s;
+                while (line < para_end) {
+                    const char* wrap = font->CalcWordWrapPosition(font_sz, line, para_end, compile_cw);
+                    if (wrap <= line && para_end > line) {
+                        // Force one UTF-8 codepoint so we always advance.
+                        const unsigned char c = static_cast<unsigned char>(*line);
+                        int nbytes = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2
+                            : ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xF8) == 0xF0) ? 4 : 1;
+                        wrap = line + nbytes;
+                        if (wrap > para_end) wrap = para_end;
+                    }
+                    ImVec2 lsz = font->CalcTextSizeA(font_sz, FLT_MAX, 0.0f, line, wrap);
+                    float lx = wpos.x + region_x + (compile_cw - lsz.x) * 0.5f;
+                    box_dl->AddText(font, font_sz, ImVec2(lx, draw_y), text_col, line, wrap);
+                    draw_y += line_h;
+                    if (wrap >= para_end) break;
+                    line = wrap;
+                    while (line < para_end && (*line == ' ' || *line == '\t')) ++line;
+                }
+                s = (para_end < end && *para_end == '\n') ? para_end + 1 : para_end;
+            }
             if (failed) ImGui::PopStyleColor();
+            // Reserve layout space so the button/progress bar below still lands at cy2.
+            ImGui::SetCursorPos(ImVec2(region_x, cy));
+            ImGui::Dummy(ImVec2(compile_cw, compile_text_h));
 
             float cy2 = cy + compile_text_h + ctrl_gap;
             if (compile_ui_state_ == 2) {
@@ -2149,7 +2203,7 @@ private:
         r.max = ImGui::GetItemRectMax();
         r.dl = ImGui::GetWindowDrawList();
         if (ImGui::IsItemHovered())
-            r.dl->AddRectFilled(r.min, r.max, IM_COL32(255, 255, 255, 30));
+            r.dl->AddRectFilled(r.min, r.max, IM_COL32(255, 255, 255, 30), ui_s(6.0f));
         return r;
     }
 
@@ -2548,16 +2602,21 @@ private:
 
         ImGui::TextUnformatted(u8"设置");
         ImGui::Separator();
-        ImGui::TextUnformatted(u8"缓冲窗口(帧)");
+        // Gap between a field's label and the previous row's slider (label↔own control stays tight).
+        const float field_gap = ui_s(6.0f);
+        auto settings_label = [&](const char* label) {
+            ImGui::Dummy(ImVec2(0.0f, field_gap));
+            ImGui::TextUnformatted(label);
+        };
+        settings_label(u8"缓冲窗口（帧）");
         ImGui::SliderInt("##lead", &settings_edit_lead_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_lead_ != ui_cfg_lead_)
             ui_intents_.lead = settings_edit_lead_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s",
-                u8"AI 相对播放头的超前缓冲（帧）。简单段囤去码帧给难段消费。\n"
-                u8"实际不超过解码超前环（PT 环深度；4K 亦约 170）。");
-        ImGui::TextUnformatted(u8"处理片段长度(帧)");
+                u8"AI 相对播放头的超前缓冲（帧数），简单段囤去码帧给难段消费。");
+        settings_label(u8"处理片段长度（帧）");
         ImGui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_clip_length_ != ui_cfg_clip_length_)
@@ -2566,26 +2625,25 @@ private:
             ImGui::SetTooltip("%s",
                 u8"BasicVSR++ 每批处理的连续帧数。更短响应更快、画面更易\n"
                 u8"规律抖动；更长更稳但首批延迟更高（TRT 上限 180）。");
-        ImGui::TextUnformatted(u8"同帧最多区块数");
+        settings_label(u8"同帧最多区块数");
         ImGui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_max_regions_ != ui_cfg_max_regions_)
             ui_intents_.max_regions = settings_edit_max_regions_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s",
-                u8"同一帧最多同时去码的马赛克区块数。调高消耗近似线性倍增。");
-        ImGui::TextUnformatted(u8"冷启动跳过(秒)");
+                u8"同一帧最多同时去码的马赛克区块数，调高性能消耗将会倍增。");
+        settings_label(u8"冷启动跳过（秒）");
         ImGui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_cold_start_s_ != ui_cfg_cold_start_s_)
             ui_intents_.cold_start_s = settings_edit_cold_start_s_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s",
-                u8"开播/seek 后先播原片，AI 从该秒数之后起跑。\n"
-                u8"跳过帧数 = 秒×帧率，且不超过解码超前环（约 170 帧）。");
+                u8"拖动进度条后先播原片，AI 从该秒数之后起跑。");
         {
             const char* target_fps_items[] = { u8"原始", "30", "60" };
-            ImGui::TextUnformatted(u8"目标帧率");
+            settings_label(u8"目标帧率");
             if (ImGui::Combo("##target_fps", &settings_edit_target_fps_idx_, target_fps_items, 3)) {
                 // Combo is click-select (no drag) -- commit on the selection change itself.
                 static const int kTargetFpsByIdx[] = { 0, 30, 60 };
@@ -2604,9 +2662,9 @@ private:
         // Phase 6 M-D: instant native toggle -- each frame the local bool is re-seeded from the
         // atomic present_loop() reads, and a change is stored straight back; see ai_enabled_'s
         // member comment.
-        bool local_ai = ai_enabled_.load(std::memory_order_relaxed);
-        if (ImGui::Checkbox(u8"去码", &local_ai))
-            ai_enabled_.store(local_ai, std::memory_order_relaxed);
+        // bool local_ai = ai_enabled_.load(std::memory_order_relaxed);
+        // if (ImGui::Checkbox(u8"去码", &local_ai))
+        //     ai_enabled_.store(local_ai, std::memory_order_relaxed);
 
         ImGui::Separator();
         ImGui::TextUnformatted(u8"诊断");
@@ -2620,6 +2678,34 @@ private:
 
         ImGui::PopItemWidth();
         ImGui::End();
+    }
+
+    // Win11 DWM window chrome for the borderless (hollow-NC) client: system rounded corners
+    // (~8px at 96 DPI via DWMWCP_ROUND) and a drop shadow. WS_THICKFRAME alone usually keeps
+    // the shadow, but WM_NCCALCSIZE hollowing can drop it -- a 1px frame extension re-arms DWM
+    // composition without turning the whole client into glass. Fullscreen disables both.
+    void apply_dwm_chrome(bool fullscreen)
+    {
+        if (!hwnd_) return;
+
+        // DWMWCP_ROUND = Win11 default window rounding; DONOTROUND for edge-to-edge fullscreen.
+        // Harmless no-op on Win10 (DwmSetWindowAttribute returns E_INVALIDARG for unknown attrs).
+        int corner = fullscreen ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+
+        // System-default thin border color (matches accent / dark-mode theme).
+        COLORREF border = DWMWA_COLOR_DEFAULT;
+        DwmSetWindowAttribute(hwnd_, DWMWA_BORDER_COLOR, &border, sizeof(border));
+
+        if (fullscreen) {
+            MARGINS m = {0, 0, 0, 0};
+            DwmExtendFrameIntoClientArea(hwnd_, &m);
+        } else {
+            // 1px on each side is enough to keep the DWM drop shadow while the client remains
+            // fully opaque under the flip-model swapchain (AlphaMode = IGNORE).
+            MARGINS m = {1, 1, 1, 1};
+            DwmExtendFrameIntoClientArea(hwnd_, &m);
+        }
     }
 
     // Borderless fill-monitor fullscreen toggle -- explicitly NOT exclusive fullscreen (no mode
@@ -2639,6 +2725,7 @@ private:
             // size already sees fullscreen_==true and lays out the auto-hiding bar / full-screen
             // video (fit_viewport()) correctly, with no one-frame transient.
             fullscreen_.store(true, std::memory_order_relaxed);
+            apply_dwm_chrome(/*fullscreen=*/true);
             SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_ & ~(WS_CAPTION | WS_THICKFRAME |
                 WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU));
             SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
@@ -2646,6 +2733,7 @@ private:
                 SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
         } else {
             fullscreen_.store(false, std::memory_order_relaxed); // before SetWindowPos, see above
+            apply_dwm_chrome(/*fullscreen=*/false);
             SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_);
             SetWindowPos(hwnd_, nullptr, windowed_rect_.left, windowed_rect_.top,
                 windowed_rect_.right - windowed_rect_.left, windowed_rect_.bottom - windowed_rect_.top,
