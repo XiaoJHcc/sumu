@@ -1196,6 +1196,13 @@ public:
     void record_open_path(const std::string& path) { ui_intents_.open_path = path; }
     void record_open_dialog() { ui_intents_.open_dialog = true; }
     void record_compile_engine() { ui_intents_.compile_engine = true; }
+    void request_open_url_popup()
+    {
+        open_url_popup_ = true;
+        open_url_focus_ = true;
+        open_url_show_error_ = false;
+        open_url_buf_[0] = '\0';
+    }
 
     const std::string& path() const { return video_path_; }
     // True when the current session opened an http(s) URL (shallow ring, no scrub).
@@ -1277,6 +1284,12 @@ public:
         take("splash_loading", ui_str_.splash_loading);
         take("open_prompt", ui_str_.open_prompt);
         take("open_file", ui_str_.open_file);
+        take("open_url", ui_str_.open_url);
+        take("open_url_title", ui_str_.open_url_title);
+        take("open_url_hint", ui_str_.open_url_hint);
+        take("open_url_ok", ui_str_.open_url_ok);
+        take("open_url_cancel", ui_str_.open_url_cancel);
+        take("open_url_invalid", ui_str_.open_url_invalid);
         take("compile_retry", ui_str_.compile_retry);
         take("compile_engine", ui_str_.compile_engine);
         take("settings_title", ui_str_.settings_title);
@@ -2095,6 +2108,7 @@ private:
             if (ui_settings_open_) build_settings_panel(top_bar_h);
             build_bottom_bar();
         }
+        build_open_url_popup(); // modal above chrome; first-screen + live session both use it
         build_status_float(); // model-warmup status line -- drawn in every branch above
     }
 
@@ -2145,7 +2159,10 @@ private:
         const char* prompt = ui_str_.open_prompt.c_str();
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
         const float open_btn_w = ui_s(120.0f), open_btn_h = ui_s(32.0f);
+        const float open_btn_gap = ui_s(12.0f);
         const float gap = ui_s(16.0f);
+        // Two side-by-side open buttons: local file + network URL.
+        const float open_row_w = open_btn_w * 2.0f + open_btn_gap;
 
         // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
         // it first so the whole prompt+button+compile block stays vertically centered.
@@ -2179,8 +2196,12 @@ private:
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, y));
         ImGui::TextUnformatted(prompt);
 
-        ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - open_btn_w) * 0.5f, y + tsize.y + gap));
+        const float open_row_x = (io.DisplaySize.x - open_row_w) * 0.5f;
+        const float open_row_y = y + tsize.y + gap;
+        ImGui::SetCursorPos(ImVec2(open_row_x, open_row_y));
         if (ImGui::Button(ui_str_.open_file.c_str(), ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
+        ImGui::SameLine(0.0f, open_btn_gap);
+        if (ImGui::Button(ui_str_.open_url.c_str(), ImVec2(open_btn_w, open_btn_h))) request_open_url_popup();
 
         if (show_compile) {
             float region_x = (io.DisplaySize.x - compile_cw) * 0.5f;
@@ -2255,6 +2276,127 @@ private:
         }
 
         ImGui::End();
+    }
+
+    // Open-URL modal: first-screen "打开 URL" button and top-bar link icon both call
+    // request_open_url_popup(). Confirm trims the buffer, requires http(s)://, then writes
+    // ui_intents_.open_path so Python reuses the existing drop/open path (do_open/do_reopen).
+    // Cancel / Esc / outside click only close the popup -- no transport side effects.
+    // Popup id uses ### so the i18n title can change without breaking OpenPopup matching.
+    void build_open_url_popup()
+    {
+        if (open_url_popup_) {
+            ImGui::OpenPopup("###sumu_open_url");
+            open_url_popup_ = false; // OpenPopup is sticky until EndPopup; re-arm only on next request
+        }
+
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(ui_s(480.0f), 0.0f), ImGuiCond_Appearing);
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+        const std::string modal_title =
+            (ui_str_.open_url_title.empty() ? std::string("Open URL") : ui_str_.open_url_title)
+            + "###sumu_open_url";
+        if (!ImGui::BeginPopupModal(modal_title.c_str(), nullptr, flags)) {
+            return;
+        }
+
+        if (!ui_str_.open_url_hint.empty()) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + ui_s(440.0f));
+            ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+        }
+
+        if (open_url_focus_) {
+            ImGui::SetKeyboardFocusHere();
+            open_url_focus_ = false;
+        }
+        ImGui::SetNextItemWidth(ui_s(440.0f));
+        bool enter = ImGui::InputText("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        if (open_url_show_error_ && !ui_str_.open_url_invalid.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
+            ImGui::TextUnformatted(ui_str_.open_url_invalid.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Spacing();
+        const float btn_w = ui_s(100.0f);
+        const float btn_h = ui_s(28.0f);
+        const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+            std::max(0.0f, (ImGui::GetContentRegionAvail().x - row_w) * 0.5f));
+
+        auto trim_url = [](const char* raw) -> std::string {
+            std::string s(raw ? raw : "");
+            // Strip leading/trailing whitespace and common surrounding quotes from paste.
+            auto is_ws = [](unsigned char c) {
+                return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+            };
+            size_t a = 0, b = s.size();
+            while (a < b && is_ws(static_cast<unsigned char>(s[a]))) ++a;
+            while (b > a && is_ws(static_cast<unsigned char>(s[b - 1]))) --b;
+            s = s.substr(a, b - a);
+            if (s.size() >= 2) {
+                char q0 = s.front(), q1 = s.back();
+                if ((q0 == '"' && q1 == '"') || (q0 == '\'' && q1 == '\''))
+                    s = s.substr(1, s.size() - 2);
+            }
+            return s;
+        };
+        auto looks_http = [](const std::string& s) {
+            if (s.size() < 8) return false;
+            // Case-insensitive scheme check without locale-dependent tolower on the whole string.
+            auto eq_ci = [](char a, char b) {
+                auto up = [](char c) {
+                    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+                };
+                return up(a) == up(b);
+            };
+            const char* http = "http://";
+            const char* https = "https://";
+            bool is_http = true, is_https = true;
+            for (int i = 0; http[i]; ++i)
+                if (i >= static_cast<int>(s.size()) || !eq_ci(s[static_cast<size_t>(i)], http[i]))
+                    is_http = false;
+            for (int i = 0; https[i]; ++i)
+                if (i >= static_cast<int>(s.size()) || !eq_ci(s[static_cast<size_t>(i)], https[i]))
+                    is_https = false;
+            return is_http || is_https;
+        };
+
+        bool do_ok = enter;
+        if (ImGui::Button(ui_str_.open_url_ok.empty() ? "Open" : ui_str_.open_url_ok.c_str(),
+                ImVec2(btn_w, btn_h))) {
+            do_ok = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ui_str_.open_url_cancel.empty() ? "Cancel" : ui_str_.open_url_cancel.c_str(),
+                ImVec2(btn_w, btn_h))) {
+            open_url_show_error_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        if (do_ok) {
+            std::string url = trim_url(open_url_buf_);
+            if (!looks_http(url)) {
+                open_url_show_error_ = true;
+            } else {
+                open_url_show_error_ = false;
+                record_open_path(url);
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        // Esc closes BeginPopupModal by default when IsPopupOpen; also honor it explicitly.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            open_url_show_error_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
     }
 
     // Model-warmup status line (left-bottom float): built every build_ui() call (see its header
@@ -2375,10 +2517,28 @@ private:
           // (see UiIntents' header comment; present keeps showing the current video meanwhile).
             IconButtonResult r = icon_button("##open_btn", ImVec2(btn_w, btn_h));
             if (r.clicked) record_open_dialog();
+            if (ImGui::IsItemHovered() && !ui_str_.open_file.empty())
+                ImGui::SetTooltip("%s", ui_str_.open_file.c_str());
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
             r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(3.0f)), ImVec2(cx + ui_s(7.0f), cy + ui_s(6.0f)), icon_col, 1.0f, 0, icon_th);
             r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(6.0f)), ImVec2(cx - ui_s(1.0f), cy - ui_s(3.0f)), icon_col, 1.0f, 0, icon_th);
+        }
+        ImGui::SameLine();
+        { // Network URL open: chain-link glyph next to the folder button. Opens the ImGui
+          // URL popup (build_open_url_popup); on confirm writes open_path for Python.
+            IconButtonResult r = icon_button("##open_url_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) request_open_url_popup();
+            if (ImGui::IsItemHovered() && !ui_str_.open_url.empty())
+                ImGui::SetTooltip("%s", ui_str_.open_url.c_str());
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            // Two small overlapping rings (link icon), hollow-rect weight matching neighbors.
+            const float r_link = ui_s(4.2f);
+            const float dx = ui_s(2.4f);
+            const float dy = ui_s(2.0f);
+            r.dl->AddCircle(ImVec2(cx - dx, cy + dy), r_link, icon_col, 12, icon_th);
+            r.dl->AddCircle(ImVec2(cx + dx, cy - dy), r_link, icon_col, 12, icon_th);
         }
         ImGui::SameLine();
         {
@@ -4301,6 +4461,12 @@ private:
         std::string splash_loading;
         std::string open_prompt;
         std::string open_file;
+        std::string open_url;
+        std::string open_url_title;
+        std::string open_url_hint;
+        std::string open_url_ok;
+        std::string open_url_cancel;
+        std::string open_url_invalid;
         std::string compile_retry;
         std::string compile_engine;
         std::string settings_title;
@@ -4321,6 +4487,12 @@ private:
         std::string dialog_video_files;
         std::string dialog_all_files;
     } ui_str_;
+    // Open-URL modal (ImGui popup). Main-thread only, same discipline as ui_settings_open_.
+    // Confirm writes a trimmed http(s) URL into ui_intents_.open_path (Python reuses the drop path).
+    bool open_url_popup_ = false;
+    bool open_url_focus_ = false;
+    char open_url_buf_[2048] = {};
+    bool open_url_show_error_ = false;
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
