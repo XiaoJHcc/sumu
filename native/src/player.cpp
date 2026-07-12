@@ -2176,9 +2176,11 @@ private:
         ImGui::SetNextWindowPos(ImVec2(margin, io.DisplaySize.y - bottom_clear), ImGuiCond_Always,
             ImVec2(0.0f, 1.0f));
         ImGui::SetNextWindowBgAlpha(0.55f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(6.0f));
         ImGui::Begin("##sumu_status_float", nullptr, flags);
         ImGui::TextUnformatted(status_text_.c_str());
         ImGui::End();
+        ImGui::PopStyleVar(); // WindowRounding
     }
 
     // M-A: self-drawn icon buttons (top/bottom bar), replacing the M3 ASCII-text ImGui::Button
@@ -2577,6 +2579,10 @@ private:
             ImGuiWindowFlags_AlwaysAutoResize;
         // Match build_status_float(): translucent so the video shows through.
         ImGui::SetNextWindowBgAlpha(0.55f);
+        // Content inset so labels/sliders aren't flush against the panel edge;
+        // same 6px corner language as the status float / compile card.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(12.0f), ui_s(12.0f)));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(6.0f));
         ImGui::Begin("##sumu_settings", nullptr, flags);
 
         // Staged locally in settings_edit_*_, seeded from the Python-refreshed ui_cfg_*
@@ -2678,6 +2684,7 @@ private:
 
         ImGui::PopItemWidth();
         ImGui::End();
+        ImGui::PopStyleVar(2); // WindowRounding + WindowPadding
     }
 
     // Win11 DWM window chrome for the borderless (hollow-NC) client: system rounded corners
