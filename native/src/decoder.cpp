@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0
 #include "decoder.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
@@ -48,6 +51,7 @@ void Decoder::close()
     loop_offset_seconds_ = 0.0;
     last_out_pts_seconds_ = -1.0;
     d3d_device_ = nullptr;
+    is_network_ = false;
 }
 
 AVPixelFormat Decoder::get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts)
@@ -103,18 +107,65 @@ bool Decoder::ensure_hw_frames_ctx(AVCodecContext* ctx)
     return true;
 }
 
+bool Decoder::looks_like_network_url(const std::string& path)
+{
+    // Minimal scheme check for the network IO profile. Emby/Jellyfin DirectPlay and plain
+    // http.server both land here; file paths and UNC shares stay on the local profile.
+    // Case-insensitive prefix only -- no full URL parse (FFmpeg does the real open).
+    auto starts_with_ci = [](const std::string& s, const char* prefix) {
+        const size_t n = std::strlen(prefix);
+        if (s.size() < n) return false;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::tolower(static_cast<unsigned char>(s[i])) !=
+                std::tolower(static_cast<unsigned char>(prefix[i])))
+                return false;
+        }
+        return true;
+    };
+    return starts_with_ci(path, "http://") || starts_with_ci(path, "https://");
+}
+
 bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& error)
 {
     // Always start from a clean slate -- a previous partial failure (or a reopen after
     // close_session) must not leave half-allocated FFmpeg contexts for the next attempt.
     close();
     d3d_device_ = device;
+    is_network_ = looks_like_network_url(path);
 
-    if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, nullptr) < 0) {
+    // Network sources: timeout + reconnect + smaller probe. Local files keep FFmpeg defaults
+    // (deep probe is fine on disk and preserves existing open latency characteristics).
+    // Options dict is consumed/owned by avformat_open_input on success; free on all paths.
+    AVDictionary* fmt_opts = nullptr;
+    if (is_network_) {
+        // rw_timeout is microseconds for the FFmpeg network protocols.
+        av_dict_set(&fmt_opts, "rw_timeout", "15000000", 0);          // 15s
+        av_dict_set(&fmt_opts, "reconnect", "1", 0);
+        av_dict_set(&fmt_opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&fmt_opts, "reconnect_on_network_error", "1", 0);
+        av_dict_set(&fmt_opts, "reconnect_delay_max", "5", 0);
+        // Faster open on remote: don't read multi-MB probes the way local defaults may.
+        av_dict_set(&fmt_opts, "probesize", "1048576", 0);            // 1 MiB
+        av_dict_set(&fmt_opts, "analyzeduration", "2000000", 0);      // 2s (µs)
+        // Hint that HTTP Range seeks are expected (DirectPlay / static file servers).
+        av_dict_set(&fmt_opts, "seekable", "1", 0);
+        fprintf(stderr, "[sumu] decoder open network URL (timeout/reconnect/shallow probe)\n");
+    }
+
+    if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, &fmt_opts) < 0) {
+        av_dict_free(&fmt_opts);
         error = "avformat_open_input failed for " + path;
         close();
         return false;
     }
+    av_dict_free(&fmt_opts);
+
+    if (is_network_ && fmt_ctx_) {
+        // Belt-and-suspenders: also clamp on the context in case a demuxer ignores dict keys.
+        fmt_ctx_->probesize = 1 * 1024 * 1024;
+        fmt_ctx_->max_analyze_duration = 2 * AV_TIME_BASE; // 2s
+    }
+
     if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
         error = "avformat_find_stream_info failed";
         close();

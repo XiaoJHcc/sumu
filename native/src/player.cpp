@@ -248,8 +248,13 @@ float seekbar_x_for_frame(int64_t frame, float x0, float x1, int64_t frame_count
 
 std::string basename_of(const std::string& path)
 {
-    size_t pos = path.find_last_of("/\\");
-    return (pos == std::string::npos) ? path : path.substr(pos + 1);
+    // Strip query/fragment so "http://host/a/b.mp4?token=x" shows as "b.mp4", not the token.
+    std::string p = path;
+    size_t cut = p.find_first_of("?#");
+    if (cut != std::string::npos)
+        p = p.substr(0, cut);
+    size_t pos = p.find_last_of("/\\");
+    return (pos == std::string::npos) ? p : p.substr(pos + 1);
 }
 
 std::string format_mmss(double seconds)
@@ -388,13 +393,26 @@ public:
     // 4K dual×180 RGBA was ~6GB and OOM'd; deep PT alone is ~2.2GB. AI display window can
     // stay short -- Python holds sparse restored crops and JIT-pushes into the AI ring near
     // the present head. Indexing: frame_num % capacity per ring (wrap_pt_slot / wrap_ai_slot).
+    // Network profile deliberately stays shallow: remote Range seeks + dual-decoder scrub are
+    // the cost drivers, not VRAM (see open_session network branch).
     static constexpr UINT kRingCapacityMax = 180;
     static constexpr UINT kAiRingCapacityMax = 64;  // 4K AI display window (~1s@60)
     static constexpr UINT kRingCapacityDefault = 64; // pre-open / closed
+    static constexpr UINT kNetworkRingCapacity = 48; // ~0.8–1.6s@30/60; enough for present + thin AI
+    static constexpr UINT kNetworkAiRingCapacity = 32;
     static constexpr int64_t kStartBufferFrames = 5;
+    static constexpr int64_t kNetworkStartBufferFrames = 2;
 
-    static void pick_ring_capacities(int width, int height, UINT& pt_cap, UINT& ai_cap)
+    static void pick_ring_capacities(int width, int height, UINT& pt_cap, UINT& ai_cap,
+                                    bool network = false)
     {
+        if (network) {
+            // Shallow decode-ahead for HTTP(S): less pre-read bandwidth, faster seek reclaim.
+            // AI lead will clamp to decode_ahead_max on the Python side.
+            pt_cap = kNetworkRingCapacity;
+            ai_cap = kNetworkAiRingCapacity;
+            return;
+        }
         const int64_t px = static_cast<int64_t>(width) * static_cast<int64_t>(height);
         if (px <= 1920LL * 1080LL) {
             // 1080p: dual full-depth still ~2GB -- keep symmetric 180 for max AI stockpile.
@@ -505,18 +523,24 @@ public:
         if (src_width_ <= 0 || src_height_ <= 0)
             throw std::runtime_error("decoder reported invalid dimensions");
 
-        // Resolution-aware ring depths (I8): deep PT for AI input lead; AI ring may be shorter
-        // (Python JIT-pushes near present). Set before create_ring_resources().
-        pick_ring_capacities(src_width_, src_height_, ring_capacity_, ai_ring_capacity_);
+        // Resolution-aware ring depths (I8), plus network shallow profile when source is http(s).
+        // Network: smaller PT/AI rings so decode-ahead and AI lead stay thin (less remote
+        // pre-read; seek reclaims the ring faster). Local: unchanged deep lookahead.
+        const bool network = decoder_.is_network();
+        network_source_ = network;
+        pick_ring_capacities(src_width_, src_height_, ring_capacity_, ai_ring_capacity_, network);
         if (ring_capacity_ < 16) ring_capacity_ = 16;
         if (ring_capacity_ > kRingCapacityMax) ring_capacity_ = kRingCapacityMax;
         if (ai_ring_capacity_ < 16) ai_ring_capacity_ = 16;
         if (ai_ring_capacity_ > kRingCapacityMax) ai_ring_capacity_ = kRingCapacityMax;
-        decode_ahead_max_ = static_cast<int64_t>(ring_capacity_) - 10;
+        // Local keeps a 10-frame safety margin under ring capacity; network ring is already
+        // shallow so only leave a 4-frame margin (still >= 1).
+        const int64_t ahead_margin = network ? 4 : 10;
+        decode_ahead_max_ = static_cast<int64_t>(ring_capacity_) - ahead_margin;
         if (decode_ahead_max_ < 1) decode_ahead_max_ = 1;
-        fprintf(stderr, "[sumu] pt_ring=%u ai_ring=%u decode_ahead_max=%lld (%dx%d)\n",
+        fprintf(stderr, "[sumu] pt_ring=%u ai_ring=%u decode_ahead_max=%lld (%dx%d)%s\n",
             ring_capacity_, ai_ring_capacity_, static_cast<long long>(decode_ahead_max_),
-            src_width_, src_height_);
+            src_width_, src_height_, network ? " network" : "");
 
         // ---- audio (spike, additive) -- software-decode-only AVCodecContext for the audio
         // stream, if any (never touches d3d11va/hw_device_ctx_). Built here on the main
@@ -580,25 +604,33 @@ public:
         // to open the second decoder just means no hover previews (the player is fully functional
         // without them), never a failed session. Its GPU resources were already built above by
         // create_ring_resources() -> create_scrub_resources().
-        {
+        // Network profile: SKIP the second open entirely. A parallel scrub Decoder means a
+        // second HTTP connection + open-time full-timeline keyframe grid seeks -- the single
+        // worst remote-IO pattern this player has. Local disk keeps scrub as before.
+        if (!network) {
             std::string scrub_err;
             if (scrub_decoder_.open(video_path, device_.Get(), scrub_err))
                 scrub_thread_ = std::thread(&Player::scrub_loop, this);
             else
                 fprintf(stderr, "[sumu] scrub decoder open failed (%s) -- hover thumbnails disabled\n",
                     scrub_err.c_str());
+        } else {
+            fprintf(stderr, "[sumu] network source: scrub decoder disabled (no second open / no grid prefetch)\n");
         }
 
+        // Network: wait for fewer initial frames and allow a longer open timeout (RTT + probe).
+        const int64_t start_buf = network ? kNetworkStartBufferFrames : kStartBufferFrames;
+        const double start_timeout_s = network ? 30.0 : 10.0;
         LARGE_INTEGER t0;
         QueryPerformanceCounter(&t0);
         for (;;) {
-            if (pt_high_water_.load(std::memory_order_relaxed) >= kStartBufferFrames - 1)
+            if (pt_high_water_.load(std::memory_order_relaxed) >= start_buf - 1)
                 break;
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             double waited_s = static_cast<double>(now.QuadPart - t0.QuadPart) / qpc_freq_d();
-            if (waited_s > 10.0)
-                throw std::runtime_error("decode thread failed to buffer initial frames within 10s");
+            if (waited_s > start_timeout_s)
+                throw std::runtime_error("decode thread failed to buffer initial frames within timeout");
             Sleep(1);
         }
 
@@ -629,8 +661,11 @@ public:
         // filling right away using the idle NVDEC) rather than lazily on first hover -- seekbar
         // dragging is a high-frequency action and we want coverage ready before the user reaches
         // for it. The fill self-suspends the moment playback starts (see scrub_loop()).
-        scrub_grid_wanted_.store(true, std::memory_order_relaxed);
-        scrub_cv_.notify_one();
+        // Network: scrub thread was never started -- do not request grid fill.
+        if (!network) {
+            scrub_grid_wanted_.store(true, std::memory_order_relaxed);
+            scrub_cv_.notify_one();
+        }
 
         // Auto-size the window to this video (1:1 point-for-point, capped/on-screen -- see the
         // method). Done last, after session_active_ so the synchronous WM_SIZE this triggers
@@ -821,6 +856,7 @@ public:
             // play()/seek()/etc. refuse cleanly and the splash shows the open-prompt again.
             opened_ = false;
             video_path_.clear();
+            network_source_ = false;
             throw;
         }
         return frame_count_;
@@ -1162,6 +1198,8 @@ public:
     void record_compile_engine() { ui_intents_.compile_engine = true; }
 
     const std::string& path() const { return video_path_; }
+    // True when the current session opened an http(s) URL (shallow ring, no scrub).
+    bool is_network() const { return network_source_; }
     bool ui_ready() const { return ui_ready_; }
 
     // Apply Windows monitor DPI to ImGui fonts + spacing and to our self-drawn chrome.
@@ -4234,6 +4272,8 @@ private:
 
     // ---- UI product state (M3) -- main-thread-exclusive, see UiIntents' header comment. ------
     std::string video_path_;
+    // Session IO profile: set in open_session from decoder_.is_network(). Cleared on failed reopen.
+    bool network_source_ = false;
     UiIntents ui_intents_;
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config
     int ui_cfg_max_regions_ = 1;  // (settings panel seeds edit buffers from these on open)
@@ -4736,6 +4776,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("pick_open_file", &Player::pick_open_file) // blocking Win32 dialog, call before open()
         .def("open", &Player::open, py::arg("path"))
         .def("reopen", &Player::reopen, py::arg("path")) // M-C2: runtime file swap, present never stops
+        .def("is_network", &Player::is_network) // http(s) session: shallow ring, scrub off
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)

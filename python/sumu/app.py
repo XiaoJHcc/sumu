@@ -306,7 +306,8 @@ def main():
         apply_target_fps_for_open()
         print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
               f"dims={player.dims()} source_fps={player.source_fps():.4f} "
-              f"fps_div={player.fps_div()} target_fps={cfg_target_fps}",
+              f"fps_div={player.fps_div()} target_fps={cfg_target_fps}"
+              f"{' network' if player.is_network() else ''}",
               file=sys.stderr)
         opened = True
         current_path = path
@@ -347,7 +348,8 @@ def main():
             return
         apply_target_fps_for_open()
         print(f"== player.reopen == frames={new_frame_count} dims={player.dims()} "
-              f"fps={player.fps():.4f} fps_div={player.fps_div()} target_fps={cfg_target_fps}",
+              f"fps={player.fps():.4f} fps_div={player.fps_div()} target_fps={cfg_target_fps}"
+              f"{' network' if player.is_network() else ''}",
               file=sys.stderr)
         # video_meta recomputed lazily at scheduler-build time (see do_open's note) -- tearing the
         # scheduler down above forces the build step below to re-run against the new file.
@@ -598,14 +600,42 @@ def main():
                 det_model, res_model, pad_mode = warm_models
                 # Lazy, off the startup path: compute video_meta now (get_video_meta_data came from
                 # the warmup worker) and build the config from the committed int knobs.
+                # Network sources: skip ffprobe/cv2 second open -- native already probed fps/dims/
+                # frame_count; a second remote probe races the player and hurts weak links.
                 try:
-                    video_meta = warm_meta_fn(current_path)
+                    if player.is_network():
+                        from fractions import Fraction
+                        from sumu.ai.utils import VideoMetadata
+                        sess_fps = float(player.fps())
+                        w, h = player.dims()
+                        fc = int(player.frame_count())
+                        fps_exact = Fraction(sess_fps).limit_denominator(1001)
+                        dur = (fc / sess_fps) if sess_fps > 0 and fc > 0 else 0.0
+                        video_meta = VideoMetadata(
+                            video_file=current_path,
+                            video_height=int(h),
+                            video_width=int(w),
+                            video_fps=sess_fps,
+                            average_fps=sess_fps,
+                            video_fps_exact=fps_exact,
+                            codec_name="unknown",
+                            frames_count=fc,
+                            duration=float(dur),
+                            time_base=Fraction(1, max(1, int(round(sess_fps * 1001))))
+                            if sess_fps > 0 else Fraction(1, 30),
+                            start_pts=0,
+                        )
+                        print(f"== video_meta (native, network) == {w}x{h} fps={sess_fps:.4f} "
+                              f"frames={fc}", file=sys.stderr)
+                    else:
+                        video_meta = warm_meta_fn(current_path)
                 except Exception as e:  # noqa: BLE001 -- meta probe failure must not kill playback
                     # File is already open and playing passthrough; just skip AI for this file.
                     print(f"== video_meta failed == {current_path!r}: {e}", file=sys.stderr)
                     video_meta = None
                 if video_meta is not None:
                     # Align AI meta with the retimed session (player.fps/frame_count after fps_div).
+                    # Network path already used session numbers; local still needs this remap.
                     try:
                         from fractions import Fraction
                         sess_fps = float(player.fps())
@@ -615,10 +645,18 @@ def main():
                         video_meta.frames_count = int(player.frame_count())
                     except Exception:  # noqa: BLE001
                         pass
+                    # Network: clamp AI lead to the shallow native decode-ahead (already enforced
+                    # inside Scheduler._effective_lead via decode_ahead_max, but keep config honest).
+                    lead_for_cfg = cfg_lead
+                    if player.is_network():
+                        try:
+                            lead_for_cfg = min(cfg_lead, max(1, int(player.decode_ahead_max())))
+                        except Exception:  # noqa: BLE001
+                            lead_for_cfg = min(cfg_lead, 48)
                     config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
                                                 max_regions_per_frame=cfg_max_regions,
                                                 cold_start_s=cfg_cold_start_s,
-                                                lead=cfg_lead)
+                                                lead=lead_for_cfg)
                     scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
                     scheduler.start()
 
