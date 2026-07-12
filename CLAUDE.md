@@ -61,7 +61,28 @@ RTX 4080 · 16GB · Win11 · 4K@150Hz（scale=1）· 驱动 610.47 · Python 3.1
 2. **架构预留 AI 画面插入能力**（Spike 1，零拷贝 CUDA↔D3D11）——已通过。
 3. **AI 模型能在此架构运行对接**（Phase 4，照搬 lada 核心）——已完整移植并端到端验证，见 `docs/ai_core_port.md`、`docs/scene_clip_blend_port.md`、`docs/scheduler.md`。
 
-三目标达成后项目继续推进到 Phase 5（ImGui UI：进度条/scrub 缩略图/窗口 chrome/降级旋钮）与 Phase 6（音频从属时钟、设置持久化、打包），当前处于功能收尾/打磨阶段而非 spike 阶段。已知缺口（YOLO 跳帧未实现、诊断卡片未接 UI、4K 下 AI 命中率接近零等）不在本节重复，如需现状核对以 `docs/robustness_4e.md`、`docs/packaging.md`、`python/sumu/scheduler.py` 为准，不要假设本文件同步更新。
+三目标达成后已完成 Phase 5（ImGui UI：进度条/scrub 缩略图/窗口 chrome/降级旋钮）与 Phase 6（音频从属时钟、设置持久化、打包、i18n）。**第一阶段（架构换层 + 日常播放器）已收口**；后续进入第二阶段，只做新功能/新优化（候选方向见文末「第二阶段」），不再以「补历史缺口」驱动。
+
+### 已放弃 / 不再当作待办的方向（2026-07-12 拍板）
+
+| 方向 | 处置 | 原因 |
+|---|---|---|
+| YOLO 跳帧 / 稀疏检测 | **放弃** | 当前瓶颈不在 YOLO；BasicVSR 压力已由默认 `clip_length=30` 等旋钮消化，不再列为活路 |
+| 完整诊断卡片（检测/修复 fps、命中率、丢弃帧…） | **放弃**（可选仅保留缓冲进度条） | 当前性能足够，不需要完整调参仪表盘 |
+| 4K「AI 命中率≈0」当架构缺陷 | **不修** | present 韧性（I9）已验证；4K 去码是 best-effort，靠旋钮（目标帧率/缓冲窗口/区块数）调，不当 bug |
+
+日常现状与压测数字以 `docs/robustness_4e.md`、`docs/packaging.md`、`python/sumu/scheduler.py` 为准。
+
+## 第二阶段（候选，非承诺 backlog）
+
+第一阶段已收口后，只按产品需要开新功能/新优化，例如：
+
+- 离线导出 / 批处理（整片写出去码视频）
+- 最近打开列表 + 播放进度的 UI 入口（持久化已有：`settings.recent` / `positions`）
+- 可选：设置面板缓冲进度条（完整诊断卡片已放弃）
+- 其它用户驱动的体验项
+
+**不在第二阶段清单**：YOLO 跳帧、完整诊断仪表盘、把 4K 命中率当架构债重做、循环回绕播放。
 
 ## 约定
 

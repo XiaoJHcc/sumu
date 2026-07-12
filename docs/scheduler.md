@@ -138,44 +138,12 @@ STEADY-STATE [10s-end] n=1513 mean=33.37 median=33.37 stddev=0.10 max=34.5  p99=
 NV12→BGR 采集引入的 MAE（0.698-0.700）与 `docs/native_ai_input.md` 已验证过的原生桥基线
 （1080p mean 0.6990）几乎完全吻合——证明调度器这一层没有引入任何额外误差。
 
-## 已知坑与未覆盖项（如实列出，不回避）
+## 备注（历史测试边界，不驱动后续工作）
 
-- **一次性 `backlog_resyncs=1` 属预期**：调度器线程在 `scheduler.start()` 之后、
-  `player.play()` 之前就已启动（`run_player.py` 的顺序），`ai_frontier` 初始为 0；
-  播放刚开始的极短窗口内，YOLO+aggregation 的耗时可能让 `ai_frontier` 短暂落后于飞速前进的
-  `head`，触发一次 frontier 重同步。这是设计内的正常降级行为（I9），不是 bug，但值得在这里
-  明确记录，避免被误读成故障。
-- **兜底 discontinuity 启发式（前跳>500帧/倒退）从未被单独触发测试过**：本次 seek 测试全程
-  走的是 `notify_seek()` 主路径，`seek_resets` 计数器里的那一次确实来自 `notify_seek()`
-  分支，不是启发式分支。启发式代码本身逻辑简单（阈值比较），但没有构造"调用方绕过
-  `notify_seek()` 直接 `player.seek()`"这种场景验证过。
-- **EOF flush 路径未被触达**：两次测试运行都只推进到 frame ~1200-2300（3576 帧视频的中段），
-  从未真正到达视频末尾，因此 `_process_frame` 里 `eof=True` 触发的
-  `materialize_completed_clips(..., eof=True, ...)` 那个"强制 flush 未完成 clip"的分支完全没有
-  被执行过，只有静态代码审查，没有运行时验证。
-- **视频循环播放（loop）/wraparound 未测试**：`_last_head` 倒退触发 reset 的逻辑理论上能覆盖
-  "播放到末尾后从头循环"的场景，但没有实际构造循环播放场景验证过。
-- **只测试了一次 seek**：45 秒运行里只做了一次 `notify_seek`+`seek()`（中点位置），没有像
-  `docs/native_ai_input.md` 里原生层那样做多轮×多个 fraction 的 seek 压力测试（附带调度器）。
-  多次连续 seek 对 `frame_cache`/`scenes` 状态机的重复清空-重建行为没有压力测试过。
-  hit_rate 在单次 seek 后的恢复轨迹（0.967→0.953→0.957→0.960，15 秒内）是唯一一组样本，没有
-  验证是否在更差情况（例如 seek 到视频最开始、或背靠背连续 seek）下恢复模式会不同。
-  性质：这是"消费方一次真实调用"的验证，不是穷举/压力测试。
-- **`get_cuda_nv12_by_frame` 的多消费者/多线程调用测试范围**：调度器设计上只有一个生产者线程
-  调用它，`docs/native_ai_input.md` 已经指出原生层没有专门测过多线程并发调用；本调度器同样
-  没有引入或测试这种场景（设计上就是单线程模型，不需要）。
-- **frame_cache 容量公式（82 帧）在两次测试里都从未被逼近极限**：`frame_cache_size` 观测到的
-  实际峰值在 20-22 帧左右，远低于容量上限 82；公式的"最坏情况"论证是分析性的，没有构造出真正
-  逼近该上限的负载场景（例如极慢的 clip 完成速度、或反常大的 clip_length）来验证淘汰边界行为。
-- **数字来自单次运行，非多次重复取统计分布**：与 `docs/native_ai_input.md` 已有先例一致的
-  方法论局限——present/hit_rate/cold_start 数字都是各自场景下的单次真实测得结果，如果要作为
-  长期回归基准维护，建议后续像 `docs/native_core.md` 一样多跑几次取中位数。
-- **`ai_hit_rate` 未达到 1.0**：这不被认为是 bug——`test_video.mp4` 虽然全程马赛克
-  （CLAUDE.md），但 clip 化处理天然有批延迟（一个 clip 要攒够/等到场景结束才能 restore+push），
-  加上 frontier 闸门把提前量限制在 `lead`（默认 180，运行时钳到 decode-ahead）帧以内，个别帧在 present 需要它的那一刻 AI 还没
-  处理完，present 会退回 passthrough（`n_pt_fresh`，不是 `n_pt_stale`，即不是重复旧帧，是原始
-  未去码帧）。0.96-0.97 且仍在稳定爬升是一个符合"降级不停顿"设计预期的健康结果，而非应该强行
-  拉到 1.0 的缺陷。
+- **一次性 `backlog_resyncs=1` 属预期**：调度器在 `play()` 前已启动时，冷启动窗口可能触发一次 frontier 重同步（I9），不是故障。
+- **主路径 seek 已在 `docs/robustness_4e.md` ② 补强**（25 次 seek 风暴 + AI）；本节早期「只测一次 seek / 启发式未单独压」的说法以 4e 为准。
+- **产品不循环播放**：播完停最后一帧。scheduler 里取模 eof / 跨圈注释是历史防御，日常无回绕触发路径，**不需再修 loop 语义**。
+- **`ai_hit_rate` 不必 1.0**：clip 批延迟 + frontier 闸门下回退原片是设计预期；1080p 稳态 ~0.96 健康。4K 命中接近零是 best-effort，见 CLAUDE.md「已放弃方向」。
 
 ## 交付文件
 

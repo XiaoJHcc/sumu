@@ -20,7 +20,7 @@
 - **输入/输出张量契约**：`preprocess(imgs: list[ImageTensor(H,W,C) uint8 BGR]) -> list[torch.Tensor]`（letterbox 后，指定 device）；`inference_and_postprocess(imgs, orig_imgs) -> list[UltralyticsResults]`（内部把 `imgs` `.to(device).to(dtype).div_(255.0)` 归一化后跑推理+NMS+`process_mask`）。sumu 侧：每次要检测的帧从 ready-map 上游解码环缓冲里取，输出的 `Results`（含 mask/box）直接喂给下一步 Scene/Clip 聚合。
 - **移植风险/坑（引用 lada 实测）**：
   - GPU 预处理路径历史上有两个从没跑过就藏着的 bug（帧真正变 GPU 张量才触发）：`_preprocess_gpu` 缺 BHWC→BCHW permute；`PyTorchLetterBox` 用 `isinstance` 判重建导致首帧走 ultralytics 原生 `LetterBox`（无 `original_shape` 属性）+ pad 值应为 uint8 空间的 114（不是 /255 空间的 114/255）。移植时如果第一次真正跑 GPU 输入路径，应重新验证这两点没有回归。
-  - `realtime-perf-measured-deadends.md`：YOLO `imgsz` 调小收益非单调（瓶颈是 GPU 时间片占用不是算力）；YOLO 与 restorer 同卡抢占，实测拖累 restorer 吞吐约 27%（62fps 独占→45fps 共享），唯一未验证的缓解手段是 YOLO 跳帧/稀疏检测（DESIGN.md 已列为 sumu 新增项，不在本次照搬范围）。
+  - `realtime-perf-measured-deadends.md`：YOLO `imgsz` 调小收益非单调（瓶颈是 GPU 时间片占用不是算力）；YOLO 与 restorer 同卡抢占在 lada 时代拖累 restorer ~27%。**sumu 已放弃 YOLO 跳帧**（瓶颈不在 YOLO，见 CLAUDE.md「已放弃方向」）；勿再当作待办。
 
 ### 2. Scene / Clip 聚合逻辑
 
@@ -29,7 +29,7 @@
   - `Scene` 类，第 34-86 行（`__init__` 35, `add_frame` 48, `merge_mask_box` 60, `belongs` 71, `__iter__`/`__next__` 77/80）
   - `Clip` 类，第 89-171 行（`__init__` 90 内部做 `crop_to_box_v3` + resize 到 `(size,size)` + pad, `get_max_width_height` 136, `pop` 148, `__getitem__` 170）
   - 两个 builder 方法：`_create_clips_for_completed_scenes`（第 355-375 行）、`_create_or_append_scenes_based_on_prediction_result`（第 376-396 行）
-  - `_NoDetectionResult` 占位类（第 26-31 行，YOLO 跳帧预留 stub，用于跳过帧时喂一个空检测结果）
+  - `_NoDetectionResult` 占位类（第 26-31 行，历史 YOLO 跳帧 stub；sumu 已放弃跳帧，保留类无接线义务）
 - **依赖**：`image_utils`（`crop_to_box_v3`、`pad_image`）、内部 `Box`/`MaskTensor`/`ImageTensor` 类型别名，无 ultralytics/torch_tensorrt 依赖。
 - **device 通用性**：Scene/Clip 内部只做张量裁剪/resize/pad，未见强制 `.cpu()`/`.numpy()` 硬编码，随输入张量 device 走。
 - **纯函数 vs 线程纠缠**：**关键坑**——`Scene`/`Clip` 两个类本身纯逻辑无线程依赖，但两个 builder 方法是 `MosaicDetector` 类的**成员方法**，被同一个类里的 `_frame_detector_worker`（第 483-525 行）worker 循环同步调用（第 495/509/515 行）。移植时必须把这两个方法的方法体**从 worker 循环的调用点里抽出来**，改造成独立可调用的纯函数（接收 `scenes: list[Scene]`、当前 `frame_num`、YOLO 的 `Results`，返回更新后的 `scenes` 列表 + 可能产出的 `Clip` 列表），不能把整个 `MosaicDetector` 类照搬。

@@ -116,8 +116,10 @@ def blend_back_frame(frame: ImageTensor, frame_num: int, matched_clips: list[Cli
 
 ## 未覆盖项（诚实报告）
 
+> 以下是**移植当次**的验证边界，不是第二阶段 backlog。调度器消费 `Clip` / `blend_back_frame`
+> 的接线已在 `python/sumu/scheduler.py` 落地；`max_regions_per_frame` 已进 UI 设置。
+
 - `visualization_utils.draw_mosaic_detections`（`mosaic_detection` 调试可视化分支）未移植，不在项 4 范围内。
-- `video_utils.get_video_meta_data`（项 6）未移植；本次用 PyAV 手拼 `VideoMetadata` 仅用于测试脚手架。
+- `video_utils.get_video_meta_data`（项 6）未整文件照搬；日常路径用 native 元数据 + 脚手架拼 `VideoMetadata`。
 - CPU 全链路（检测+聚合+修复，不仅仅是 blend 数学）未独立跑通验证，只验证了 blend 数学本身的 CPU 分支。
-- 多区域检测（`max_regions_per_frame>1` 时"只取前 N 个"的截断路径）未被真实数据触发验证，只是代码走查确认逻辑保留。
-- 未来调度器怎么给 `blend_back_frame` 喂 `matched_clips`（ready-map O(1) 查找)、`Clip` 是一次性消费还是可重复读，都还没设计，仅在本次移植的函数签名/注释里留了扩展点。
+- 多区域检测（`max_regions_per_frame>1`）当时未被真实数据触发；逻辑与 UI 旋钮已保留。

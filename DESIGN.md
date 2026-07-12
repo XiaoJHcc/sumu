@@ -33,7 +33,7 @@
 | I6 | **seek = reposition，不是 teardown** | seek 只把 present clock + decode-ahead 缓冲 + AI 前沿**重定位**到新帧号；**不销毁不重建**线程/解码器。这从根上消掉 lada 的 seek 多秒黑屏和解码器 churn 堆损坏。 |
 | I7 | **单一解码头 + decode-ahead 环缓冲** | 一个 NVDEC 会话跑在 AI 前沿，原片帧进 GPU 环形缓冲供 present 消费，同批帧喂 AI。省 NVDEC 名额、免重复解码。**VRAM 要显式预算**（见 I8）。 |
 | I8 | **VRAM 是一等约束** | 4K 帧缓一个 lookahead 窗口（~180 帧）≈ 2–4GB 显存。环缓冲存 **NV12**（减半），present 时才转；按 VRAM 上限动态压 lookahead。设计里必须带预算，不能事后补。 |
-| I9 | **降级而非停顿** | GPU 跟不上时，手段是：回退原片、缩小 max_clip_length、fp16、YOLO 跳帧——**永远不停时钟**。（`clip_size` 已锁死 256，与 TRT 引擎编译 shape 绑定，不是可调旋钮） |
+| I9 | **降级而非停顿** | GPU 跟不上时，手段是：回退原片、缩小 max_clip_length、fp16、目标帧率降采样、收窄缓冲窗口——**永远不停时钟**。（`clip_size` 已锁死 256，与 TRT 引擎编译 shape 绑定，不是可调旋钮。YOLO 跳帧已放弃，见 CLAUDE.md「已放弃方向」） |
 | I10 | **先埋点，再优化；实测推翻直觉** | lada 史上多个「听起来合理」的结论被实测推翻（如「AI GIL 争用饿死呈现」实为帧时钟空转）。sumu 从第一天带 present/AI trace，任何优化先量后改。 |
 
 ### C. 要照搬的 README 核心机制（全部保留，只换承载层）
@@ -46,9 +46,9 @@
 - **模型预热（warmup）**：加载后跑一次 dummy forward，把 CUDA/cuDNN 初始化在加载期付清。
 - **TRT 加速 BasicVSR++**：拆 6 子引擎，独占 3–4x；非 cuda/非 fp16/引擎缺失无缝回退 PyTorch。缓存键编 arch+TRT 版本+精度+OS+clip 上界（自愈、不跨机分发）。
 - **GPU 解码后端**：NVDEC/PyNvVideoCodec 零拷贝（sumu 里升级为「解码后帧全程不下 GPU 直到 present」）。
-- **降级旋钮**：max_clip_length / fp16 / （新增）YOLO 跳帧。（`clip_size` 锁死 256，烧进 TRT 引擎编译 shape，非运行时旋钮）
-- **诊断卡片**：检测/修复 fps、缓冲窗口横条、AI 命中率、丢弃帧数——作为调参仪表盘。
-- **落后重定位（reposition）**：lada 中因帧号问题默认关闭；sumu 帧号锚定后应能正确工作，纳入设计。
+- **降级旋钮**：max_clip_length / fp16 / 目标帧率 / 缓冲窗口 / 同帧区块数。（`clip_size` 锁死 256，烧进 TRT 引擎编译 shape，非运行时旋钮。YOLO 跳帧已放弃。）
+- **设置面板诊断**：仅保留 AI 修复速度；**完整诊断卡片已放弃**。可选后续只加缓冲进度条，不做命中率/丢弃帧等仪表盘。
+- **落后重定位（reposition / frontier 闸门）**：lada 中因帧号问题默认关闭；sumu 帧号锚定后已落地（`scheduler` 的 `backlog_resyncs`）。
 
 ### D. AI 管线：照搬什么，重写什么
 
@@ -68,14 +68,15 @@
 - GStreamer appsrc 胶水 + seek 拆建状态机
 - 整个 GUI 外壳（新项目，无历史包袱）
 
-**新增（lada 的待办活路）**
-- **YOLO 跳帧 / 稀疏检测**：detector 隔 N 帧推理、中间帧复用 mask——lada 实测认定的唯一稳态吞吐活路（把 YOLO 与 restorer 争用的 ~27% GPU 时间要回来）。
+**已放弃的新增方向（勿再当作待办）**
+- **YOLO 跳帧 / 稀疏检测**：lada 时代曾认定为吞吐活路；sumu 实测瓶颈不在 YOLO，BasicVSR 压力已由 `clip_length=30` 等旋钮消化——**放弃，不再实现**。`_NoDetectionResult` 等历史 stub 可保留但无接线义务。
 
 ### E. 已知硬约束（不是 sumu 能消除的，设计时认账）
 
 - **BasicVSR++ 时间维度延迟**：模型必须吃一段连续帧，延迟下界 ≈ clip 帧数。这是模型属性，任何架构都绕不开——sumu 用小 clip 窗口 + 回退原片来**遮蔽**它，不是消除。
-- **单卡 YOLO/restorer 争用**：一张卡上检测与修复抢时间片。缓解靠 YOLO 跳帧，不是靠架构变出第二张卡。
+- **单卡检测/修复争用**：一张卡上 YOLO 与 restorer 抢时间片。sumu 不靠 YOLO 跳帧缓解；靠 clip 长度、目标帧率、区块数与 frontier 闸门做产品层降级。
 - **模型本身不可重写**：YOLO、BasicVSR++ 是产品本体。
+- **播完行为**：产品策略是**播完停在最后一帧并暂停**，不循环回绕。解码/调度里残留的 loop 相关符号（如 `loop_offset_seconds_` 恒为 0、scheduler 的取模 eof 判定）是历史兼容/防御代码，不是待修的「循环播放」功能。
 
 ---
 

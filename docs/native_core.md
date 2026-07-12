@@ -82,9 +82,10 @@ p.close()
      `frame_num`（I5：帧号唯一事实来源，锚定真实 PTS）；
    - 若目标帧号超出实际可解码范围（视频末尾附近的深度 seek），优雅地 clamp 到能拿到的最后
      一帧，而不是直接失败。
-   - `first_pts_seconds_`/`loop_offset_seconds_` 这两个"帧号原点"锚点**从不**因 seek 而重置，
-     只有 `next_frame()` 自身在自然播放到达文件末尾、循环回起点时才会推进 `loop_offset_seconds_`
-     ——这保证了任意次数的 seek 之后，帧号在全局意义上仍然一致。
+   - `first_pts_seconds_`/`loop_offset_seconds_` 这两个"帧号原点"锚点**从不**因 seek 而重置。
+     产品策略已改为**播完停最后一帧、不循环**（`next_frame()` 在 EOF 返回 false，不再推进
+     `loop_offset_seconds_`；该字段会话内恒为 0，仅保留在 PTS 公式里）。这保证任意次数 seek
+     之后帧号在全局意义上仍然一致。
 3. 把落地帧拷贝进 passthrough ring 对应的 slot，并**清空**（而非部分清空）`pt_tag_`/`ai_tag_`
    两个 ready-map——~1 秒深的环形缓冲相对一次真实 seek 几乎总是整体失效，无条件清空最简单也最
    安全（present 的"重复上一帧"兜底路径本来就永不阻塞，多重复几帧不会有任何代价）。
@@ -193,16 +194,9 @@ f_after_resume=179  (play() 后 sleep 1s，帧号从 119 推进到 179，约 60 
 `is_playing()` 状态切换正确，全程 present 线程未被销毁/重建（只是复用同一个正在跑的
 present_loop，anchor 被重新定位）。
 
-## 已知局限 / 未覆盖内容（如实说明，未隐藏）
+## 已知局限 / 未覆盖内容（历史记录；后续补测见 robustness_4e）
 
-- `screen_mean_luma()` 的黑屏检测是**全桌面**采样而非窗口内容本身的像素级验证（Player 未把
-  HWND 暴露给 pybind11，出于不给这次晋升引入额外原生 surface 的考虑，没有为此新增接口）——
-  它能可靠捕捉"整个屏幕接近纯黑"这类严重故障，但不能证明"present 的画面就是正确的视频帧"。
-  本次运行没有触发黑屏迹象，但这是一个粗筛信号，不是逐像素级的图像正确性证明。
-- 测试的目标机器/环境需要一个真实的桌面会话（D3D11 窗口 + swapchain 需要能实际呈现），本次
-  三项验证均在有桌面会话的环境下运行并得到上述结果。
-- 未测试与 `push_ai_frame` 并发时的 seek 行为（即"AI 生产者线程正在推送、同时发生 seek"这一
-  组合场景）——本次验证聚焦于 seek 本身的 reposition 正确性与三大架构 bug 清单里点名的
-  "冻屏/崩溃/黑屏"排查，Spike 2 已经验证过 AI 混合本身不影响 present 节奏，两者的正交组合
-  理论上由 `d3d_mutex_`/`ready_mutex_` 的锁序保证安全，但没有专门跑一次"seek 风暴 + AI 推流"
-  同时进行的压力测试。
+- `screen_mean_luma()` 的黑屏检测是**全桌面**采样而非窗口内容本身的像素级验证——粗筛信号，不是逐像素正确性证明。
+- 需要真实桌面会话（D3D11 窗口 + swapchain）。
+- 本文写就时「未测 seek 风暴 + AI 推流」——**已由 `docs/robustness_4e.md` ② 补上**（25/25 通过）。
+- `g_quit` 全局共享误退：**已修（M-C1）**，见 `player.cpp` 的 per-instance `quit_`。

@@ -105,15 +105,10 @@ present 线程的可观测停顿——回归结果（见下）也从实测角度
 
 ## 回归结果（硬性要求，如实呈现）
 
-**发现并排除的一处误报**：最初用 `smoke_player.py all`（单进程内连续跑 smoothness→pause→seek
-三个场景）测试时，pause 和 seek 场景在几乎第一次 `pump_messages()` 后就报告
-`quit_early=True`（seek 场景 20 个 seek 只跑了 1 个）。排查后确认这是 `player.cpp` 里一个
-**既有、未被本次改动触及**的问题：`g_quit` 是一个**跨 `Player` 实例共享的全局变量**
-（`native/src/player.cpp:105`），第一个 `Player`（smoothness）关闭时把它设为 `true`
-后，同一进程里后续 `Player` 实例（pause、seek）一启动 `pump_messages()` 就会读到这个残留状态
-立即判定退出——与本次 Part B 改动无关（AI 输入桥完全没有碰 `WndProc`/`g_quit`/窗口生命周期），
-纯粹是 `all` 这种"单进程连续起多个 `Player`"用法首次触发的既有窗口消息循环设计问题。改用与
-4a 基线一致的方法论——每个场景独立进程调用——复现出干净结果：
+**历史误报（已过时，勿再当待办）**：早期用 `smoke_player.py all`（单进程连跑多场景）时出现
+`quit_early=True`，根因是当时文件级全局 `g_quit` 跨 `Player` 实例共享。**已修（M-C1）**：
+`quit_` 现为 per-instance atomic，经 `GWLP_USERDATA` 路由。当时改用每场景独立进程得到干净
+回归结果如下：
 
 **smoothness**（`test_video_4k.mp4`，50s，`scripts/analyze_present.py --format ns --fps 59.9401`）：
 
