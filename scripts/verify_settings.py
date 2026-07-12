@@ -35,6 +35,7 @@ def main():
         s = settings_mod.Settings(
             volume=0.5, muted=True, recent=["a", "b", "c"], positions={"x": 1234},
             cold_start_s=1.5, target_fps=30, clip_length=45, max_regions=3, lead=120,
+            language="en",
         )
         settings_mod.save(s, settings_path)
         loaded = settings_mod.load(settings_path)
@@ -47,6 +48,7 @@ def main():
         check("round-trip clip_length", loaded.clip_length == 45)
         check("round-trip max_regions", loaded.max_regions == 3)
         check("round-trip lead", loaded.lead == 120)
+        check("round-trip language", loaded.language == "en")
 
         # 2. Corrupt/missing
         with open(settings_path, "wb") as f:
@@ -61,10 +63,19 @@ def main():
         check("corrupt file -> defaults (clip_length)", corrupt_loaded.clip_length == 30)
         check("corrupt file -> defaults (max_regions)", corrupt_loaded.max_regions == 1)
         check("corrupt file -> defaults (lead)", corrupt_loaded.lead == 180)
+        check("corrupt file -> defaults (language)", corrupt_loaded.language == "auto")
 
         os.remove(settings_path)
         missing_loaded = settings_mod.load(settings_path)
         check("missing file -> defaults", missing_loaded == settings_mod.Settings())
+
+        # 2a. language clamp
+        settings_mod.save(settings_mod.Settings(language="fr"), settings_path)
+        check("language unknown -> auto", settings_mod.load(settings_path).language == "auto")
+        settings_mod.save(settings_mod.Settings(language="ZH-cn"), settings_path)
+        check("language case-normalize zh-CN", settings_mod.load(settings_path).language == "zh-CN")
+        settings_mod.save(settings_mod.Settings(language="auto"), settings_path)
+        check("language auto round-trip", settings_mod.load(settings_path).language == "auto")
 
         # 2b. cold_start_s clamp
         s_hi = settings_mod.Settings(cold_start_s=99.0)

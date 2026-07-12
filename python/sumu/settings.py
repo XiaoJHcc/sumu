@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0
 #
 # Phase 6 M-E: persisted user state for the daily entrypoint (scripts/play.py) -- last volume,
-# mute state, recent-files list, per-file last playback position (resume), and AI/scheduler knobs
-# (clip_length / max_regions / cold_start_s / lead / target_fps). Deliberately stdlib-only
-# (json/os/pathlib/tempfile + dataclasses/typing), no dependency on sumu_core/torch, so this
-# module is importable and testable in complete isolation (see scripts/verify_settings.py).
+# mute state, recent-files list, per-file last playback position (resume), AI/scheduler knobs
+# (clip_length / max_regions / cold_start_s / lead / target_fps), and UI language preference
+# ("auto" | "zh-CN" | "en"). Deliberately stdlib-only (json/os/pathlib/tempfile +
+# dataclasses/typing), no dependency on sumu_core/torch, so this module is importable and
+# testable in complete isolation (see scripts/verify_settings.py).
 #
 # Crash-safety invariant: settings.json is user-editable/deletable state living outside the repo.
 # A missing, empty, or corrupt file must NEVER turn a clean run into a crash -- load() always
@@ -23,6 +24,12 @@ from pathlib import Path
 from typing import Optional
 
 RECENT_CAP = 10
+
+# UI language preference: "auto" follows the OS; otherwise a supported catalog code.
+# Keep the allowed set in sync with sumu.i18n.SUPPORTED_LANGS (settings stays stdlib-only
+# and must not import i18n, so the list is duplicated here as a clamp table).
+LANGUAGE_AUTO = "auto"
+LANGUAGE_CHOICES = ("auto", "zh-CN", "en", "ja")
 
 # Target session fps preference: 0 = keep source rate ("原始"); 30 / 60 = pick best 1/N
 # temporal downsample so source_fps/N is nearest the target (never upsamples).
@@ -82,6 +89,9 @@ class Settings:
     # AI frontier lead / buffer window (frames): stockpile restored frames for hard segments.
     # Runtime still clamps to native decode-ahead ring (see Scheduler._effective_lead).
     lead: int = LEAD_DEFAULT
+    # UI language: "auto" (OS) or a supported catalog code ("zh-CN" / "en"). Resolved at
+    # startup by sumu.i18n.set_language(); unknown values clamp to "auto" on load/save.
+    language: str = LANGUAGE_AUTO
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by normcase, cap at RECENT_CAP entries (oldest dropped).
@@ -156,6 +166,17 @@ def clamp_target_fps(value) -> int:
     if v in TARGET_FPS_CHOICES:
         return v
     return TARGET_FPS_ORIGINAL
+
+
+def clamp_language(value) -> str:
+    """'auto' | 'zh-CN' | 'en'. Unknown / non-str → 'auto'."""
+    if not isinstance(value, str):
+        return LANGUAGE_AUTO
+    v = value.strip()
+    for code in LANGUAGE_CHOICES:
+        if v.lower() == code.lower():
+            return code
+    return LANGUAGE_AUTO
 
 
 def fps_div_for_target(source_fps: float, target_fps: int) -> int:
@@ -251,6 +272,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             clip_length=clamp_clip_length(data.get("clip_length", CLIP_LENGTH_DEFAULT)),
             max_regions=clamp_max_regions(data.get("max_regions", MAX_REGIONS_DEFAULT)),
             lead=clamp_lead(data.get("lead", LEAD_DEFAULT)),
+            language=clamp_language(data.get("language", LANGUAGE_AUTO)),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -276,6 +298,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "clip_length": clamp_clip_length(settings.clip_length),
             "max_regions": clamp_max_regions(settings.max_regions),
             "lead": clamp_lead(settings.lead),
+            "language": clamp_language(settings.language),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

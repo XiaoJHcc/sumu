@@ -29,6 +29,7 @@ import time
 import sumu_core  # noqa: E402
 from sumu.pipeline import build_models, default_restoration_model_path  # noqa: E402
 from sumu import settings as settings_mod  # noqa: E402 -- M-E: persisted volume/mute/recent/resume
+from sumu import i18n as i18n_mod  # noqa: E402
 
 
 class _WarmupState:
@@ -192,10 +193,15 @@ def main():
     args = ap.parse_args()
 
     settings = settings_mod.load()
+    # Resolve language before the first overlay frame so native labels + status/compile
+    # strings match the OS (or settings.language) from tick 1.
+    lang = i18n_mod.set_language(settings.language)
+    print(f"== i18n == preference={settings.language!r} active={lang!r}", file=sys.stderr)
 
     player = sumu_core.Player(args.width, args.height, args.maximized)
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
+    i18n_mod.apply_to_player(player, settings.language)
     # fps_div is derived per open from target_fps + source_fps (not a global fixed skip).
 
     # Kick off model warmup in the background immediately -- the window is already up (Player's
@@ -280,7 +286,9 @@ def main():
         unsupported containers land here (native decoder.open throws RuntimeError)."""
         nonlocal open_error_text, open_error_until
         name = os.path.basename(path) if path else ""
-        open_error_text = f"无法打开：{name}" if name else "无法打开该视频"
+        open_error_text = (
+            i18n_mod.t("open_failed_named", name=name) if name else i18n_mod.t("open_failed")
+        )
         open_error_until = time.monotonic() + _OPEN_ERROR_HOLD_S
         print(f"== open failed == {path!r}: {err}", file=sys.stderr)
 
@@ -377,18 +385,18 @@ def main():
                 open_error_text = ""
                 status_text = ""
             elif warm_error is not None:
-                status_text = "预热失败（将播放原片）"
+                status_text = i18n_mod.t("warmup_failed")
             elif scheduler is not None or warm_ready:
                 status_text = ""
             elif not opened:
                 # First screen (no file open yet): the middle compile-prompt region already
                 # conveys startup state and shows from frame 1 -- a separate bottom-left
-                # "正在预热模型…" float that appears then vanishes a few seconds later is exactly
+                # warmup float that appears then vanishes a few seconds later is exactly
                 # the startup flicker we're removing, so suppress it here. The float is kept only
                 # for the file-open-mid-warmup case below (and the warm_error case above).
                 status_text = ""
             else:
-                status_text = "正在预热模型…"
+                status_text = i18n_mod.t("warmup_status")
             player.set_status_text(status_text)
 
             # On-demand TRT compile state machine. First consume a finished compile (hot-swap the
@@ -435,20 +443,24 @@ def main():
                 frac = (cs_step / cs_total) if cs_total else 0.0
                 compile_ui_state = _COMPILE_UI_RUNNING
                 compile_progress = frac
-                compile_ui_text = f"正在编译加速引擎 {cs_step}/{cs_total}…（首次，需数分钟）"
+                compile_ui_text = i18n_mod.t(
+                    "compile_running", step=cs_step, total=cs_total
+                )
             elif compile_state is not None and cs_done and not cs_ok:
-                compile_ui_state, compile_progress, compile_ui_text = _COMPILE_UI_FAILED, 0.0, "编译失败"
+                compile_ui_state, compile_progress, compile_ui_text = (
+                    _COMPILE_UI_FAILED, 0.0, i18n_mod.t("compile_failed")
+                )
             elif compile_requested:
                 # Latched click, waiting on warmup/model readiness before the compile thread can
                 # actually spawn (below) -- show the progress bar right away so the button
                 # disappears on the very next tick instead of staying clickable while queued.
                 compile_ui_state = _COMPILE_UI_RUNNING
                 compile_progress = 0.0
-                compile_ui_text = "准备编译加速引擎…"
+                compile_ui_text = i18n_mod.t("compile_preparing")
             else:
                 compile_ui_state = _COMPILE_UI_IDLE
                 compile_progress = 0.0
-                compile_ui_text = "首次使用需要为你的显卡编译去码加速引擎（大约几分钟）"
+                compile_ui_text = i18n_mod.t("compile_prompt")
             player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
 
             ai_restore_fps = -1.0

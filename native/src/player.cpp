@@ -863,15 +863,37 @@ public:
     // either garbling the title-bar name or failing to open the file. This one call site is
     // fixed at the source (return value is guaranteed UTF-8); the rest of the ANSI Win32 calls
     // elsewhere in this file (CreateWindowExA etc.) are untouched, out of scope here.
+    static std::wstring utf8_to_wide(const std::string& s)
+    {
+        if (s.empty()) return std::wstring();
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        if (n <= 0) return std::wstring();
+        std::wstring w(static_cast<size_t>(n - 1), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+        return w;
+    }
+
     std::string pick_open_file()
     {
         wchar_t file_buf[MAX_PATH] = {};
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = hwnd_;
-        ofn.lpstrFilter =
-            L"Video Files\0*.mp4;*.mkv;*.mov;*.avi;*.hevc;*.h265;*.ts\0"
-            L"All Files\0*.*\0\0";
+        // Double-NUL-terminated filter; labels come from the i18n string table.
+        // Must stay alive until GetOpenFileNameW returns (local wstring is fine).
+        std::wstring filter;
+        auto append_filter_pair = [&](const std::string& label_utf8, const wchar_t* patterns) {
+            std::wstring label = utf8_to_wide(label_utf8);
+            filter.append(label);
+            filter.push_back(L'\0');
+            filter.append(patterns);
+            filter.push_back(L'\0');
+        };
+        append_filter_pair(ui_str_.dialog_video_files,
+            L"*.mp4;*.mkv;*.mov;*.avi;*.hevc;*.h265;*.ts");
+        append_filter_pair(ui_str_.dialog_all_files, L"*.*");
+        filter.push_back(L'\0');
+        ofn.lpstrFilter = filter.c_str();
         ofn.lpstrFile = file_buf;
         ofn.nMaxFile = static_cast<DWORD>(ARRAYSIZE(file_buf));
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -1198,6 +1220,44 @@ public:
         compile_ui_state_ = state;
         compile_ui_progress_ = progress;
         compile_ui_text_ = text;
+    }
+
+    // UI string table for ImGui labels / tooltips / open-file filter. Python owns catalogs
+    // (sumu.i18n) and pushes the resolved table once at startup (and on language change).
+    // Main-thread only; missing keys leave the previous/default value in place.
+    void set_ui_strings(const py::dict& d)
+    {
+        auto take = [&](const char* key, std::string& dest) {
+            if (!d.contains(key)) return;
+            try {
+                std::string v = py::cast<std::string>(d[key]);
+                if (!v.empty()) dest = std::move(v);
+            } catch (const py::cast_error&) {
+                // ignore non-str values -- keep prior string
+            }
+        };
+        take("splash_loading", ui_str_.splash_loading);
+        take("open_prompt", ui_str_.open_prompt);
+        take("open_file", ui_str_.open_file);
+        take("compile_retry", ui_str_.compile_retry);
+        take("compile_engine", ui_str_.compile_engine);
+        take("settings_title", ui_str_.settings_title);
+        take("lead_label", ui_str_.lead_label);
+        take("lead_tooltip", ui_str_.lead_tooltip);
+        take("clip_length_label", ui_str_.clip_length_label);
+        take("clip_length_tooltip", ui_str_.clip_length_tooltip);
+        take("max_regions_label", ui_str_.max_regions_label);
+        take("max_regions_tooltip", ui_str_.max_regions_tooltip);
+        take("cold_start_label", ui_str_.cold_start_label);
+        take("cold_start_tooltip", ui_str_.cold_start_tooltip);
+        take("target_fps_label", ui_str_.target_fps_label);
+        take("target_fps_original", ui_str_.target_fps_original);
+        take("target_fps_tooltip", ui_str_.target_fps_tooltip);
+        take("diagnostics_title", ui_str_.diagnostics_title);
+        take("ai_speed", ui_str_.ai_speed);
+        take("ai_speed_unknown", ui_str_.ai_speed_unknown);
+        take("dialog_video_files", ui_str_.dialog_video_files);
+        take("dialog_all_files", ui_str_.dialog_all_files);
     }
 
     py::dict take_ui_intents()
@@ -1836,19 +1896,24 @@ private:
         // (ScaleAllSizes in apply_ui_dpi multiplies this with the monitor scale).
         ImGui::GetStyle().FrameRounding = 6.0f;
 
-        // CJK glyph support -- without this, any non-ASCII text (CJK filenames picked via
-        // pick_open_file(), the Chinese UI labels below) renders as tofu boxes. MUST run
-        // before ImGui_ImplDX11_Init()/CreateDeviceObjects() below: the font atlas has to be
-        // fully configured before the device objects (including the font texture) are built.
-        // Loaded at runtime from the system font directory only -- never bundled/committed,
-        // so no license/redistribution concern. Tries a short candidate list, falling back
-        // through progressively less-common CJK fonts. GetGlyphRangesChineseSimplifiedCommon()
-        // (ASCII + ~2500 common simplified Han glyphs) keeps the atlas far smaller than
-        // GetGlyphRangesChineseFull() while covering filenames/UI labels. SizePixels is the
-        // unscaled base (18px at 96 DPI); style.FontScaleDpi multiplies it at runtime so a
-        // 150%/200% Windows scale actually enlarges the glyphs (see apply_ui_dpi()).
+        // CJK glyph support -- without this, non-ASCII UI (zh/ja labels, CJK filenames from
+        // pick_open_file()) renders as tofu. MUST run before ImGui_ImplDX11_Init()/
+        // CreateDeviceObjects(): the font atlas has to be configured before the font texture
+        // is built. System fonts only (never bundled). Glyph ranges: merge Simplified Chinese
+        // common + Japanese so zh-CN / ja / mixed filenames all cover without knowing the UI
+        // language at ui_init() time (language is pushed later via set_ui_strings). Ranges
+        // vector must outlive AddFontFromFileTTF until the atlas is built -- kept as a
+        // Player member. SizePixels is the unscaled base (18px at 96 DPI); FontScaleDpi
+        // multiplies it at runtime (see apply_ui_dpi()).
+        ImFontGlyphRangesBuilder ranges_builder;
+        ranges_builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        ranges_builder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        ranges_builder.BuildRanges(&font_glyph_ranges_);
         static const char* kCjkFontCandidates[] = {
-            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttc",      // Microsoft YaHei (zh-CN systems)
+            "C:\\Windows\\Fonts\\YuGothM.ttc",   // Yu Gothic Medium (ja systems)
+            "C:\\Windows\\Fonts\\meiryo.ttc",
+            "C:\\Windows\\Fonts\\msgothic.ttc",
             "C:\\Windows\\Fonts\\simhei.ttf",
             "C:\\Windows\\Fonts\\simsun.ttc",
             "C:\\Windows\\Fonts\\msyhl.ttc",
@@ -1859,7 +1924,7 @@ private:
             if (!probe.good()) continue;
             probe.close();
             if (io.Fonts->AddFontFromFileTTF(font_path, 18.0f, nullptr,
-                    io.Fonts->GetGlyphRangesChineseSimplifiedCommon())) {
+                    font_glyph_ranges_.Data)) {
                 fprintf(stderr, "[sumu] CJK font loaded: %s\n", font_path);
                 cjk_font_loaded = true;
                 break;
@@ -2009,7 +2074,7 @@ private:
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("##sumu_splash", nullptr, flags);
-        const char* text = u8"加载中…";
+        const char* text = ui_str_.splash_loading.c_str();
         ImVec2 tsize = ImGui::CalcTextSize(text);
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, (io.DisplaySize.y - tsize.y) * 0.5f));
         ImGui::TextUnformatted(text);
@@ -2039,7 +2104,7 @@ private:
         const float logo_gap = ui_s(16.0f);
         bool have_logo = logo_srv_ != nullptr;
 
-        const char* prompt = u8"拖入视频文件到此处，或";
+        const char* prompt = ui_str_.open_prompt.c_str();
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
         const float open_btn_w = ui_s(120.0f), open_btn_h = ui_s(32.0f);
         const float gap = ui_s(16.0f);
@@ -2077,7 +2142,7 @@ private:
         ImGui::TextUnformatted(prompt);
 
         ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - open_btn_w) * 0.5f, y + tsize.y + gap));
-        if (ImGui::Button(u8"打开文件", ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
+        if (ImGui::Button(ui_str_.open_file.c_str(), ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
 
         if (show_compile) {
             float region_x = (io.DisplaySize.x - compile_cw) * 0.5f;
@@ -2144,7 +2209,8 @@ private:
                 ImGui::ProgressBar(compile_ui_progress_, ImVec2(compile_cw, compile_bar_h));
             } else {
                 // idle (1) or failed (3): a click records the compile/retry intent
-                const char* label = failed ? u8"重试" : u8"编译加速引擎";
+                const char* label = failed ? ui_str_.compile_retry.c_str()
+                                           : ui_str_.compile_engine.c_str();
                 ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - compile_btn_w) * 0.5f, cy2));
                 if (ImGui::Button(label, ImVec2(compile_btn_w, compile_btn_h))) record_compile_engine();
             }
@@ -2606,7 +2672,7 @@ private:
         // squeezes long CJK labels out of a narrow panel).
         ImGui::PushItemWidth(-1.0f);
 
-        ImGui::TextUnformatted(u8"设置");
+        ImGui::TextUnformatted(ui_str_.settings_title.c_str());
         ImGui::Separator();
         // Gap between a field's label and the previous row's slider (label↔own control stays tight).
         const float field_gap = ui_s(6.0f);
@@ -2614,42 +2680,39 @@ private:
             ImGui::Dummy(ImVec2(0.0f, field_gap));
             ImGui::TextUnformatted(label);
         };
-        settings_label(u8"缓冲窗口（帧）");
+        settings_label(ui_str_.lead_label.c_str());
         ImGui::SliderInt("##lead", &settings_edit_lead_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_lead_ != ui_cfg_lead_)
             ui_intents_.lead = settings_edit_lead_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s",
-                u8"AI 相对播放头的超前缓冲（帧数），简单段囤去码帧给难段消费。");
-        settings_label(u8"处理片段长度（帧）");
+            ImGui::SetTooltip("%s", ui_str_.lead_tooltip.c_str());
+        settings_label(ui_str_.clip_length_label.c_str());
         ImGui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_clip_length_ != ui_cfg_clip_length_)
             ui_intents_.clip_length = settings_edit_clip_length_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s",
-                u8"BasicVSR++ 每批处理的连续帧数。更短响应更快、画面更易\n"
-                u8"规律抖动；更长更稳但首批延迟更高（TRT 上限 180）。");
-        settings_label(u8"同帧最多区块数");
+            ImGui::SetTooltip("%s", ui_str_.clip_length_tooltip.c_str());
+        settings_label(ui_str_.max_regions_label.c_str());
         ImGui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_max_regions_ != ui_cfg_max_regions_)
             ui_intents_.max_regions = settings_edit_max_regions_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s",
-                u8"同一帧最多同时去码的马赛克区块数，调高性能消耗将会倍增。");
-        settings_label(u8"冷启动跳过（秒）");
+            ImGui::SetTooltip("%s", ui_str_.max_regions_tooltip.c_str());
+        settings_label(ui_str_.cold_start_label.c_str());
         ImGui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_cold_start_s_ != ui_cfg_cold_start_s_)
             ui_intents_.cold_start_s = settings_edit_cold_start_s_;
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s",
-                u8"拖动进度条后先播原片，AI 从该秒数之后起跑。");
+            ImGui::SetTooltip("%s", ui_str_.cold_start_tooltip.c_str());
         {
-            const char* target_fps_items[] = { u8"原始", "30", "60" };
-            settings_label(u8"目标帧率");
+            const char* target_fps_items[] = {
+                ui_str_.target_fps_original.c_str(), "30", "60"
+            };
+            settings_label(ui_str_.target_fps_label.c_str());
             if (ImGui::Combo("##target_fps", &settings_edit_target_fps_idx_, target_fps_items, 3)) {
                 // Combo is click-select (no drag) -- commit on the selection change itself.
                 static const int kTargetFpsByIdx[] = { 0, 30, 60 };
@@ -2660,9 +2723,7 @@ private:
                     ui_intents_.target_fps = fps;
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-                ImGui::SetTooltip("%s",
-                    u8"原始 = 按片源帧率播；30/60 = 按片源自动选最佳 1/N 抽帧，\n"
-                    u8"使有效帧率最接近目标（不会上采样；30fps 片选 30 仍全帧）。");
+                ImGui::SetTooltip("%s", ui_str_.target_fps_tooltip.c_str());
         }
 
         // Phase 6 M-D: instant native toggle -- each frame the local bool is re-seeded from the
@@ -2673,14 +2734,14 @@ private:
         //     ai_enabled_.store(local_ai, std::memory_order_relaxed);
 
         ImGui::Separator();
-        ImGui::TextUnformatted(u8"诊断");
+        ImGui::TextUnformatted(ui_str_.diagnostics_title.c_str());
         // Net BasicVSR restore throughput from Python Scheduler (restore_clip wall time only;
         // excludes frontier-gate sleeps). Pushed each tick via set_ui_config; <0 means no
         // restore has finished yet (or no scheduler).
         if (ui_cfg_ai_restore_fps_ >= 0.0f)
-            ImGui::Text(u8"AI 处理速度：%.1f fps", ui_cfg_ai_restore_fps_);
+            ImGui::Text(ui_str_.ai_speed.c_str(), ui_cfg_ai_restore_fps_);
         else
-            ImGui::TextUnformatted(u8"AI 处理速度：—");
+            ImGui::TextUnformatted(ui_str_.ai_speed_unknown.c_str());
 
         ImGui::PopItemWidth();
         ImGui::End();
@@ -4158,6 +4219,10 @@ private:
     // Pre-ScaleAllSizes snapshot of ImGuiStyle (captured once in ui_init after StyleColorsDark).
     // apply_ui_dpi() copies this then ScaleAllSizes(scale) so repeated DPI changes don't compound.
     ImGuiStyle ui_style_base_{};
+    // Glyph ranges for the CJK system font (zh common + Japanese). Built in ui_init and
+    // must outlive AddFontFromFileTTF until the atlas is built -- ImFontConfig keeps a
+    // pointer into this vector.
+    ImVector<ImWchar> font_glyph_ranges_;
 
     // ---- UI draw-data handoff (M2) -- ui_pending_ is main-thread-written/present-moved-out,
     // ui_active_ is present-thread-exclusive (never touched under ui_mutex_ once moved into).
@@ -4189,12 +4254,39 @@ private:
     int compile_ui_state_ = 0;
     float compile_ui_progress_ = 0.0f;
     std::string compile_ui_text_;
+    // ImGui / open-dialog labels. Empty until Python set_ui_strings() fills them
+    // (daily path: apply_to_player right after Player ctor, before first ui_tick).
+    // Copy lives only in python/sumu/locales/*.json -- no C++ text duplicates.
+    struct UiStrings {
+        std::string splash_loading;
+        std::string open_prompt;
+        std::string open_file;
+        std::string compile_retry;
+        std::string compile_engine;
+        std::string settings_title;
+        std::string lead_label;
+        std::string lead_tooltip;
+        std::string clip_length_label;
+        std::string clip_length_tooltip;
+        std::string max_regions_label;
+        std::string max_regions_tooltip;
+        std::string cold_start_label;
+        std::string cold_start_tooltip;
+        std::string target_fps_label;
+        std::string target_fps_original;
+        std::string target_fps_tooltip;
+        std::string diagnostics_title;
+        std::string ai_speed;
+        std::string ai_speed_unknown;
+        std::string dialog_video_files;
+        std::string dialog_all_files;
+    } ui_str_;
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
     float settings_edit_cold_start_s_ = 1.0f;
     int settings_edit_lead_ = 180;
-    int settings_edit_target_fps_idx_ = 0; // 0=原始, 1=30, 2=60
+    int settings_edit_target_fps_idx_ = 0; // 0=original, 1=30, 2=60
     // Atomic: written on the main thread (toggle_fullscreen()) but read on the PRESENT thread by
     // fit_viewport() (whether to reserve the title-bar strip) as well as the main thread
     // (build_top_bar()'s auto-hide, is_fullscreen(), resize_window_for_video()). relaxed is
@@ -4668,6 +4760,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
         .def("set_compile_ui", &Player::set_compile_ui,
              py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
+        .def("set_ui_strings", &Player::set_ui_strings, py::arg("strings")) // i18n label table
 
         .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_
         .def("seek", &Player::seek, py::arg("frame_num"))

@@ -116,7 +116,12 @@ hiddenimports += [
     "sumu.pipeline",
     "sumu.scheduler",
     "sumu.settings",
+    "sumu.i18n",
 ] + collect_submodules("sumu")
+
+# UI message catalogs (JSON). Embedded fallbacks in i18n.py cover a missing tree, but
+# shipping the files keeps translations editable without a rebuild.
+datas += [(os.path.join(ROOT, "python", "sumu", "locales"), "sumu/locales")]
 
 # native extension + its co-located ffmpeg DLLs (loaded by sumu_core via
 # load-time import / LOAD_WITH_ALTERED_SEARCH_PATH -- must stay next to it)
