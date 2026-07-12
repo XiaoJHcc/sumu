@@ -6,10 +6,11 @@
 # NEVER run pyinstaller against scripts/sumu_main.py directly -- that would
 # generate/clobber a fresh (unconfigured) spec instead of using this one.
 #
-# This is a torch+CUDA+TensorRT app: expect a large (~4-6GB) onedir bundle and
-# a slow first analysis pass. Weights are NOT bundled here -- they're staged
-# next to the exe by scripts/build_dist.ps1 (sumu.ai._default_model_weights_dir()
-# resolves <dir of sys.executable>/model_weights at runtime when sys.frozen).
+# This is a torch+CUDA+TensorRT app: expect a large (~7GB after layer-1 strip)
+# onedir bundle and a slow first analysis pass. Weights are NOT bundled here --
+# they're staged next to the exe by scripts/build_dist.ps1
+# (sumu.ai._default_model_weights_dir() resolves
+# <dir of sys.executable>/model_weights at runtime when sys.frozen).
 import os
 import sys
 
@@ -22,6 +23,49 @@ from PyInstaller.utils.hooks import (
     collect_submodules,
     copy_metadata,
 )
+
+# Runtime-unused payload that collect_all(torch/ultralytics/...) otherwise ships.
+# Verified by quarantine smoke on the target machine (docs/packaging.md):
+#   - torch/lib/*.lib + include/testing/share (~2.7GB): link/dev artifacts
+#   - polars / scipy / matplotlib (~0.26GB): ultralytics/mmengine optional deps;
+#     YOLO predict + BasicVSR++ load path never import them
+# KEEP: PIL (ultralytics imports it eagerly) and tcl/tk (pyi_rth__tkinter hard-requires
+# _tcl_data even though the player never uses tkinter).
+_LAYER1_MOD_PREFIXES = ("polars", "scipy", "matplotlib", "mpl_toolkits")
+_LAYER1_PATH_PREFIXES = (
+    "torch/include/",
+    "torch/testing/",
+    "torch/share/",
+    "polars/",
+    "_polars_runtime_32/",
+    "scipy/",
+    "scipy.libs/",
+    "matplotlib/",
+    "mpl_toolkits/",
+)
+
+
+def _is_layer1_bloat(dest_name: str, src_path: str = "") -> bool:
+    n = dest_name.replace("\\", "/")
+    nl = n.lower()
+    src = (src_path or "").replace("\\", "/").lower()
+    # torch ships MSVC import/static libs next to CUDA DLLs. dest may be
+    # torch/lib/foo.lib or bare foo.lib depending on the collector; use src
+    # as a fallback so we don't keep ~2.7GB of link-time artifacts.
+    if nl.endswith(".lib") and (
+        nl.startswith("torch/")
+        or "/torch/" in f"/{nl}"
+        or "site-packages/torch/" in src
+        or "/torch/lib/" in f"/{src}"
+    ):
+        return True
+    for p in _LAYER1_PATH_PREFIXES:
+        if nl == p.rstrip("/") or nl.startswith(p):
+            return True
+    for m in _LAYER1_MOD_PREFIXES:
+        if nl == m or nl.startswith(m + ".") or nl.startswith(m + "/"):
+            return True
+    return False
 
 # SPECPATH is injected by PyInstaller into this file's globals -- it's the
 # directory containing THIS .spec file (packaging/), not the invocation cwd.
@@ -97,17 +141,42 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[os.path.join(ROOT, "packaging", "rthook_dll_path.py")],
-    excludes=["av"],
+    # av: daily entry never uses PyAV (only run_player --correctness).
+    # polars/scipy/matplotlib: ultralytics/mmengine optional deps; layer-1 strip
+    # also filters whatever collect_all still injects into binaries/datas/pure.
+    excludes=["av", "polars", "scipy", "matplotlib", "mpl_toolkits"],
     noarchive=False,
     cipher=block_cipher,
 )
+
+# Layer-1 size strip (post-Analysis). collect_all / collect_dynamic_libs ignore
+# excludes= for binary/data payloads, so filter TOC entries here. See
+# _is_layer1_bloat above and docs/packaging.md for the measured savings.
+def _strip_layer1(toc, label):
+    kept, dropped = [], []
+    for entry in toc:
+        dest = entry[0]
+        src = entry[1] if len(entry) > 1 else ""
+        if _is_layer1_bloat(dest, src):
+            dropped.append(dest)
+        else:
+            kept.append(entry)
+    if dropped:
+        print(f"[sumu.spec] layer1 strip {label}: dropped {len(dropped)} entries "
+              f"(e.g. {dropped[:3]})")
+    return kept
+
+
+a.binaries = _strip_layer1(a.binaries, "binaries")
+a.datas = _strip_layer1(a.datas, "datas")
+a.pure = _strip_layer1(a.pure, "pure")
 
 # SUMU_FAST_FREEZE (set by scripts/build_dist.ps1 -FastFreeze): skip COLLECT.
 # COLLECT.assemble() unconditionally _make_clean_directory()s the whole onedir
 # tree and re-copies every binary/data file every run (PyInstaller has no
 # incremental copy there -- see PyInstaller/building/api.py COLLECT._check_guts,
 # which always returns True "in order to clean the output directory"). That's
-# a full re-copy of ~9-10GB of torch/cv2/tensorrt payload that never changes
+# a full re-copy of ~7GB of torch/cv2/tensorrt payload that never changes
 # between ordinary dev iterations. EXE(exclude_binaries=True) itself only
 # writes the thin bootloader+PYZ exe (our own compiled Python) to
 # build/sumu/sumu.exe and does NOT touch dist/ -- so when only sumu's own
