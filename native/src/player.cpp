@@ -3386,9 +3386,15 @@ private:
                 // Source timeline -> session timeline. Decode every GOP frame (required for
                 // HEVC/H.264); only keep every fps_div-th as a dense session frame so the rest
                 // of the player is identical to a native lower-fps file.
+                // frame_num is derived from presentation PTS (Decoder prefers
+                // best_effort_timestamp). Negative can appear only if a bad first_pts origin
+                // was locked before a earlier-PTS frame arrived -- drop rather than wrap into
+                // the ring tail (which would present as a flash of the wrong nearby frame).
                 int div = fps_div_.load(std::memory_order_relaxed);
                 if (div < 1) div = 1;
                 int64_t source_frame = static_cast<int64_t>(std::llround(df.pts_seconds * source_fps_));
+                if (source_frame < 0)
+                    continue;
                 if (div > 1 && (source_frame % div) != 0)
                     continue;
                 int64_t frame_num = source_frame / div;

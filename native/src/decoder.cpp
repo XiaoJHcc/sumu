@@ -192,6 +192,12 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     codec_ctx_->opaque = this;
     codec_ctx_->get_format = &Decoder::get_hw_format_thunk;
     codec_ctx_->thread_count = 1; // single-threaded decode: keeps this on one D3D11 call sequence
+    // Required for correct pts/dts → frame timestamp conversion (esp. B-frames). Without this,
+    // files whose container stamps PTS==DTS despite has_b_frames>0 can leave frame->pts in
+    // decode order; best_effort_timestamp then can't recover a presentation timeline either.
+    codec_ctx_->pkt_timebase = stream->time_base;
+    if (stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0)
+        codec_ctx_->framerate = stream->avg_frame_rate;
 
     AVDictionary* opts = nullptr;
     if (avcodec_open2(codec_ctx_, decoder, &opts) < 0) {
@@ -215,6 +221,25 @@ bool Decoder::seek_to_start()
     return ret >= 0;
 }
 
+// Presentation timestamp for a just-received AVFrame.
+// Prefer best_effort_timestamp: for files with B-frames whose container stamped PTS==DTS
+// (common bad remux), frame->pts stays in decode order and would map frame_num backwards
+// (visible as nearby-frame flicker). best_effort_timestamp is FFmpeg's presentation-order
+// estimate (equals pts when the container timestamps are already correct).
+static double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base, double fps,
+                                    double last_out_pts_seconds)
+{
+    int64_t ts = AV_NOPTS_VALUE;
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+        ts = frame->best_effort_timestamp;
+    else if (frame->pts != AV_NOPTS_VALUE)
+        ts = frame->pts;
+    if (ts != AV_NOPTS_VALUE)
+        return ts * av_q2d(time_base);
+    // No timestamp at all: step one frame from the last remapped output (best-effort only).
+    return last_out_pts_seconds + 1.0 / fps;
+}
+
 int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
 {
     for (;;) {
@@ -228,9 +253,7 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
             }
             out.texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
             out.array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
-            raw_pts_s_out = (frame_->pts != AV_NOPTS_VALUE)
-                ? frame_->pts * av_q2d(time_base_)
-                : (last_out_pts_seconds_ + 1.0 / fps_);
+            raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, fps_, last_out_pts_seconds_);
             return 1;
         }
         if (recv == AVERROR(EAGAIN)) {
@@ -270,9 +293,7 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
             if (drain == 0) {
                 out.texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
                 out.array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
-                raw_pts_s_out = (frame_->pts != AV_NOPTS_VALUE)
-                    ? frame_->pts * av_q2d(time_base_)
-                    : (last_out_pts_seconds_ + 1.0 / fps_);
+                raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, fps_, last_out_pts_seconds_);
                 return 1; // caller sees this as a normal frame; next pump call will see EOF again
             }
             return 0; // genuinely nothing left
