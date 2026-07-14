@@ -56,11 +56,30 @@ def default_path() -> Path:
     return Path.home() / ".sumu" / "settings.json"
 
 
+def _is_network_url(path: str) -> bool:
+    """http(s) sources must not go through abspath/normcase -- that rewrites URLs into bogus
+    filesystem paths under the cwd. Keep this stdlib-only (no urllib) so settings stays
+    importable without extra deps."""
+    if not path:
+        return False
+    p = path.lstrip().lower()
+    return p.startswith("http://") or p.startswith("https://")
+
+
 def _norm_key(path: str) -> str:
     """Normalize a path for use as a `positions` dict key / `recent` dedup comparison --
     Windows paths are case-insensitive, so plain string equality would treat "C:\\a.mp4" and
-    "c:\\A.MP4" as different files. Only used by the push_recent/set_position/get_position
-    accessors below -- raw Settings.recent/.positions storage (as loaded/saved) is untouched."""
+    "c:\\A.MP4" as different files. http(s) URLs use a case-folded scheme/host-preserving key
+    (no abspath). Only used by the push_recent/set_position/get_position accessors below --
+    raw Settings.recent/.positions storage (as loaded/saved) is untouched."""
+    if _is_network_url(path):
+        # Preserve path/query case (servers may be case-sensitive); only fold scheme for dedup.
+        s = path.strip()
+        if s.lower().startswith("https://"):
+            return "https://" + s[8:]
+        if s.lower().startswith("http://"):
+            return "http://" + s[7:]
+        return s
     return os.path.normcase(os.path.abspath(path))
 
 
@@ -94,10 +113,12 @@ class Settings:
     language: str = LANGUAGE_AUTO
 
     def push_recent(self, path: str) -> None:
-        """Move-to-front, dedup by normcase, cap at RECENT_CAP entries (oldest dropped).
-        Stores a real usable absolute path (case preserved) -- only the dedup/ordering
-        comparison uses the case-insensitive normalized key, per _norm_key's contract."""
-        stored = os.path.abspath(path)
+        """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
+        Local files: store absolute path (case preserved). http(s): store the URL as given."""
+        if _is_network_url(path):
+            stored = path.strip()
+        else:
+            stored = os.path.abspath(path)
         key = _norm_key(path)
         self.recent = [p for p in self.recent if _norm_key(p) != key]
         self.recent.insert(0, stored)

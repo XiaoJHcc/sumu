@@ -53,7 +53,16 @@ public:
 
     // device: caller's D3D11 device (already created, same one used for the swapchain).
     // Returns false + fills `error` on failure. Populates fps()/width()/height()/frame_count().
+    // `path` may be a local filesystem path OR an http(s) URL (FFmpeg network protocols).
+    // Network URLs get timeout/reconnect/smaller probe options; see is_network().
     bool open(const std::string& path, ID3D11Device* device, std::string& error);
+
+    // True when the last successful open() treated `path` as a network URL (http/https).
+    // Player uses this to pick the shallow IO profile (smaller ring, no scrub second open).
+    bool is_network() const { return is_network_; }
+
+    // Scheme check only -- does not open anything. Shared with Player for early UI decisions.
+    static bool looks_like_network_url(const std::string& path);
 
     // Decode until one frame is available. Returns false on EOF or unrecoverable error --
     // does NOT loop back to the start (product policy: pause on last frame; decode_loop idles
@@ -170,6 +179,10 @@ private:
     double last_out_pts_seconds_ = -1.0;
 
     ID3D11Device* d3d_device_ = nullptr; // not owned
+
+    // Set in open() from looks_like_network_url(path); cleared in close(). Drives FFmpeg
+    // format options (timeout/reconnect/probesize) and is read by Player for IO profile.
+    bool is_network_ = false;
 
     // ---- audio (spike, additive) -----------------------------------------------------------
     int audio_stream_idx_ = -1; // -1 == no audio stream (legitimate, silent)
