@@ -478,13 +478,14 @@ wheels = [
 
 [[package]]
 name = "sumu"
-version = "0.0.1.dev0"
+version = "0.2.4"
 source = { virtual = "." }
 dependencies = [
     { name = "av", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "mmengine", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "numpy", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "opencv-python", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "pillow", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "pybind11", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "tensorrt-cu12-bindings", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "tensorrt-cu12-libs", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
@@ -502,6 +503,7 @@ requires-dist = [
     { name = "mmengine", specifier = "==0.10.7" },
     { name = "numpy" },
     { name = "opencv-python", specifier = "==4.12.0.88" },
+    { name = "pillow" },
     { name = "pybind11" },
     { name = "tensorrt-cu12-bindings", specifier = "==10.12.0.36", index = "https://pypi.nvidia.com/" },
     { name = "tensorrt-cu12-libs", specifier = "==10.12.0.36", index = "https://pypi.nvidia.com/" },
@@ -549,8 +551,8 @@ name = "tensorrt-cu12-bindings"
 version = "10.12.0.36"
 source = { registry = "https://pypi.nvidia.com/" }
 wheels = [
-    { url = "https://pypi.nvidia.com/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.12.0.36-cp312-none-win_amd64.whl", hash = "sha256:408af91113c22f58f2f08404bfc1548baa8d78ce6126bd543acdc9d5819662ff" },
-    { url = "https://pypi.nvidia.com/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.12.0.36-cp313-none-win_amd64.whl", hash = "sha256:3a1709e9dbaaef0f005681637a7d698f8609fec250716bbd184e3f3c40d8c4ea" },
+    { url = "https://pypi.nvidia.cn/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.12.0.36-cp312-none-win_amd64.whl", hash = "sha256:408af91113c22f58f2f08404bfc1548baa8d78ce6126bd543acdc9d5819662ff" },
+    { url = "https://pypi.nvidia.cn/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.12.0.36-cp313-none-win_amd64.whl", hash = "sha256:3a1709e9dbaaef0f005681637a7d698f8609fec250716bbd184e3f3c40d8c4ea" },
 ]
 
 [[package]]
@@ -561,7 +563,7 @@ dependencies = [
     { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://pypi.nvidia.com/tensorrt-cu12-libs/tensorrt_cu12_libs-10.12.0.36-py2.py3-none-win_amd64.whl", hash = "sha256:d0e22a1fc312486ab980c2b19ccaadb74123829a51a56c69f6dd2b6d356a74e9" },
+    { url = "https://pypi.nvidia.cn/tensorrt-cu12-libs/tensorrt_cu12_libs-10.12.0.36-py2.py3-none-win_amd64.whl", hash = "sha256:d0e22a1fc312486ab980c2b19ccaadb74123829a51a56c69f6dd2b6d356a74e9" },
 ]
 
 [[package]]
