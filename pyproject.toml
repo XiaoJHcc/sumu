@@ -56,6 +56,17 @@ torch-tensorrt = { index = "pytorch-cu128" }
 tensorrt-cu12-libs = { index = "nvidia" }
 tensorrt-cu12-bindings = { index = "nvidia" }
 
+# --- 构建期工具（打分发包用，不是运行时依赖）---
+# PyInstaller + hooks-contrib 只在 scripts/build_dist.ps1 的 freeze 阶段用到。
+# 放进 dev 组而非 [project].dependencies，这样 `uv sync` 会自动带回它们
+# （历史上 venv 被重建后这两个游离在 lock 外、需手动 pip install，见 docs/packaging.md），
+# 但普通运行/被 import 的依赖闭包里不会混入它们。版本对齐 docs/packaging.md。
+[dependency-groups]
+dev = [
+    "pyinstaller==6.21.0",
+    "pyinstaller-hooks-contrib==2026.6",
+]
+
 [tool.uv]
 # Pin the resolution environment to the target machine (win x86_64). This stops
 # uv from solving impossible splits (e.g. torch-tensorrt's tegra variant pulling
