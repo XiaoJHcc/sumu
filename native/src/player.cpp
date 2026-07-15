@@ -439,6 +439,13 @@ public:
     // resize_window_for_video() (adds it to the target client height).
     static constexpr float kTopBarHBase = 32.0f;
 
+    // Font size ladder (unscaled base @ 96 DPI). FontScaleDpi multiplies at runtime -- pass
+    // these to AddFontFromFileTTF / PushFont(NULL, size), never GetFontSize() (would double-scale).
+    //   kFontSizeBase -- body / chrome labels / buttons (default)
+    //   kFontSizeSm   -- secondary copy (hints, captions)
+    static constexpr float kFontSizeBase = 18.0f;
+    static constexpr float kFontSizeSm = 16.0f;
+
     // UI length at the current monitor DPI (96 DPI → 1.0). Multiplies every fixed-pixel chrome
     // constant (bars, buttons, icons, padding) so a 150%/200% Windows scale doesn't leave the
     // overlay looking tiny. Fonts ride style.FontScaleDpi (set by apply_ui_dpi); this helper is
@@ -1954,8 +1961,9 @@ private:
         // common + Japanese so zh-CN / ja / mixed filenames all cover without knowing the UI
         // language at ui_init() time (language is pushed later via set_ui_strings). Ranges
         // vector must outlive AddFontFromFileTTF until the atlas is built -- kept as a
-        // Player member. SizePixels is the unscaled base (18px at 96 DPI); FontScaleDpi
-        // multiplies it at runtime (see apply_ui_dpi()).
+        // Player member. SizePixels is kFontSizeBase (unscaled @ 96 DPI); FontScaleDpi
+        // multiplies it at runtime (see apply_ui_dpi()). Secondary copy uses PushFont(NULL,
+        // kFontSizeSm) -- same face, one step smaller (ImGui 1.92 dynamic sizing).
         ImFontGlyphRangesBuilder ranges_builder;
         ranges_builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
         ranges_builder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
@@ -1974,7 +1982,7 @@ private:
             std::ifstream probe(font_path, std::ios::binary);
             if (!probe.good()) continue;
             probe.close();
-            if (io.Fonts->AddFontFromFileTTF(font_path, 18.0f, nullptr,
+            if (io.Fonts->AddFontFromFileTTF(font_path, kFontSizeBase, nullptr,
                     font_glyph_ranges_.Data)) {
                 fprintf(stderr, "[sumu] CJK font loaded: %s\n", font_path);
                 cjk_font_loaded = true;
@@ -2283,6 +2291,8 @@ private:
     // ui_intents_.open_path so Python reuses the existing drop/open path (do_open/do_reopen).
     // Cancel / Esc / outside click only close the popup -- no transport side effects.
     // Popup id uses ### so the i18n title can change without breaking OpenPopup matching.
+    // Chrome matches the main window: 6px rounding, title-bar height = top_bar_h(), bg tone
+    // (0.14,0.14,0.16) same as build_top_bar / draw_splash.
     void build_open_url_popup()
     {
         if (open_url_popup_) {
@@ -2293,20 +2303,97 @@ private:
         ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(ui_s(480.0f), 0.0f), ImGuiCond_Appearing);
+
+        // Match main chrome (settings panel / status float / title bar), 8px corners + stroke.
+        // Border is self-drawn at EndPopup (foreground list) so title-strip fill cannot cover
+        // the top corner arcs; ImGui PopupBorderSize stays 0 to avoid a double/clipped stroke.
+        const float rounding = ui_s(8.0f);
+        const float border_sz = 1.0f;
+        const ImU32 border_col = IM_COL32(120, 120, 120, 230);
+        const ImVec4 chrome_bg(0.14f, 0.14f, 0.16f, 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f)); // custom title strip
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, chrome_bg);
+        // Pure black @ 50% over the chrome (default ModalWindowDimBg is a gray wash).
+        ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.50f));
+
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoTitleBar; // self-drawn title strip at top_bar_h()
+        // ID after ### matches OpenPopup("###sumu_open_url"); display name unused (NoTitleBar).
         const std::string modal_title =
             (ui_str_.open_url_title.empty() ? std::string("Open URL") : ui_str_.open_url_title)
             + "###sumu_open_url";
         if (!ImGui::BeginPopupModal(modal_title.c_str(), nullptr, flags)) {
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(3);
             return;
         }
 
+        const float bar_h = top_bar_h();
+        const float pad = ui_s(12.0f);
+        const float content_w = ui_s(440.0f);
+        const float win_w = content_w + pad * 2.0f;
+        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+        const float icon_th = ui_s(1.5f);
+
+        // Reserve full width + title-strip height so AlwaysAutoResize matches main chrome.
+        ImGui::Dummy(ImVec2(win_w, bar_h));
+
+        // ---- self-drawn title strip (height == main title bar, same bg tone) ----
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        const float strip_w = ImGui::GetWindowSize().x;
+        // Inset by border_sz so the later stroke isn't covered by this fill.
+        // Same hue as build_top_bar WindowBg / draw_splash clear (0.14,0.14,0.16).
+        dl->AddRectFilled(ImVec2(wpos.x + border_sz, wpos.y + border_sz),
+            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
+            IM_COL32(36, 36, 41, 255), std::max(0.0f, rounding - border_sz),
+            ImDrawFlags_RoundCornersTop);
+        dl->AddLine(ImVec2(wpos.x + border_sz, wpos.y + bar_h),
+            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
+            IM_COL32(120, 120, 120, 120), 1.0f);
+
+        // Title label -- same vertical center as build_top_bar basename; left inset matches body pad.
+        const char* title = ui_str_.open_url_title.empty() ? "Open URL" : ui_str_.open_url_title.c_str();
+        const float chrome_btn_w = ui_s(28.0f);
+        const float chrome_btn_h = bar_h - ui_s(4.0f);
+        {
+            float th = ImGui::GetTextLineHeight();
+            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
+            ImGui::SetCursorPosX(pad);
+            ImGui::TextUnformatted(title);
+        }
+
+        // Close X (same size / hollow-line weight / edge inset as the main top-bar close button).
+        ImGui::SetCursorPos(ImVec2(strip_w - chrome_btn_w - ui_s(4.0f), (bar_h - chrome_btn_h) * 0.5f));
+        {
+            IconButtonResult r = icon_button("##open_url_close", ImVec2(chrome_btn_w, chrome_btn_h));
+            if (r.clicked) {
+                open_url_show_error_ = false;
+                ImGui::CloseCurrentPopup();
+            }
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float half = ui_s(5.0f);
+            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
+        }
+
+        // ---- body ----
+        // WindowPadding is 0 for the custom title strip; Indent keeps every body line at `pad`
+        // (plain SetCursorPos only fixes the first line -- Text/Spacing reset X to 0).
+        ImGui::SetCursorPosY(bar_h + pad);
+        ImGui::Indent(pad);
+        ImGui::PushItemWidth(content_w);
+
         if (!ui_str_.open_url_hint.empty()) {
-            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + ui_s(440.0f));
+            ImGui::PushFont(nullptr, kFontSizeSm); // secondary copy (hint)
+            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + content_w);
             ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
             ImGui::PopTextWrapPos();
+            ImGui::PopFont();
             ImGui::Spacing();
         }
 
@@ -2314,7 +2401,6 @@ private:
             ImGui::SetKeyboardFocusHere();
             open_url_focus_ = false;
         }
-        ImGui::SetNextItemWidth(ui_s(440.0f));
         bool enter = ImGui::InputText("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
             ImGuiInputTextFlags_EnterReturnsTrue);
         if (open_url_show_error_ && !ui_str_.open_url_invalid.empty()) {
@@ -2327,8 +2413,8 @@ private:
         const float btn_w = ui_s(100.0f);
         const float btn_h = ui_s(28.0f);
         const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-            std::max(0.0f, (ImGui::GetContentRegionAvail().x - row_w) * 0.5f));
+        // Absolute X: left pad + center within content column.
+        ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
 
         auto trim_url = [](const char* raw) -> std::string {
             std::string s(raw ? raw : "");
@@ -2396,7 +2482,24 @@ private:
             ImGui::CloseCurrentPopup();
         }
 
+        // Bottom inset; content_w Dummy keeps right pad (= left Indent) under AlwaysAutoResize.
+        ImGui::Dummy(ImVec2(content_w, pad));
+        ImGui::PopItemWidth();
+        ImGui::Unindent(pad);
+
+        // Full outline on the foreground list so rounded top corners aren't clipped/covered
+        // by the title-strip fill or the window InnerClipRect.
+        {
+            ImVec2 a = ImGui::GetWindowPos();
+            ImVec2 b = ImVec2(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
+            ImGui::GetForegroundDrawList()->AddRect(
+                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
+                border_col, rounding, 0, border_sz);
+        }
+
         ImGui::EndPopup();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(3);
     }
 
     // Model-warmup status line (left-bottom float): built every build_ui() call (see its header
@@ -2870,42 +2973,59 @@ private:
         // squeezes long CJK labels out of a narrow panel).
         ImGui::PushItemWidth(-1.0f);
 
-        ImGui::TextUnformatted(ui_str_.settings_title.c_str());
-        ImGui::Separator();
-        // Gap between a field's label and the previous row's slider (label↔own control stays tight).
+        // Title: top pad = WindowPadding.y; bottom to separator slightly tighter.
+        {
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+            ImGui::TextUnformatted(ui_str_.settings_title.c_str());
+            ImGui::Dummy(ImVec2(0.0f, ui_s(8.0f)));
+            ImGui::Separator();
+            ImGui::PopStyleVar();
+        }
+        // Label vertical margins: top half of former field_gap, bottom fixed 1.
         const float field_gap = ui_s(6.0f);
         auto settings_label = [&](const char* label) {
-            ImGui::Dummy(ImVec2(0.0f, field_gap));
+            ImGui::Dummy(ImVec2(0.0f, field_gap * 0.5f));
+            ImGui::PushFont(nullptr, kFontSizeSm);
             ImGui::TextUnformatted(label);
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(0.0f, ui_s(1.0f)));
+        };
+        // Tooltips at kFontSizeSm (SetTooltip has no font arg -- BeginTooltip + PushFont).
+        auto settings_tooltip = [&](const char* text) {
+            if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) || !text || !text[0]) return;
+            ImGui::BeginTooltip();
+            ImGui::PushFont(nullptr, kFontSizeSm);
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+            ImGui::TextUnformatted(text);
+            ImGui::PopTextWrapPos();
+            ImGui::PopFont();
+            ImGui::EndTooltip();
         };
         settings_label(ui_str_.lead_label.c_str());
         ImGui::SliderInt("##lead", &settings_edit_lead_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_lead_ != ui_cfg_lead_)
             ui_intents_.lead = settings_edit_lead_;
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s", ui_str_.lead_tooltip.c_str());
+        settings_tooltip(ui_str_.lead_tooltip.c_str());
         settings_label(ui_str_.clip_length_label.c_str());
         ImGui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_clip_length_ != ui_cfg_clip_length_)
             ui_intents_.clip_length = settings_edit_clip_length_;
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s", ui_str_.clip_length_tooltip.c_str());
+        settings_tooltip(ui_str_.clip_length_tooltip.c_str());
         settings_label(ui_str_.max_regions_label.c_str());
         ImGui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_max_regions_ != ui_cfg_max_regions_)
             ui_intents_.max_regions = settings_edit_max_regions_;
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s", ui_str_.max_regions_tooltip.c_str());
+        settings_tooltip(ui_str_.max_regions_tooltip.c_str());
         settings_label(ui_str_.cold_start_label.c_str());
         ImGui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
         if (ImGui::IsItemDeactivatedAfterEdit() &&
             settings_edit_cold_start_s_ != ui_cfg_cold_start_s_)
             ui_intents_.cold_start_s = settings_edit_cold_start_s_;
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-            ImGui::SetTooltip("%s", ui_str_.cold_start_tooltip.c_str());
+        settings_tooltip(ui_str_.cold_start_tooltip.c_str());
         {
             const char* target_fps_items[] = {
                 ui_str_.target_fps_original.c_str(), "30", "60"
@@ -2920,8 +3040,7 @@ private:
                 if (fps != ui_cfg_target_fps_)
                     ui_intents_.target_fps = fps;
             }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-                ImGui::SetTooltip("%s", ui_str_.target_fps_tooltip.c_str());
+            settings_tooltip(ui_str_.target_fps_tooltip.c_str());
         }
 
         // Phase 6 M-D: instant native toggle -- each frame the local bool is re-seeded from the
@@ -2931,15 +3050,24 @@ private:
         // if (ImGui::Checkbox(u8"去码", &local_ai))
         //     ai_enabled_.store(local_ai, std::memory_order_relaxed);
 
-        ImGui::Separator();
-        ImGui::TextUnformatted(ui_str_.diagnostics_title.c_str());
+        // Separator: pad above (from combo), tighter pad below (to AI line).
+        {
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+            ImGui::Dummy(ImVec2(0.0f, ui_s(8.0f)));
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2(0.0f, ui_s(6.0f)));
+            ImGui::PopStyleVar();
+        }
         // Net BasicVSR restore throughput from Python Scheduler (restore_clip wall time only;
         // excludes frontier-gate sleeps). Pushed each tick via set_ui_config; <0 means no
         // restore has finished yet (or no scheduler).
+        ImGui::PushFont(nullptr, kFontSizeSm);
         if (ui_cfg_ai_restore_fps_ >= 0.0f)
             ImGui::Text(ui_str_.ai_speed.c_str(), ui_cfg_ai_restore_fps_);
         else
             ImGui::TextUnformatted(ui_str_.ai_speed_unknown.c_str());
+        ImGui::PopFont();
 
         ImGui::PopItemWidth();
         ImGui::End();

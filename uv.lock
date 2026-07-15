@@ -534,7 +534,7 @@ wheels = [
 
 [[package]]
 name = "sumu"
-version = "0.2.4"
+version = "0.2.6"
 source = { virtual = "." }
 dependencies = [
     { name = "av", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },

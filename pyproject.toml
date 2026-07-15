@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 [project]
 name = "sumu"
-version = "0.2.4"
+version = "0.2.6"
 description = "Clock-driven, all-GPU realtime de-mosaic preview player"
 requires-python = ">=3.12"
 license = "AGPL-3.0"
