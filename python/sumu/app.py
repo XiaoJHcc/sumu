@@ -80,6 +80,21 @@ class _CompileState:
         self.split = None         # the BasicVSRPlusPlusNetSplit to activate on success
 
 
+class _OpenState:
+    """Cross-thread handoff for async open/reopen (network URLs). open()/reopen() release the GIL
+    and may run tens of seconds on FFmpeg network IO; doing them on the main loop freezes the URL
+    float. Worker writes the terminal result once; main applies play/error + notify_open_url_finished."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.done = False
+        self.ok = False
+        self.error = None
+        self.path = None
+        self.is_reopen = False
+
+
 # Native compile-UI states pushed via player.set_compile_ui(state, progress, text).
 _COMPILE_UI_HIDDEN = 0
 _COMPILE_UI_IDLE = 1       # engines absent: show prompt + "compile" button
@@ -88,6 +103,25 @@ _COMPILE_UI_FAILED = 3     # compile failed: show error + "retry" button
 
 # How long the "无法打开" float stays visible after a failed open/reopen (seconds).
 _OPEN_ERROR_HOLD_S = 4.0
+
+
+def _open_worker(ostate: "_OpenState", player, path: str, is_reopen: bool) -> None:
+    """Blocking player.open/reopen off the main thread. GIL is released inside the native call."""
+    try:
+        if is_reopen:
+            player.reopen(path)
+        else:
+            player.open(path)
+        with ostate.lock:
+            ostate.ok = True
+            ostate.done = True
+            ostate.running = False
+    except Exception as e:  # noqa: BLE001 -- open failure must never crash the player
+        with ostate.lock:
+            ostate.error = e
+            ostate.ok = False
+            ostate.done = True
+            ostate.running = False
 
 
 def _compile_worker(cstate: "_CompileState", res_model, res_path, device, fp16) -> None:
@@ -292,19 +326,12 @@ def main():
         open_error_until = time.monotonic() + _OPEN_ERROR_HOLD_S
         print(f"== open failed == {path!r}: {err}", file=sys.stderr)
 
-    def do_open(path):
-        """First-ever open (opened is False): player.open() is decode-only and fast (no model
-        dependency), so this starts original/passthrough playback immediately -- the Scheduler
-        is deliberately NOT built here, only once warmup finishes (see the main loop's
-        "延迟建 scheduler" step below)."""
-        nonlocal opened, current_path, open_error_text, open_error_until
-        try:
-            player.open(path)
-        except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
-            _report_open_failed(path, e)
-            return
+    def _finish_open_success(path, is_reopen):
+        """Shared post-open bookkeeping after player.open/reopen succeeded (main thread)."""
+        nonlocal opened, current_path, open_error_text, open_error_until, video_meta
         apply_target_fps_for_open()
-        print(f"== player.open == fps={player.fps():.4f} frames={player.frame_count()} "
+        print(f"== player.{'reopen' if is_reopen else 'open'} == "
+              f"fps={player.fps():.4f} frames={player.frame_count()} "
               f"dims={player.dims()} source_fps={player.source_fps():.4f} "
               f"fps_div={player.fps_div()} target_fps={cfg_target_fps}"
               f"{' network' if player.is_network() else ''}",
@@ -313,11 +340,51 @@ def main():
         current_path = path
         open_error_text = ""
         open_error_until = 0.0
+        # Force scheduler rebuild against the new file (reopen already stopped it).
+        video_meta = None
         settings.push_recent(current_path)
-        # video_meta is NOT computed here (get_video_meta_data lives on the warmup worker and may
-        # not be handed over yet -- the user can open a file mid-warmup). It's computed lazily in
-        # the "延迟建 scheduler" step below, which only runs post-warmup anyway.
-        player.play()
+        player.play()  # open_session() starts paused at frame 0; auto-play from the start.
+        try:
+            player.notify_open_url_finished(True)
+        except Exception:  # noqa: BLE001 -- older native builds without the method
+            pass
+
+    def _finish_open_failed(path, err, is_reopen):
+        """Main-thread failure path: restore open-prompt / URL float form (上一步)."""
+        nonlocal opened, current_path
+        if is_reopen:
+            # Native close_session() already ran; open_session() failed -> no live session.
+            opened = False
+            current_path = None
+        _report_open_failed(path, err)
+        try:
+            player.notify_open_url_finished(False)
+        except Exception:  # noqa: BLE001 -- older native builds without the method
+            pass
+
+    def _prepare_reopen():
+        """Save position + tear scheduler before a reopen (sync or async). Main thread only."""
+        nonlocal scheduler
+        if current_path is not None:
+            try:
+                settings.set_position(current_path, player.current_frame())
+            except Exception:  # noqa: BLE001 -- position save must not block the reopen attempt
+                pass
+        if scheduler is not None:
+            scheduler.stop()
+            scheduler = None
+
+    def do_open(path):
+        """First-ever open (opened is False): player.open() is decode-only and fast (no model
+        dependency), so this starts original/passthrough playback immediately -- the Scheduler
+        is deliberately NOT built here, only once warmup finishes (see the main loop's
+        "延迟建 scheduler" step below)."""
+        try:
+            player.open(path)
+        except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
+            _finish_open_failed(path, e, is_reopen=False)
+            return
+        _finish_open_success(path, is_reopen=False)
 
     def do_reopen(path):
         """Same semantics as the old apply_ui_intents' reopen path (run_player.py:183 /
@@ -329,38 +396,16 @@ def main():
         On failure (unsupported / half-downloaded file): native reopen() has already closed the
         previous session and left the player unopened (opened_=false); we mirror that here so the
         open-prompt comes back and the user can pick another file -- never crash the process."""
-        nonlocal scheduler, current_path, opened, open_error_text, open_error_until
-        if current_path is not None:
-            try:
-                settings.set_position(current_path, player.current_frame())
-            except Exception:  # noqa: BLE001 -- position save must not block the reopen attempt
-                pass
-        if scheduler is not None:
-            scheduler.stop()
-            scheduler = None
+        _prepare_reopen()
         try:
-            new_frame_count = player.reopen(path)
+            player.reopen(path)
         except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
-            # Native close_session() already ran; open_session() failed -> no live session.
-            opened = False
-            current_path = None
-            _report_open_failed(path, e)
+            _finish_open_failed(path, e, is_reopen=True)
             return
-        apply_target_fps_for_open()
-        print(f"== player.reopen == frames={new_frame_count} dims={player.dims()} "
-              f"fps={player.fps():.4f} fps_div={player.fps_div()} target_fps={cfg_target_fps}"
-              f"{' network' if player.is_network() else ''}",
-              file=sys.stderr)
-        # video_meta recomputed lazily at scheduler-build time (see do_open's note) -- tearing the
-        # scheduler down above forces the build step below to re-run against the new file.
-        current_path = path
-        open_error_text = ""
-        open_error_until = 0.0
-        settings.push_recent(current_path)
-        player.play()  # open_session() starts paused at frame 0; auto-play from the start
-                       # (matches do_open()'s open->play() sequence above). Position memory is
-                       # still written (set_position above / finally) but not auto-restored --
-                       # resume wiring is deferred until a manual "continue watching" UI exists.
+        _finish_open_success(path, is_reopen=True)
+
+    # Async network open: keeps pump_messages/ui_tick alive so the URL float can show loading.
+    open_state = None
 
 
     try:
@@ -380,12 +425,36 @@ def main():
                 warm_device = warmup.device
                 warm_fp16 = warmup.fp16
 
+            # Drain a finished async open/reopen before status/intents so play() lands this tick.
+            if open_state is not None:
+                with open_state.lock:
+                    os_done = open_state.done
+                    os_ok = open_state.ok
+                    os_err = open_state.error
+                    os_path = open_state.path
+                    os_reopen = open_state.is_reopen
+                    os_running = open_state.running
+                if os_done:
+                    open_state = None
+                    if os_ok:
+                        _finish_open_success(os_path, is_reopen=os_reopen)
+                    else:
+                        _finish_open_failed(os_path, os_err, is_reopen=os_reopen)
+                elif os_running:
+                    pass  # still in flight
+
             now_mono = time.monotonic()
+            opening_now = open_state is not None
             if open_error_text and now_mono < open_error_until:
                 status_text = open_error_text
             elif open_error_text and now_mono >= open_error_until:
                 open_error_text = ""
                 status_text = ""
+            elif opening_now:
+                # CLI/network open without the URL modal still needs a visible loading cue;
+                # URL-popup opens show a spinner card (no status float needed there either,
+                # but this line is harmless if both fire).
+                status_text = i18n_mod.t("splash_loading")
             elif warm_error is not None:
                 status_text = i18n_mod.t("warmup_failed")
             elif scheduler is not None or warm_ready:
@@ -503,7 +572,8 @@ def main():
                 ).start()
                 print("== trt == on-demand compile started", file=sys.stderr)
 
-            if intents["toggle_play"]:
+            opening = open_state is not None
+            if intents["toggle_play"] and not opening:
                 if opened:
                     if player.is_playing():
                         player.pause()
@@ -511,23 +581,43 @@ def main():
                         player.play()
 
             path = None
-            if intents["open_dialog"]:
+            if opening:
+                # Ignore further open intents while a network open is in flight (URL float
+                # loading). pending_open_path stays until free so a CLI seed is not dropped.
+                pass
+            elif intents["open_dialog"]:
                 path = player.pick_open_file()  # modal, main thread; present keeps showing the
                                                  # current video (or the open-prompt) meanwhile
             elif intents["open_path"]:
                 path = intents["open_path"]
             elif pending_open_path:
                 path = pending_open_path
-            pending_open_path = None
+                pending_open_path = None
 
-            if path:
+            if path and not opening:
                 # Open/reopen first so a same-tick seek intent (from the previous file's
                 # seekbar) cannot land on the new session. open_session always starts at 0.
-                if not opened:
+                # Network URLs open on a worker so the URL float stays responsive (loading state).
+                is_reopen = opened
+                if settings_mod._is_network_url(path):
+                    if is_reopen:
+                        _prepare_reopen()
+                    open_state = _OpenState()
+                    open_state.running = True
+                    open_state.path = path
+                    open_state.is_reopen = is_reopen
+                    threading.Thread(
+                        target=_open_worker,
+                        args=(open_state, player, path, is_reopen),
+                        name="sumu-open", daemon=True,
+                    ).start()
+                    print(f"== open async == {'reopen' if is_reopen else 'open'} {path!r}",
+                          file=sys.stderr)
+                elif not opened:
                     do_open(path)
                 else:
                     do_reopen(path)
-            else:
+            elif not opening:
                 seek = intents["seek"]
                 if seek is not None and opened:
                     if scheduler is not None:
@@ -595,8 +685,9 @@ def main():
             # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
             # scheduler is already running. Deliberately re-checked every tick (not just right
             # after do_open()/do_reopen()) since warmup can finish on its own schedule, well
-            # after either of those.
-            if opened and warm_ready and scheduler is None and warm_error is None:
+            # after either of those. Skip while an async open is in flight (session half-built).
+            if (opened and warm_ready and scheduler is None and warm_error is None
+                    and open_state is None):
                 det_model, res_model, pad_mode = warm_models
                 # Lazy, off the startup path: compute video_meta now (get_video_meta_data came from
                 # the warmup worker) and build the config from the committed int knobs.

@@ -8,6 +8,8 @@
   "open_url_ok": "打开",
   "open_url_cancel": "取消",
   "open_url_invalid": "请输入以 http:// 或 https:// 开头的地址",
+  "open_url_loading": "正在打开…",
+  "open_url_load_failed": "无法打开该地址",
   "compile_retry": "重试",
   "compile_engine": "编译加速引擎",
   "settings_title": "设置",

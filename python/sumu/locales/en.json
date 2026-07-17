@@ -8,6 +8,8 @@
   "open_url_ok": "Open",
   "open_url_cancel": "Cancel",
   "open_url_invalid": "Enter a URL starting with http:// or https://",
+  "open_url_loading": "Opening…",
+  "open_url_load_failed": "Could not open this URL",
   "compile_retry": "Retry",
   "compile_engine": "Compile acceleration engines",
   "settings_title": "Settings",

@@ -8,6 +8,8 @@
   "open_url_ok": "開く",
   "open_url_cancel": "キャンセル",
   "open_url_invalid": "http:// または https:// で始まる URL を入力してください",
+  "open_url_loading": "開いています…",
+  "open_url_load_failed": "この URL を開けませんでした",
   "compile_retry": "再試行",
   "compile_engine": "加速エンジンをコンパイル",
   "settings_title": "設定",

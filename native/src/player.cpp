@@ -257,6 +257,36 @@ std::string basename_of(const std::string& path)
     return (pos == std::string::npos) ? p : p.substr(pos + 1);
 }
 
+// Title-bar filename elide: keep a UTF-8-safe prefix that fits max_w, append "..." when clipped.
+// Uses current ImGui font metrics (must be called during an active ImGui frame).
+std::string elide_text_to_width(const std::string& text, float max_w)
+{
+    if (text.empty() || max_w <= 0.0f)
+        return {};
+    if (ImGui::CalcTextSize(text.c_str()).x <= max_w)
+        return text;
+    const char* ellipsis = "...";
+    const float ell_w = ImGui::CalcTextSize(ellipsis).x;
+    if (ell_w >= max_w)
+        return std::string(ellipsis);
+    const float budget = max_w - ell_w;
+    const char* s = text.c_str();
+    const char* end = s + text.size();
+    const char* cut = s;
+    while (cut < end) {
+        const unsigned char c = static_cast<unsigned char>(*cut);
+        int nbytes = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2
+            : ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xF8) == 0xF0) ? 4 : 1;
+        if (cut + nbytes > end)
+            nbytes = static_cast<int>(end - cut);
+        const char* next = cut + nbytes;
+        if (ImGui::CalcTextSize(s, next).x > budget)
+            break;
+        cut = next;
+    }
+    return std::string(s, cut) + ellipsis;
+}
+
 std::string format_mmss(double seconds)
 {
     if (seconds < 0.0) seconds = 0.0;
@@ -504,6 +534,11 @@ public:
     // revisit it.
     void open_session(const std::string& video_path)
     {
+        // open()/reopen() may run off the Python main thread (async network open). Make cu_ctx_
+        // current on whichever thread is building the session -- same pattern as push_ai_frame().
+        if (cu_ctx_)
+            check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (open_session)");
+
         video_path_ = video_path; // UI displays basename_of(video_path_) in the top bar
 
         std::string decode_err;
@@ -675,11 +710,10 @@ public:
         }
 
         // Auto-size the window to this video (1:1 point-for-point, capped/on-screen -- see the
-        // method). Done last, after session_active_ so the synchronous WM_SIZE this triggers
-        // (SetWindowPos -> on_resize + WndProc's ui_tick refresh) already renders real frames at
-        // the final size. No-op while maximized/fullscreen. Applies to reopen() too (it routes
-        // through open_session()), so switching files re-fits the window to the new video.
-        resize_window_for_video();
+        // method). Deferred to ui_tick() on the main thread: open_session may run on a worker
+        // (async URL open), and SetWindowPos -> synchronous WM_SIZE -> ui_tick re-entrancy from
+        // a non-main thread is unsafe. Main applies the flag on the next tick after session_active_.
+        pending_resize_for_video_.store(true, std::memory_order_release);
     }
 
     // M-C1: joins/tears down only the session-scoped state (decode/audio threads, the D3D11
@@ -691,6 +725,9 @@ public:
     // handshake to do here yet; that's an M-C2 concern for a live (running-present) reopen.
     void close_session()
     {
+        if (cu_ctx_)
+            check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (close_session)");
+
         session_stop_.store(true, std::memory_order_relaxed);
         scrub_cv_.notify_one(); // wake scrub_thread_ out of its wait so it observes session_stop_
         if (decode_thread_.joinable()) decode_thread_.join();
@@ -1169,6 +1206,10 @@ public:
         in_ui_tick_ = true;
         struct Guard { bool* f; ~Guard() { *f = false; } } _guard{ &in_ui_tick_ };
 
+        // Apply open_session's deferred window fit on the main thread only (see open_session).
+        if (pending_resize_for_video_.exchange(false, std::memory_order_acq_rel))
+            resize_window_for_video();
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -1205,10 +1246,32 @@ public:
     void record_compile_engine() { ui_intents_.compile_engine = true; }
     void request_open_url_popup()
     {
+        // Don't clobber an in-flight URL open (popup is already open in loading state).
+        if (open_url_loading_) return;
         open_url_popup_ = true;
         open_url_focus_ = true;
         open_url_show_error_ = false;
+        open_url_show_load_error_ = false;
+        open_url_close_pending_ = false;
         open_url_buf_[0] = '\0';
+    }
+
+    // Python calls this on the main thread when an async URL open finishes. Loading keeps the
+    // modal open; success closes it on the next build_open_url_popup frame; failure restores the
+    // input form with a load-error line (上一步). No-op if the user already cancelled the modal.
+    void notify_open_url_finished(bool ok)
+    {
+        if (ok) {
+            if (open_url_loading_)
+                open_url_close_pending_ = true;
+            open_url_loading_ = false;
+            open_url_show_error_ = false;
+            open_url_show_load_error_ = false;
+        } else if (open_url_loading_) {
+            open_url_loading_ = false;
+            open_url_show_error_ = false;
+            open_url_show_load_error_ = true;
+        }
     }
 
     const std::string& path() const { return video_path_; }
@@ -1297,6 +1360,8 @@ public:
         take("open_url_ok", ui_str_.open_url_ok);
         take("open_url_cancel", ui_str_.open_url_cancel);
         take("open_url_invalid", ui_str_.open_url_invalid);
+        take("open_url_loading", ui_str_.open_url_loading);
+        take("open_url_load_failed", ui_str_.open_url_load_failed);
         take("compile_retry", ui_str_.compile_retry);
         take("compile_engine", ui_str_.compile_engine);
         take("settings_title", ui_str_.settings_title);
@@ -2289,7 +2354,9 @@ private:
     // Open-URL modal: first-screen "打开 URL" button and top-bar link icon both call
     // request_open_url_popup(). Confirm trims the buffer, requires http(s)://, then writes
     // ui_intents_.open_path so Python reuses the existing drop/open path (do_open/do_reopen).
-    // Cancel / Esc / outside click only close the popup -- no transport side effects.
+    // Popup stays open in a loading state until Python calls notify_open_url_finished -- keeps
+    // the float responsive during network open (no main-thread freeze). Cancel / Esc only close
+    // the popup UI (open may still complete in the background); no transport side effects on cancel.
     // Popup id uses ### so the i18n title can change without breaking OpenPopup matching.
     // Chrome matches the main window: 6px rounding, title-bar height = top_bar_h(), bg tone
     // (0.14,0.14,0.16) same as build_top_bar / draw_splash.
@@ -2301,8 +2368,14 @@ private:
         }
 
         ImGuiIO& io = ImGui::GetIO();
+        // Loading shrinks the card (form ~460px → spinner ~112px). Appearing-only centering
+        // leaves the small card stuck at the form's old top-left; force center every loading frame.
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            open_url_loading_ ? ImGuiCond_Always : ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (open_url_loading_) {
+            const float box = ui_s(112.0f);
+            ImGui::SetNextWindowSize(ImVec2(box, box), ImGuiCond_Always);
+        }
 
         // Match main chrome (settings panel / status float / title bar), 8px corners + stroke.
         // Border is self-drawn at EndPopup (foreground list) so title-strip fill cannot cover
@@ -2331,6 +2404,53 @@ private:
             return;
         }
 
+        // Success path: close after the modal is open this frame (CloseCurrentPopup is frame-local).
+        if (open_url_close_pending_) {
+            open_url_close_pending_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        auto draw_popup_border = [&]() {
+            ImVec2 a = ImGui::GetWindowPos();
+            ImVec2 b = ImVec2(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
+            ImGui::GetForegroundDrawList()->AddRect(
+                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
+                border_col, rounding, 0, border_sz);
+        };
+
+        // ---- loading: compact card, nothing but a centered spinner ----
+        if (open_url_loading_) {
+            const float spinner_r = ui_s(18.0f);
+            const float spinner_th = ui_s(3.0f);
+            // Size already forced via SetNextWindowSize; Dummy keeps content rect non-empty.
+            ImGui::Dummy(ImGui::GetContentRegionAvail());
+
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 wpos = ImGui::GetWindowPos();
+            ImVec2 wsize = ImGui::GetWindowSize();
+            ImVec2 center(wpos.x + wsize.x * 0.5f, wpos.y + wsize.y * 0.5f);
+
+            // Soft track + rotating head arc (no text, no URL, no chrome).
+            constexpr float kPi = 3.14159265f;
+            dl->PathClear();
+            dl->PathArcTo(center, spinner_r, 0.0f, kPi * 2.0f, 48);
+            dl->PathStroke(IM_COL32(80, 80, 90, 180), ImDrawFlags_None, spinner_th);
+
+            const float t = static_cast<float>(ImGui::GetTime());
+            const float a0 = t * 5.5f;
+            const float a1 = a0 + kPi * 1.35f;
+            dl->PathClear();
+            dl->PathArcTo(center, spinner_r, a0, a1, 32);
+            dl->PathStroke(IM_COL32(230, 230, 235, 255), ImDrawFlags_None, spinner_th);
+
+            draw_popup_border();
+            ImGui::EndPopup();
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(3);
+            return;
+        }
+
+        // ---- input form (title strip + field + buttons) ----
         const float bar_h = top_bar_h();
         const float pad = ui_s(12.0f);
         const float content_w = ui_s(440.0f);
@@ -2366,12 +2486,12 @@ private:
             ImGui::TextUnformatted(title);
         }
 
-        // Close X (same size / hollow-line weight / edge inset as the main top-bar close button).
         ImGui::SetCursorPos(ImVec2(strip_w - chrome_btn_w - ui_s(4.0f), (bar_h - chrome_btn_h) * 0.5f));
         {
             IconButtonResult r = icon_button("##open_url_close", ImVec2(chrome_btn_w, chrome_btn_h));
             if (r.clicked) {
                 open_url_show_error_ = false;
+                open_url_show_load_error_ = false;
                 ImGui::CloseCurrentPopup();
             }
             float cx = (r.min.x + r.max.x) * 0.5f;
@@ -2381,40 +2501,10 @@ private:
             r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
         }
 
-        // ---- body ----
-        // WindowPadding is 0 for the custom title strip; Indent keeps every body line at `pad`
-        // (plain SetCursorPos only fixes the first line -- Text/Spacing reset X to 0).
+        // WindowPadding is 0 for the custom title strip; Indent keeps every body line at `pad`.
         ImGui::SetCursorPosY(bar_h + pad);
         ImGui::Indent(pad);
         ImGui::PushItemWidth(content_w);
-
-        if (!ui_str_.open_url_hint.empty()) {
-            ImGui::PushFont(nullptr, kFontSizeSm); // secondary copy (hint)
-            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + content_w);
-            ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
-            ImGui::PopTextWrapPos();
-            ImGui::PopFont();
-            ImGui::Spacing();
-        }
-
-        if (open_url_focus_) {
-            ImGui::SetKeyboardFocusHere();
-            open_url_focus_ = false;
-        }
-        bool enter = ImGui::InputText("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
-            ImGuiInputTextFlags_EnterReturnsTrue);
-        if (open_url_show_error_ && !ui_str_.open_url_invalid.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
-            ImGui::TextUnformatted(ui_str_.open_url_invalid.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        ImGui::Spacing();
-        const float btn_w = ui_s(100.0f);
-        const float btn_h = ui_s(28.0f);
-        const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
-        // Absolute X: left pad + center within content column.
-        ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
 
         auto trim_url = [](const char* raw) -> std::string {
             std::string s(raw ? raw : "");
@@ -2454,6 +2544,41 @@ private:
             return is_http || is_https;
         };
 
+        if (!ui_str_.open_url_hint.empty()) {
+            ImGui::PushFont(nullptr, kFontSizeSm); // secondary copy (hint)
+            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + content_w);
+            ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopFont();
+            ImGui::Spacing();
+        }
+
+        if (open_url_focus_) {
+            ImGui::SetKeyboardFocusHere();
+            open_url_focus_ = false;
+        }
+        bool enter = ImGui::InputText("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        if (open_url_show_error_ && !ui_str_.open_url_invalid.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
+            ImGui::TextUnformatted(ui_str_.open_url_invalid.c_str());
+            ImGui::PopStyleColor();
+        } else if (open_url_show_load_error_) {
+            const char* err = !ui_str_.open_url_load_failed.empty()
+                ? ui_str_.open_url_load_failed.c_str()
+                : "Could not open this URL";
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 120, 120, 255));
+            ImGui::TextUnformatted(err);
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Spacing();
+        const float btn_w = ui_s(100.0f);
+        const float btn_h = ui_s(28.0f);
+        const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+        // Absolute X: left pad + center within content column.
+        ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
+
         bool do_ok = enter;
         if (ImGui::Button(ui_str_.open_url_ok.empty() ? "Open" : ui_str_.open_url_ok.c_str(),
                 ImVec2(btn_w, btn_h))) {
@@ -2463,6 +2588,7 @@ private:
         if (ImGui::Button(ui_str_.open_url_cancel.empty() ? "Cancel" : ui_str_.open_url_cancel.c_str(),
                 ImVec2(btn_w, btn_h))) {
             open_url_show_error_ = false;
+            open_url_show_load_error_ = false;
             ImGui::CloseCurrentPopup();
         }
 
@@ -2470,15 +2596,23 @@ private:
             std::string url = trim_url(open_url_buf_);
             if (!looks_http(url)) {
                 open_url_show_error_ = true;
+                open_url_show_load_error_ = false;
             } else {
+                // Keep popup open → spinner loading card; Python opens async and calls
+                // notify_open_url_finished when done.
                 open_url_show_error_ = false;
+                open_url_show_load_error_ = false;
+                open_url_loading_ = true;
+                if (url.size() >= sizeof(open_url_buf_))
+                    url.resize(sizeof(open_url_buf_) - 1);
+                std::memcpy(open_url_buf_, url.c_str(), url.size() + 1);
                 record_open_path(url);
-                ImGui::CloseCurrentPopup();
             }
         }
         // Esc closes BeginPopupModal by default when IsPopupOpen; also honor it explicitly.
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             open_url_show_error_ = false;
+            open_url_show_load_error_ = false;
             ImGui::CloseCurrentPopup();
         }
 
@@ -2487,16 +2621,7 @@ private:
         ImGui::PopItemWidth();
         ImGui::Unindent(pad);
 
-        // Full outline on the foreground list so rounded top corners aren't clipped/covered
-        // by the title-strip fill or the window InnerClipRect.
-        {
-            ImVec2 a = ImGui::GetWindowPos();
-            ImVec2 b = ImVec2(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
-            ImGui::GetForegroundDrawList()->AddRect(
-                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
-                border_col, rounding, 0, border_sz);
-        }
-
+        draw_popup_border();
         ImGui::EndPopup();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(3);
@@ -2645,9 +2770,21 @@ private:
         }
         ImGui::SameLine();
         {
+            // Cap the filename width so a long basename cannot shove the right-side chrome
+            // (min/max/fullscreen/close) off the bar. Leave room for those 4 buttons + a thin
+            // drag gap; elide with "..." (UTF-8-safe) and expose the full name on hover.
             float th = ImGui::GetTextLineHeight();
             ImGui::SetCursorPosY((bar_h - th) * 0.5f);
-            ImGui::TextUnformatted(basename_of(video_path_).c_str());
+            const int n_right = 4;
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            const float reserve_right = (btn_w + spacing) * n_right + spacing;
+            float max_title_w = ImGui::GetContentRegionAvail().x - reserve_right;
+            if (max_title_w < 0.0f) max_title_w = 0.0f;
+            const std::string full_name = basename_of(video_path_);
+            const std::string shown = elide_text_to_width(full_name, max_title_w);
+            ImGui::TextUnformatted(shown.c_str());
+            if (!full_name.empty() && shown != full_name && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", full_name.c_str());
         }
         ImGui::SameLine();
         ImGui::SetCursorPosY((bar_h - btn_h) * 0.5f);
@@ -4568,6 +4705,8 @@ private:
     std::string video_path_;
     // Session IO profile: set in open_session from decoder_.is_network(). Cleared on failed reopen.
     bool network_source_ = false;
+    // open_session sets this; ui_tick on the main thread applies resize_window_for_video().
+    std::atomic<bool> pending_resize_for_video_{ false };
     UiIntents ui_intents_;
     int ui_cfg_clip_length_ = 30; // Python-refreshed mirror of the ACTUAL committed config
     int ui_cfg_max_regions_ = 1;  // (settings panel seeds edit buffers from these on open)
@@ -4601,6 +4740,8 @@ private:
         std::string open_url_ok;
         std::string open_url_cancel;
         std::string open_url_invalid;
+        std::string open_url_loading;
+        std::string open_url_load_failed;
         std::string compile_retry;
         std::string compile_engine;
         std::string settings_title;
@@ -4622,11 +4763,15 @@ private:
         std::string dialog_all_files;
     } ui_str_;
     // Open-URL modal (ImGui popup). Main-thread only, same discipline as ui_settings_open_.
-    // Confirm writes a trimmed http(s) URL into ui_intents_.open_path (Python reuses the drop path).
+    // Confirm writes a trimmed http(s) URL into ui_intents_.open_path (Python reuses the drop path)
+    // and flips open_url_loading_ so the float stays open until notify_open_url_finished().
     bool open_url_popup_ = false;
     bool open_url_focus_ = false;
     char open_url_buf_[2048] = {};
-    bool open_url_show_error_ = false;
+    bool open_url_show_error_ = false;      // client-side scheme validation
+    bool open_url_show_load_error_ = false; // server/open failure after async open
+    bool open_url_loading_ = false;
+    bool open_url_close_pending_ = false;   // success → close on next build_open_url_popup
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
@@ -5080,9 +5225,14 @@ PYBIND11_MODULE(sumu_core, m)
         .def(py::init<int, int, bool>(),
             py::arg("width_hint") = 1280, py::arg("height_hint") = 720, py::arg("maximized") = false)
         .def("pick_open_file", &Player::pick_open_file) // blocking Win32 dialog, call before open()
-        .def("open", &Player::open, py::arg("path"))
-        .def("reopen", &Player::reopen, py::arg("path")) // M-C2: runtime file swap, present never stops
+        // gil_scoped_release: network open/reopen can block tens of seconds; Python's main loop
+        // (and async open worker) must keep pumping UI. CUDA context is rebound inside open_session.
+        .def("open", &Player::open, py::arg("path"),
+            py::call_guard<py::gil_scoped_release>())
+        .def("reopen", &Player::reopen, py::arg("path"), // M-C2: runtime file swap, present never stops
+            py::call_guard<py::gil_scoped_release>())
         .def("is_network", &Player::is_network) // http(s) session: shallow ring, scrub off
+        .def("notify_open_url_finished", &Player::notify_open_url_finished, py::arg("ok"))
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)
