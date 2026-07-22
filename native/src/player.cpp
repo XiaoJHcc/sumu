@@ -2816,10 +2816,20 @@ private:
         }
         ImGui::SameLine();
 
-        bool zoomed = IsZoomed(hwnd_) != 0;
+        // While borderless-fullscreen, IsZoomed is forced false (WS_MAXIMIZE cleared on enter).
+        // The button still means "leave FS into a maximized window" rather than a no-op.
+        bool zoomed = !fullscreen_.load(std::memory_order_relaxed) && IsZoomed(hwnd_) != 0;
         { // maximize/restore: hollow square (not maximized) / overlapping double square (maximized)
             IconButtonResult r = icon_button("##max_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) ShowWindow(hwnd_, zoomed ? SW_RESTORE : SW_MAXIMIZE);
+            if (r.clicked) {
+                if (fullscreen_.load(std::memory_order_relaxed)) {
+                    // Exit FS first (restores pre-FS placement), then maximize if still windowed.
+                    toggle_fullscreen();
+                    if (hwnd_ && !IsZoomed(hwnd_)) ShowWindow(hwnd_, SW_MAXIMIZE);
+                } else {
+                    ShowWindow(hwnd_, zoomed ? SW_RESTORE : SW_MAXIMIZE);
+                }
+            }
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
             if (!zoomed) {
@@ -3241,10 +3251,17 @@ private:
 
     // Borderless fill-monitor fullscreen toggle -- explicitly NOT exclusive fullscreen (no mode
     // change, no Alt+Enter path; WM_SYSKEYDOWN already swallows Alt+Enter, see WndProc).
+    //
+    // Maximized <-> fullscreen must not leave WS_MAXIMIZE set while the window fills the monitor:
+    // WM_NCCALCSIZE insets a maximized client by the frame thickness, which shows up as a visible
+    // margin/border around the video. Save/restore via WINDOWPLACEMENT so a pre-FS maximize comes
+    // back correctly, and always clear WS_MAXIMIZE for the FS style.
     void toggle_fullscreen()
     {
         if (!fullscreen_.load(std::memory_order_relaxed)) {
-            GetWindowRect(hwnd_, &windowed_rect_);
+            windowed_placement_ = WINDOWPLACEMENT{};
+            windowed_placement_.length = sizeof(windowed_placement_);
+            GetWindowPlacement(hwnd_, &windowed_placement_);
             windowed_style_ = GetWindowLongA(hwnd_, GWL_STYLE);
 
             HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
@@ -3257,18 +3274,24 @@ private:
             // video (fit_viewport()) correctly, with no one-frame transient.
             fullscreen_.store(true, std::memory_order_relaxed);
             apply_dwm_chrome(/*fullscreen=*/true);
+            // Strip caption/frame AND WS_MAXIMIZE so IsZoomed is false for the whole FS session
+            // (otherwise WM_NCCALCSIZE's maximized inset carves a frame-sized border into the
+            // monitor-sized window).
             SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_ & ~(WS_CAPTION | WS_THICKFRAME |
-                WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU));
+                WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_MAXIMIZE));
             SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                 mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                 SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
         } else {
-            fullscreen_.store(false, std::memory_order_relaxed); // before SetWindowPos, see above
+            fullscreen_.store(false, std::memory_order_relaxed); // before placement restore, see above
             apply_dwm_chrome(/*fullscreen=*/false);
             SetWindowLongA(hwnd_, GWL_STYLE, windowed_style_);
-            SetWindowPos(hwnd_, nullptr, windowed_rect_.left, windowed_rect_.top,
-                windowed_rect_.right - windowed_rect_.left, windowed_rect_.bottom - windowed_rect_.top,
-                SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER);
+            // Restores both normal rect and maximized showCmd without workspace/screen confusion
+            // that a raw SetWindowPos(rcNormalPosition) would hit.
+            windowed_placement_.length = sizeof(windowed_placement_);
+            SetWindowPlacement(hwnd_, &windowed_placement_);
+            SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
         }
     }
 
@@ -4783,7 +4806,7 @@ private:
     // (build_top_bar()'s auto-hide, is_fullscreen(), resize_window_for_video()). relaxed is
     // enough -- it only gates a per-frame layout choice, no other state is published through it.
     std::atomic<bool> fullscreen_{ false };
-    RECT windowed_rect_{};  // saved pre-fullscreen window rect, for restore
+    WINDOWPLACEMENT windowed_placement_{}; // saved pre-fullscreen placement (rect + showCmd)
     LONG windowed_style_ = 0; // saved pre-fullscreen GWL_STYLE, for restore
 
     // ---- borderless custom-caption drag rect (client-space), published by build_top_bar(),
@@ -5104,10 +5127,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     // below deliberately doesn't need self for that reason.
     case WM_NCCALCSIZE:
         if (wp == TRUE) {
-            if (IsZoomed(hwnd)) {
-                // Maximized: without this inset, DWM's default zoomed rect overhangs the
-                // monitor by one frame thickness on each side, which then overlaps the taskbar
-                // and clips content -- pulling it in by the frame+padding metrics compensates.
+            // Maximized (windowed only): without this inset, DWM's default zoomed rect overhangs
+            // the monitor by one frame thickness on each side, which then overlaps the taskbar
+            // and clips content -- pulling it in by the frame+padding metrics compensates.
+            // Skip while borderless-fullscreen: the window is already sized to the monitor, and
+            // an IsZoomed leftover (or a maximize-while-FS click) would carve a visible margin.
+            if (IsZoomed(hwnd) && !(self && self->is_fullscreen())) {
                 NCCALCSIZE_PARAMS* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
                 UINT dpi = GetDpiForWindow(hwnd);
                 int fx = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
@@ -5115,7 +5140,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 p->rgrc[0].left += fx; p->rgrc[0].right -= fx;
                 p->rgrc[0].top += fy; p->rgrc[0].bottom -= fy;
             }
-            return 0; // non-maximized: client fills the entire window == borderless
+            return 0; // non-maximized / fullscreen: client fills the entire window == borderless
         }
         break;
     case WM_NCHITTEST: {
