@@ -10,6 +10,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(sumu_core CXX)
 
+# CMake 4.3's MSVC platform injects /LTCG (CMAKE_CXX_LINK_OPTIONS_IPO) into the link flags even
+# when no interprocedural-optimization is requested, which makes link.exe write multi-hundred-MB
+# temp objects under %TEMP% (hanging the link where %TEMP% is unwritable to child processes).
+# Force IPO off globally (plus the per-target override below).
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "Disable IPO/LTCG" FORCE)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
@@ -67,6 +73,7 @@ add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}" "${LOGO_RGBA
 pybind11_add_module(sumu_core
     src/player.cpp
     src/decoder.cpp
+    src/headless_decode.cpp
     "${IMGUI_DIR}/imgui.cpp"
     "${IMGUI_DIR}/imgui_draw.cpp"
     "${IMGUI_DIR}/imgui_tables.cpp"
@@ -101,6 +108,11 @@ target_link_libraries(sumu_core PRIVATE
     swresample
     "${CUDA_TOOLKIT_ROOT}/lib/x64/cuda.lib"
 )
+
+# Disable MSVC link-time code generation. /LTCG offers nothing for a pybind11 module but makes
+# the linker emit large temp objects under %TEMP% -- which hangs the link step in environments
+# where %TEMP% is not writable by child processes (observed: the sandboxed dev harness).
+set_property(TARGET sumu_core PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
 
 # Land the .pyd directly in python/sumu/ so `import sumu_core` (or sumu's own package code)
 # can find it without any sys.path surgery.
