@@ -50,6 +50,7 @@
 #include <timeapi.h>
 #include <commdlg.h> // GetOpenFileNameW (Player::pick_open_file)
 #include <shellapi.h> // DragAcceptFiles/DragQueryFileW/DragFinish (M-C2: WM_DROPFILES)
+#include <shlobj.h> // SHBrowseForFolderW (Player::pick_folder, web-stream server root)
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM (WndProc's WM_NCHITTEST)
 #pragma comment(lib, "winmm.lib")
 
@@ -414,6 +415,15 @@ struct UiIntents {
     // responds by spawning the blocking compile off the main thread and driving the compile UI
     // via set_compile_ui(). Doubles as the "retry" click in the failed state.
     bool compile_engine = false;
+    // Web-streaming server + offline-export (Phase 2, additive). The stream/export popups write
+    // these; Python drains them in take_ui_intents() and drives the background server/job.
+    bool stream_start = false;
+    int stream_port = 0;
+    std::string stream_root;
+    bool stream_stop = false;
+    bool export_start = false;
+    std::string export_source;
+    std::string export_out;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -954,6 +964,29 @@ public:
         return w;
     }
 
+    // Folder picker for the web-streaming server's video root. SHBrowseForFolderW keeps this
+    // free of explicit COM apartment setup on the main thread (IFileOpenDialog would need it).
+    std::string pick_folder()
+    {
+        BROWSEINFOW bi{};
+        bi.hwndOwner = hwnd_;
+        bi.lpszTitle = L"Select video root folder"; // native dialog chrome; kept locale-neutral
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX | BIF_USENEWUI;
+        LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+        if (!pidl) return std::string();
+        wchar_t path_buf[MAX_PATH] = {};
+        std::string result;
+        if (SHGetPathFromIDListW(pidl, path_buf)) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, path_buf, -1, nullptr, 0, nullptr, nullptr);
+            if (n > 0) {
+                result.resize(static_cast<size_t>(n - 1));
+                WideCharToMultiByte(CP_UTF8, 0, path_buf, -1, result.data(), n, nullptr, nullptr);
+            }
+        }
+        CoTaskMemFree(pidl);
+        return result;
+    }
+
     std::string pick_open_file()
     {
         wchar_t file_buf[MAX_PATH] = {};
@@ -1245,6 +1278,29 @@ public:
     void record_open_path(const std::string& path) { ui_intents_.open_path = path; }
     void record_open_dialog() { ui_intents_.open_dialog = true; }
     void record_compile_engine() { ui_intents_.compile_engine = true; }
+    // Web-stream / export popup requests (main-thread-only, see UiIntents header comment).
+    void request_stream_popup() { stream_popup_ = true; }
+    void request_export_popup()
+    {
+        export_popup_ = true;
+        // Seed the export source from the currently-open file (if any) for convenience.
+        if (export_source_buf_[0] == '\0' && !video_path_.empty()) {
+            std::memcpy(export_source_buf_, video_path_.c_str(),
+                std::min(video_path_.size(), sizeof(export_source_buf_) - 1));
+        }
+    }
+    // Python flips this when it starts/stops the server, so the stream popup shows 停止 vs 启动.
+    void set_stream_running(bool running) { stream_running_ = running; }
+    // Seed the stream root field from the last-used folder (Python persists it in settings).
+    void set_stream_defaults(int port, const std::string& root)
+    {
+        if (port > 0) stream_port_edit_ = port;
+        if (!root.empty()) {
+            std::memcpy(stream_root_buf_, root.c_str(),
+                std::min(root.size(), sizeof(stream_root_buf_) - 1));
+            stream_root_buf_[std::min(root.size(), sizeof(stream_root_buf_) - 1)] = '\0';
+        }
+    }
     void request_open_url_popup()
     {
         // Don't clobber an in-flight URL open (popup is already open in loading state).
@@ -1382,6 +1438,20 @@ public:
         take("ai_speed_unknown", ui_str_.ai_speed_unknown);
         take("dialog_video_files", ui_str_.dialog_video_files);
         take("dialog_all_files", ui_str_.dialog_all_files);
+        take("stream_server", ui_str_.stream_server);
+        take("export_video", ui_str_.export_video);
+        take("stream_title", ui_str_.stream_title);
+        take("stream_port_label", ui_str_.stream_port_label);
+        take("stream_root_label", ui_str_.stream_root_label);
+        take("stream_pick", ui_str_.stream_pick);
+        take("stream_start", ui_str_.stream_start);
+        take("stream_stop", ui_str_.stream_stop);
+        take("export_title", ui_str_.export_title);
+        take("export_source_label", ui_str_.export_source_label);
+        take("export_out_label", ui_str_.export_out_label);
+        take("export_pick", ui_str_.export_pick);
+        take("export_start", ui_str_.export_start);
+        take("cancel", ui_str_.cancel);
     }
 
     py::dict take_ui_intents()
@@ -1397,6 +1467,13 @@ public:
         d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
         d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
         d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
+        d["stream_start"] = ui_intents_.stream_start; // web-stream server: start with port/root
+        d["stream_port"] = ui_intents_.stream_port;
+        d["stream_root"] = ui_intents_.stream_root;
+        d["stream_stop"] = ui_intents_.stream_stop; // web-stream server: stop
+        d["export_start"] = ui_intents_.export_start; // offline export: start with source/out
+        d["export_source"] = ui_intents_.export_source;
+        d["export_out"] = ui_intents_.export_out;
         ui_intents_ = UiIntents{}; // drain
         return d;
     }
@@ -2183,6 +2260,8 @@ private:
             build_bottom_bar();
         }
         build_open_url_popup(); // modal above chrome; first-screen + live session both use it
+        build_stream_popup(); // web-stream server modal (port + root + start/stop)
+        build_export_popup(); // offline-export modal (source + output + start)
         build_status_float(); // model-warmup status line -- drawn in every branch above
     }
 
@@ -2232,11 +2311,11 @@ private:
 
         const char* prompt = ui_str_.open_prompt.c_str();
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
-        const float open_btn_w = ui_s(120.0f), open_btn_h = ui_s(32.0f);
-        const float open_btn_gap = ui_s(12.0f);
+        const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(32.0f);
+        const float open_btn_gap = ui_s(8.0f);
         const float gap = ui_s(16.0f);
-        // Two side-by-side open buttons: local file + network URL.
-        const float open_row_w = open_btn_w * 2.0f + open_btn_gap;
+        // Four side-by-side entry buttons: local file + network URL + web-stream + offline export.
+        const float open_row_w = open_btn_w * 4.0f + open_btn_gap * 3.0f;
 
         // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
         // it first so the whole prompt+button+compile block stays vertically centered.
@@ -2276,6 +2355,10 @@ private:
         if (ImGui::Button(ui_str_.open_file.c_str(), ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
         ImGui::SameLine(0.0f, open_btn_gap);
         if (ImGui::Button(ui_str_.open_url.c_str(), ImVec2(open_btn_w, open_btn_h))) request_open_url_popup();
+        ImGui::SameLine(0.0f, open_btn_gap);
+        if (ImGui::Button(ui_str_.stream_server.c_str(), ImVec2(open_btn_w, open_btn_h))) request_stream_popup();
+        ImGui::SameLine(0.0f, open_btn_gap);
+        if (ImGui::Button(ui_str_.export_video.c_str(), ImVec2(open_btn_w, open_btn_h))) request_export_popup();
 
         if (show_compile) {
             float region_x = (io.DisplaySize.x - compile_cw) * 0.5f;
@@ -2626,6 +2709,123 @@ private:
         ImGui::EndPopup();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(3);
+    }
+
+    // Web-stream server modal (Phase 2): port + video-root folder + 启动/停止. Matches the
+    // open-URL modal's chrome; writes ui_intents_.stream_start{port,root} / stream_stop.
+    void build_stream_popup()
+    {
+        if (stream_popup_) { ImGui::OpenPopup("###sumu_stream"); stream_popup_ = false; }
+        ImGuiIO& io = ImGui::GetIO();
+        const float rounding = ui_s(8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(16.0f), ui_s(14.0f)));
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoTitleBar;
+        if (!ImGui::BeginPopupModal("###sumu_stream", nullptr, flags)) {
+            ImGui::PopStyleColor(1);
+            ImGui::PopStyleVar(2);
+            return;
+        }
+        ImGui::TextUnformatted(ui_str_.stream_title.empty() ? "Web stream" : ui_str_.stream_title.c_str());
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(ui_s(240.0f));
+        ImGui::InputInt(ui_str_.stream_port_label.empty() ? "Port" : ui_str_.stream_port_label.c_str(),
+            &stream_port_edit_, 1, 100);
+        if (stream_port_edit_ < 1) stream_port_edit_ = 1;
+        if (stream_port_edit_ > 65535) stream_port_edit_ = 65535;
+        ImGui::SetNextItemWidth(ui_s(240.0f));
+        ImGui::InputText(ui_str_.stream_root_label.empty() ? "Root" : ui_str_.stream_root_label.c_str(),
+            stream_root_buf_, sizeof(stream_root_buf_));
+        ImGui::SameLine();
+        if (ImGui::Button(ui_str_.stream_pick.empty() ? "Browse" : ui_str_.stream_pick.c_str())) {
+            std::string dir = pick_folder();
+            if (!dir.empty()) {
+                size_t n = std::min(dir.size(), sizeof(stream_root_buf_) - 1);
+                std::memcpy(stream_root_buf_, dir.c_str(), n);
+                stream_root_buf_[n] = '\0';
+            }
+        }
+        ImGui::Spacing();
+        if (stream_running_) {
+            if (ImGui::Button(ui_str_.stream_stop.empty() ? "Stop" : ui_str_.stream_stop.c_str())) {
+                ui_intents_.stream_stop = true;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            if (ImGui::Button(ui_str_.stream_start.empty() ? "Start" : ui_str_.stream_start.c_str())) {
+                ui_intents_.stream_start = true;
+                ui_intents_.stream_port = stream_port_edit_;
+                ui_intents_.stream_root = stream_root_buf_;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str()))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        ImGui::PopStyleColor(1);
+        ImGui::PopStyleVar(2);
+    }
+
+    // Offline-export modal (Phase 2): source file + output file + 开始导出. Writes
+    // ui_intents_.export_start{source,out}; the blocking export runs on a Python thread.
+    void build_export_popup()
+    {
+        if (export_popup_) { ImGui::OpenPopup("###sumu_export"); export_popup_ = false; }
+        ImGuiIO& io = ImGui::GetIO();
+        const float rounding = ui_s(8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(16.0f), ui_s(14.0f)));
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoTitleBar;
+        if (!ImGui::BeginPopupModal("###sumu_export", nullptr, flags)) {
+            ImGui::PopStyleColor(1);
+            ImGui::PopStyleVar(2);
+            return;
+        }
+        ImGui::TextUnformatted(ui_str_.export_title.empty() ? "Export" : ui_str_.export_title.c_str());
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(ui_s(280.0f));
+        ImGui::InputText(ui_str_.export_source_label.empty() ? "Source" : ui_str_.export_source_label.c_str(),
+            export_source_buf_, sizeof(export_source_buf_));
+        ImGui::SameLine();
+        if (ImGui::Button(ui_str_.export_pick.empty() ? "Browse" : ui_str_.export_pick.c_str())) {
+            std::string f = pick_open_file();
+            if (!f.empty()) {
+                size_t n = std::min(f.size(), sizeof(export_source_buf_) - 1);
+                std::memcpy(export_source_buf_, f.c_str(), n);
+                export_source_buf_[n] = '\0';
+                std::string out = f + ".decensored.mp4"; // default output next to source
+                n = std::min(out.size(), sizeof(export_out_buf_) - 1);
+                std::memcpy(export_out_buf_, out.c_str(), n);
+                export_out_buf_[n] = '\0';
+            }
+        }
+        ImGui::SetNextItemWidth(ui_s(280.0f));
+        ImGui::InputText(ui_str_.export_out_label.empty() ? "Output" : ui_str_.export_out_label.c_str(),
+            export_out_buf_, sizeof(export_out_buf_));
+        ImGui::Spacing();
+        if (ImGui::Button(ui_str_.export_start.empty() ? "Export" : ui_str_.export_start.c_str())) {
+            ui_intents_.export_start = true;
+            ui_intents_.export_source = export_source_buf_;
+            ui_intents_.export_out = export_out_buf_;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str()))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        ImGui::PopStyleColor(1);
+        ImGui::PopStyleVar(2);
     }
 
     // Model-warmup status line (left-bottom float): built every build_ui() call (see its header
@@ -4785,6 +4985,21 @@ private:
         std::string ai_speed_unknown;
         std::string dialog_video_files;
         std::string dialog_all_files;
+        // Web-stream server + offline export (Phase 2).
+        std::string stream_server;
+        std::string export_video;
+        std::string stream_title;
+        std::string stream_port_label;
+        std::string stream_root_label;
+        std::string stream_pick;
+        std::string stream_start;
+        std::string stream_stop;
+        std::string export_title;
+        std::string export_source_label;
+        std::string export_out_label;
+        std::string export_pick;
+        std::string export_start;
+        std::string cancel;
     } ui_str_;
     // Open-URL modal (ImGui popup). Main-thread only, same discipline as ui_settings_open_.
     // Confirm writes a trimmed http(s) URL into ui_intents_.open_path (Python reuses the drop path)
@@ -4796,6 +5011,14 @@ private:
     bool open_url_show_load_error_ = false; // server/open failure after async open
     bool open_url_loading_ = false;
     bool open_url_close_pending_ = false;   // success → close on next build_open_url_popup
+    // Web-stream server / offline export popups (Phase 2). Main-thread only, same discipline.
+    bool stream_popup_ = false;
+    int stream_port_edit_ = 8080;
+    char stream_root_buf_[2048] = {};
+    bool stream_running_ = false;           // Python flips this (start/stop) for the 停止/启动 toggle
+    bool export_popup_ = false;
+    char export_source_buf_[2048] = {};
+    char export_out_buf_[2048] = {};
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
@@ -5251,6 +5474,9 @@ PYBIND11_MODULE(sumu_core, m)
         .def(py::init<int, int, bool>(),
             py::arg("width_hint") = 1280, py::arg("height_hint") = 720, py::arg("maximized") = false)
         .def("pick_open_file", &Player::pick_open_file) // blocking Win32 dialog, call before open()
+        .def("pick_folder", &Player::pick_folder) // web-stream video-root folder picker (blocking)
+        .def("set_stream_running", &Player::set_stream_running, py::arg("running")) // 停止/启动 toggle
+        .def("set_stream_defaults", &Player::set_stream_defaults, py::arg("port"), py::arg("root"))
         // gil_scoped_release: network open/reopen can block tens of seconds; Python's main loop
         // (and async open worker) must keep pumping UI. CUDA context is rebound inside open_session.
         .def("open", &Player::open, py::arg("path"),

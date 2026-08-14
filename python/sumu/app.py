@@ -236,6 +236,8 @@ def main():
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
     i18n_mod.apply_to_player(player, settings.language)
+    # Seed the web-stream popup defaults (last-used port / video root) from persisted settings.
+    player.set_stream_defaults(settings.stream_port, settings.stream_root)
     # fps_div is derived per open from target_fps + source_fps (not a global fixed skip).
 
     # Kick off model warmup in the background immediately -- the window is already up (Player's
@@ -269,6 +271,11 @@ def main():
     cfg_target_fps = int(settings_mod.clamp_target_fps(settings.target_fps))
     scheduler = None
     det_model = res_model = pad_mode = None
+    # Web-stream / offline-export feature state (Phase 2). transcode_engine is built lazily once
+    # the models are warm; stream_server/export_job are the live background feature sessions.
+    transcode_engine = None
+    stream_server = None
+    export_job = None
 
     def apply_target_fps_for_open():
         """Map global target_fps + this file's source_fps → native fps_div (1..4)."""
@@ -468,6 +475,25 @@ def main():
                 status_text = ""
             else:
                 status_text = i18n_mod.t("warmup_status")
+
+            # Feature status (web-stream / offline export) overrides the generic status when active.
+            feature_status_text = ""
+            if stream_server is not None:
+                feature_status_text = i18n_mod.t("stream_running", url=stream_server.access_url())
+            elif export_job is not None:
+                st = export_job.status()
+                if st["done"]:
+                    feature_status_text = i18n_mod.t(
+                        "export_done" if not st["error"] else "export_failed",
+                        path=st["out_path"], error=st["error"] or "")
+                    export_job = None
+                else:
+                    p = st["progress"]
+                    feature_status_text = i18n_mod.t(
+                        "export_running", progress=int(p * 100) if p is not None else "?")
+            if feature_status_text:
+                status_text = feature_status_text
+
             player.set_status_text(status_text)
 
             # On-demand TRT compile state machine. First consume a finished compile (hot-swap the
@@ -682,6 +708,62 @@ def main():
                 scheduler.start()
 
 
+            # ---- web-stream / offline-export intents (Phase 2) ----
+            # Lazily build the shared TranscodeEngine once models are warm (heavy, GPU-bound).
+            if transcode_engine is None and warm_ready and warm_models is not None:
+                det_model, res_model, pad_mode = warm_models
+                config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
+                                            max_regions_per_frame=cfg_max_regions,
+                                            cold_start_s=cfg_cold_start_s,
+                                            lead=cfg_lead)
+                from sumu.webstream import TranscodeEngine
+                transcode_engine = TranscodeEngine(det_model, res_model, pad_mode, config)
+
+            if intents["stream_stop"]:
+                if stream_server is not None:
+                    try:
+                        stream_server.stop()
+                    except Exception:  # noqa: BLE001 -- stop must never kill the main loop
+                        pass
+                    stream_server = None
+                    player.set_stream_running(False)
+                    status_text = i18n_mod.t("stream_stopped")
+            elif intents["stream_start"]:
+                port = int(intents["stream_port"] or 0)
+                root = (intents["stream_root"] or "").strip()
+                if transcode_engine is None:
+                    status_text = i18n_mod.t("warmup_status")
+                elif not root or not os.path.isdir(root):
+                    status_text = i18n_mod.t("stream_start_failed",
+                                             error=root or i18n_mod.t("stream_root_label"))
+                else:
+                    try:
+                        from sumu.webstream import StreamingServer
+                        stream_server = StreamingServer(root, port, transcode_engine,
+                                                        token=settings.stream_token)
+                        stream_server.start()
+                        settings.stream_port = port
+                        settings.stream_root = root
+                        settings_mod.save(settings)
+                        player.set_stream_running(True)
+                        status_text = i18n_mod.t("stream_running",
+                                                 url=stream_server.access_url())
+                    except Exception as e:  # noqa: BLE001
+                        status_text = i18n_mod.t("stream_start_failed", error=str(e))
+
+            if intents["export_start"]:
+                source = (intents["export_source"] or "").strip()
+                out = (intents["export_out"] or "").strip()
+                if transcode_engine is None:
+                    status_text = i18n_mod.t("warmup_status")
+                elif not source or not out:
+                    status_text = i18n_mod.t("export_failed", error="source/output")
+                else:
+                    from sumu.webstream import ExportJob
+                    export_job = ExportJob(transcode_engine, source, out)
+                    export_job.start()
+
+
             # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
             # scheduler is already running. Deliberately re-checked every tick (not just right
             # after do_open()/do_reopen()) since warmup can finish on its own schedule, well
@@ -771,4 +853,13 @@ def main():
         settings_mod.save(settings)
         if scheduler is not None:
             scheduler.stop()
+        # Phase 2: stop the web-stream server + any in-flight export before closing the player.
+        if stream_server is not None:
+            try:
+                stream_server.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            stream_server = None
+        if export_job is not None:
+            export_job.cancel()
         player.close()

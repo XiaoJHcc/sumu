@@ -45,6 +45,9 @@ MAX_REGIONS_MIN, MAX_REGIONS_MAX = 1, 8
 LEAD_DEFAULT = 180  # DESIGN.md lookahead_frames
 LEAD_MIN, LEAD_MAX = 1, 180
 COLD_START_S_DEFAULT = 1.0
+# Web-streaming server defaults (Phase 2).
+STREAM_PORT_DEFAULT = 8080
+STREAM_PORT_MIN, STREAM_PORT_MAX = 1024, 65535
 
 
 def default_path() -> Path:
@@ -111,6 +114,11 @@ class Settings:
     # UI language: "auto" (OS) or a supported catalog code ("zh-CN" / "en"). Resolved at
     # startup by sumu.i18n.set_language(); unknown values clamp to "auto" on load/save.
     language: str = LANGUAGE_AUTO
+    # Web-streaming server defaults (Phase 2): last-used port / video root folder / token.
+    # stream_token empty means auto-generate a fresh one per run.
+    stream_port: int = STREAM_PORT_DEFAULT
+    stream_root: str = ""
+    stream_token: str = ""
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
@@ -198,6 +206,15 @@ def clamp_language(value) -> str:
         if v.lower() == code.lower():
             return code
     return LANGUAGE_AUTO
+
+
+def clamp_stream_port(value) -> int:
+    """Web-streaming server port: 1024–65535; non-numeric → default."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return STREAM_PORT_DEFAULT
+    return max(STREAM_PORT_MIN, min(STREAM_PORT_MAX, v))
 
 
 def fps_div_for_target(source_fps: float, target_fps: int) -> int:
@@ -294,6 +311,9 @@ def load(path: Optional[str | Path] = None) -> Settings:
             max_regions=clamp_max_regions(data.get("max_regions", MAX_REGIONS_DEFAULT)),
             lead=clamp_lead(data.get("lead", LEAD_DEFAULT)),
             language=clamp_language(data.get("language", LANGUAGE_AUTO)),
+            stream_port=clamp_stream_port(data.get("stream_port", STREAM_PORT_DEFAULT)),
+            stream_root=data.get("stream_root", "") if isinstance(data.get("stream_root"), str) else "",
+            stream_token=data.get("stream_token", "") if isinstance(data.get("stream_token"), str) else "",
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -320,6 +340,9 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "max_regions": clamp_max_regions(settings.max_regions),
             "lead": clamp_lead(settings.lead),
             "language": clamp_language(settings.language),
+            "stream_port": clamp_stream_port(settings.stream_port),
+            "stream_root": settings.stream_root,
+            "stream_token": settings.stream_token,
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
