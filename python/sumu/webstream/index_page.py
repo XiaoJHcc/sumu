@@ -28,9 +28,14 @@ def is_video(name: str) -> bool:
     return name[dot:].lower() in VIDEO_EXT
 
 
-def _url(rel_path: str, token: str) -> str:
-    """URL-encode a relative path and append the token query (if any)."""
-    q = "/" + "/".join(_quote(seg) for seg in rel_path.split("/"))
+def _qs(token: str) -> str:
+    """`?token=...` query suffix (or '' when auth is off)."""
+    return ("?token=" + _quote(token)) if token else ""
+
+
+def _thumb_url(rel: str, token: str) -> str:
+    """URL of a video's on-demand thumbnail endpoint, URL-encoded + token-qualified."""
+    q = "/__thumb__/" + "/".join(_quote(seg) for seg in rel.split("/"))
     if token:
         q += "?token=" + _quote(token)
     return q
@@ -65,15 +70,22 @@ def render_index(title: str, crumbs: list[tuple[str, str]], items: list[dict], t
         name = _esc(it["name"])
         badge = "文件夹" if it["is_dir"] else "视频"
         if it["is_dir"]:
-            href = "/browse/%s%s" % (_quote(it["rel"]), ("?token=" + _quote(token)) if token else "")
+            href = "/browse/%s%s" % (_quote(it["rel"]), _qs(token))
         else:
-            href = "/play/%s%s" % (_quote(it["rel"]), ("?token=" + _quote(token)) if token else "")
+            href = "/play/%s%s" % (_quote(it["rel"]), _qs(token))
         size = "" if it["is_dir"] else _fmt_size(it.get("size"))
+        thumb_rel = it.get("thumb")
+        if thumb_rel:
+            src = _thumb_url(thumb_rel, token)
+            img = ('<img class="thumb" src="%s" alt="" loading="lazy" decoding="async" '
+                   'onerror="this.onerror=null;this.src=\'%s\'" />' % (src, _PLACEHOLDER))
+        else:
+            img = '<img class="thumb" src="%s" alt="" />' % _PLACEHOLDER
         cards.append(
             '<a class="card" href="%s" title="%s">'
-            '<div class="cover"><img src="%s" alt=""/><span class="badge">%s</span></div>'
+            '<div class="cover">%s<span class="badge">%s</span></div>'
             '<div class="meta"><div class="name">%s</div>%s</div></a>'
-            % (href, name, _PLACEHOLDER, badge, name,
+            % (href, name, img, badge, name,
                ('<div class="sub">%s</div>' % size) if size else "")
         )
 
@@ -143,7 +155,7 @@ h1{font-size:22px;font-weight:650;margin:0 0 8px;letter-spacing:-.02em}
 border-radius:14px;overflow:hidden;text-decoration:none;color:inherit;transition:transform .15s ease}
 .card:hover{transform:translateY(-2px);background:var(--card-hover);border-color:#334155}
 .cover{position:relative;aspect-ratio:16/10;background:#0e131c;overflow:hidden}
-.cover img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb{width:100%;height:100%;object-fit:cover;display:block;background:#0e131c}
 .badge{position:absolute;left:8px;top:8px;padding:2px 8px;border-radius:999px;font-size:11px;
 color:#dbe7ff;background:rgba(15,23,42,.72);border:1px solid rgba(148,163,184,.25)}
 .meta{padding:10px 11px 12px}.name{font-size:13px;font-weight:560;line-height:1.35;

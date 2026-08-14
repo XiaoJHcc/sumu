@@ -236,8 +236,10 @@ def main():
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
     i18n_mod.apply_to_player(player, settings.language)
-    # Seed the web-stream popup defaults (last-used port / video root) from persisted settings.
-    player.set_stream_defaults(settings.stream_port, settings.stream_root)
+    # Seed the web-stream popup defaults (last-used port / video root / token / no-token) from
+    # persisted settings.
+    player.set_stream_defaults(settings.stream_port, settings.stream_root,
+                               settings.stream_no_token, settings.stream_token)
     # fps_div is derived per open from target_fps + source_fps (not a global fixed skip).
 
     # Kick off model warmup in the background immediately -- the window is already up (Player's
@@ -476,11 +478,11 @@ def main():
             else:
                 status_text = i18n_mod.t("warmup_status")
 
-            # Feature status (web-stream / offline export) overrides the generic status when active.
+            # Feature status (offline export) overrides the generic status when active. The
+            # web-stream server deliberately has NO status float here -- its running URL is shown
+            # (and clickable) inside the server popup instead.
             feature_status_text = ""
-            if stream_server is not None:
-                feature_status_text = i18n_mod.t("stream_running", url=stream_server.access_url())
-            elif export_job is not None:
+            if export_job is not None:
                 st = export_job.status()
                 if st["done"]:
                     feature_status_text = i18n_mod.t(
@@ -731,6 +733,8 @@ def main():
             elif intents["stream_start"]:
                 port = int(intents["stream_port"] or 0)
                 root = (intents["stream_root"] or "").strip()
+                no_token = bool(intents.get("stream_no_token", False))
+                token = (intents.get("stream_token") or "").strip()
                 if transcode_engine is None:
                     status_text = i18n_mod.t("warmup_status")
                 elif not root or not os.path.isdir(root):
@@ -740,14 +744,15 @@ def main():
                     try:
                         from sumu.webstream import StreamingServer
                         stream_server = StreamingServer(root, port, transcode_engine,
-                                                        token=settings.stream_token)
+                                                        token=token, no_token=no_token)
                         stream_server.start()
                         settings.stream_port = port
                         settings.stream_root = root
+                        settings.stream_no_token = no_token
+                        if not no_token:
+                            settings.stream_token = token  # "" = random next time
                         settings_mod.save(settings)
-                        player.set_stream_running(True)
-                        status_text = i18n_mod.t("stream_running",
-                                                 url=stream_server.access_url())
+                        player.set_stream_running(True, stream_server.access_url())
                     except Exception as e:  # noqa: BLE001
                         status_text = i18n_mod.t("stream_start_failed", error=str(e))
 

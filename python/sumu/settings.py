@@ -115,10 +115,12 @@ class Settings:
     # startup by sumu.i18n.set_language(); unknown values clamp to "auto" on load/save.
     language: str = LANGUAGE_AUTO
     # Web-streaming server defaults (Phase 2): last-used port / video root folder / token.
-    # stream_token empty means auto-generate a fresh one per run.
+    # stream_token empty means auto-generate a fresh one per run; stream_no_token True skips auth
+    # entirely (server serves with no token).
     stream_port: int = STREAM_PORT_DEFAULT
     stream_root: str = ""
     stream_token: str = ""
+    stream_no_token: bool = False
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
@@ -314,6 +316,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             stream_port=clamp_stream_port(data.get("stream_port", STREAM_PORT_DEFAULT)),
             stream_root=data.get("stream_root", "") if isinstance(data.get("stream_root"), str) else "",
             stream_token=data.get("stream_token", "") if isinstance(data.get("stream_token"), str) else "",
+            stream_no_token=_coerce_bool(data.get("stream_no_token"), False),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -343,6 +346,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "stream_port": clamp_stream_port(settings.stream_port),
             "stream_root": settings.stream_root,
             "stream_token": settings.stream_token,
+            "stream_no_token": bool(settings.stream_no_token),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

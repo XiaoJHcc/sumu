@@ -20,7 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs
 
-from . import index_page
+from . import index_page, thumbnail
 
 
 class _Session:
@@ -103,11 +103,14 @@ class StreamManager:
 
 class StreamingServer:
     def __init__(self, root: str, port: int, engine, host: str = "0.0.0.0",
-                 token: str = "", bitrate: str = "8M", cache_dir: str | None = None):
+                 token: str = "", no_token: bool = False, bitrate: str = "8M",
+                 cache_dir: str | None = None):
         self.root = os.path.abspath(root)
         self.port = int(port)
         self.host = host
-        self.token = token or secrets.token_urlsafe(18)
+        # no_token disables auth entirely (empty token, _token_ok short-circuits); otherwise an
+        # empty token means "generate a random one per run".
+        self.token = "" if no_token else (token or secrets.token_urlsafe(18))
         self.bitrate = bitrate
         self.cache_dir = cache_dir or os.path.join(os.path.dirname(self.root) or self.root,
                                                    ".sumu_stream_cache")
@@ -165,10 +168,27 @@ class StreamingServer:
             is_dir = os.path.isdir(full)
             if not is_dir and not index_page.is_video(name):
                 continue  # only folders + videos in the grid (v1)
-            items.append({"name": name, "is_dir": is_dir, "rel": rel,
-                          "size": st.st_size if not is_dir else None})
+            if is_dir:
+                items.append({"name": name, "is_dir": True, "rel": rel, "kind": "folder",
+                              "size": None, "thumb": self._first_video_in_dir(full, rel)})
+            else:
+                items.append({"name": name, "is_dir": False, "rel": rel, "kind": "video",
+                              "size": st.st_size, "thumb": rel})
         items.sort(key=lambda it: (not it["is_dir"], it["name"].lower()))
         return items
+
+    def _first_video_in_dir(self, abs_dir: str, rel_prefix: str) -> str | None:
+        """First direct video child (non-recursive) used as a folder's cover thumbnail."""
+        try:
+            names = sorted(n for n in os.listdir(abs_dir) if not n.startswith("."))
+        except OSError:
+            return None
+        for name in names:
+            if not index_page.is_video(name):
+                continue
+            if os.path.isfile(os.path.join(abs_dir, name)):
+                return (rel_prefix + "/" + name) if rel_prefix else name
+        return None
 
 
 def _safe_key(rel: str) -> str:
@@ -238,9 +258,30 @@ def _make_handler(server: "StreamingServer"):
                 if path.startswith("/stream/"):
                     rest = self._rel_after("/stream/")
                     return self._stream(rest, head_only)
+                if path.startswith("/__thumb__/"):
+                    rel = self._rel_after("/__thumb__/").strip("/")
+                    return self._thumb(rel, head_only)
                 return self._send_html(404, index_page.render_message("404", "Not Found"))
             except ValueError:
                 return self._send_plain(403, "Forbidden")
+
+        def _thumb(self, rel: str, head_only: bool):
+            """Serve (generating on demand) a cached JPEG thumbnail for a video. 404 on failure so
+            the front-end's <img onerror> falls back to its inline SVG placeholder."""
+            try:
+                abs_path = server._resolve(rel)
+            except ValueError:
+                return self._send_plain(403, "Forbidden")
+            if not os.path.isfile(abs_path) or not index_page.is_video(os.path.basename(abs_path)):
+                return self._send_plain(404, "Not Found")
+            try:
+                st = os.stat(abs_path)
+            except OSError:
+                return self._send_plain(404, "Not Found")
+            jpg = thumbnail.generate_video_thumb(abs_path, st)
+            if jpg is None or not os.path.isfile(jpg):
+                return self._send_plain(404, "Not Found")
+            self._send_file(jpg, "image/jpeg", head_only)
 
         def _index(self, rel: str, crumbs: list[tuple[str, str]]):
             try:

@@ -420,6 +420,8 @@ struct UiIntents {
     bool stream_start = false;
     int stream_port = 0;
     std::string stream_root;
+    bool stream_no_token = false;
+    std::string stream_token;
     bool stream_stop = false;
     bool export_start = false;
     std::string export_source;
@@ -1290,15 +1292,28 @@ public:
         }
     }
     // Python flips this when it starts/stops the server, so the stream popup shows 停止 vs 启动.
-    void set_stream_running(bool running) { stream_running_ = running; }
-    // Seed the stream root field from the last-used folder (Python persists it in settings).
-    void set_stream_defaults(int port, const std::string& root)
+    // The access URL is passed on start so the popup can render it as a clickable link (open in
+    // the default browser) instead of a persistent status float.
+    void set_stream_running(bool running, const std::string& url = "")
+    {
+        stream_running_ = running;
+        if (!url.empty()) stream_url_ = url;
+    }
+    // Seed the stream root/token/no-token fields from last-used settings (Python persists them).
+    void set_stream_defaults(int port, const std::string& root, bool no_token,
+                             const std::string& token)
     {
         if (port > 0) stream_port_edit_ = port;
         if (!root.empty()) {
             std::memcpy(stream_root_buf_, root.c_str(),
                 std::min(root.size(), sizeof(stream_root_buf_) - 1));
             stream_root_buf_[std::min(root.size(), sizeof(stream_root_buf_) - 1)] = '\0';
+        }
+        stream_no_token_edit_ = no_token;
+        if (!token.empty()) {
+            std::memcpy(stream_token_buf_, token.c_str(),
+                std::min(token.size(), sizeof(stream_token_buf_) - 1));
+            stream_token_buf_[std::min(token.size(), sizeof(stream_token_buf_) - 1)] = '\0';
         }
     }
     void request_open_url_popup()
@@ -1446,6 +1461,10 @@ public:
         take("stream_pick", ui_str_.stream_pick);
         take("stream_start", ui_str_.stream_start);
         take("stream_stop", ui_str_.stream_stop);
+        take("stream_url_label", ui_str_.stream_url_label);
+        take("stream_no_token", ui_str_.stream_no_token);
+        take("stream_token_label", ui_str_.stream_token_label);
+        take("stream_token_hint", ui_str_.stream_token_hint);
         take("export_title", ui_str_.export_title);
         take("export_source_label", ui_str_.export_source_label);
         take("export_out_label", ui_str_.export_out_label);
@@ -1470,6 +1489,8 @@ public:
         d["stream_start"] = ui_intents_.stream_start; // web-stream server: start with port/root
         d["stream_port"] = ui_intents_.stream_port;
         d["stream_root"] = ui_intents_.stream_root;
+        d["stream_no_token"] = ui_intents_.stream_no_token;
+        d["stream_token"] = ui_intents_.stream_token;
         d["stream_stop"] = ui_intents_.stream_stop; // web-stream server: stop
         d["export_start"] = ui_intents_.export_start; // offline export: start with source/out
         d["export_source"] = ui_intents_.export_source;
@@ -2313,9 +2334,11 @@ private:
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
         const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(32.0f);
         const float open_btn_gap = ui_s(8.0f);
+        const float open_btn_vgap = ui_s(8.0f);
         const float gap = ui_s(16.0f);
-        // Four side-by-side entry buttons: local file + network URL + web-stream + offline export.
-        const float open_row_w = open_btn_w * 4.0f + open_btn_gap * 3.0f;
+        // 2×2 entry grid: local file (primary blue) + network URL / web-stream / offline export.
+        const float open_row_w = open_btn_w * 2.0f + open_btn_gap;
+        const float open_grid_h = open_btn_h * 2.0f + open_btn_vgap;
 
         // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
         // it first so the whole prompt+button+compile block stays vertically centered.
@@ -2333,7 +2356,7 @@ private:
 
         float content_h = std::max(0.0f, io.DisplaySize.y - top_bar_h);
         float logo_block = have_logo ? (logo_draw + logo_gap) : 0.0f;
-        float block_h = logo_block + tsize.y + gap + open_btn_h + compile_block_h;
+        float block_h = logo_block + tsize.y + gap + open_grid_h + compile_block_h;
         float top = (content_h - block_h) * 0.5f;
         if (top < 0.0f) top = 0.0f;
 
@@ -2351,18 +2374,24 @@ private:
 
         const float open_row_x = (io.DisplaySize.x - open_row_w) * 0.5f;
         const float open_row_y = y + tsize.y + gap;
+        // Row 1: primary "open file" keeps the default blue; "open URL" is secondary gray.
         ImGui::SetCursorPos(ImVec2(open_row_x, open_row_y));
         if (ImGui::Button(ui_str_.open_file.c_str(), ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
         ImGui::SameLine(0.0f, open_btn_gap);
+        push_secondary_button_style();
         if (ImGui::Button(ui_str_.open_url.c_str(), ImVec2(open_btn_w, open_btn_h))) request_open_url_popup();
-        ImGui::SameLine(0.0f, open_btn_gap);
+        pop_secondary_button_style();
+        // Row 2: web-stream server + offline export (both secondary gray).
+        ImGui::SetCursorPos(ImVec2(open_row_x, open_row_y + open_btn_h + open_btn_vgap));
+        push_secondary_button_style();
         if (ImGui::Button(ui_str_.stream_server.c_str(), ImVec2(open_btn_w, open_btn_h))) request_stream_popup();
         ImGui::SameLine(0.0f, open_btn_gap);
         if (ImGui::Button(ui_str_.export_video.c_str(), ImVec2(open_btn_w, open_btn_h))) request_export_popup();
+        pop_secondary_button_style();
 
         if (show_compile) {
             float region_x = (io.DisplaySize.x - compile_cw) * 0.5f;
-            float cy = y + tsize.y + gap + open_btn_h + region_gap;
+            float cy = y + tsize.y + gap + open_grid_h + region_gap;
 
 
             // Frame the whole compile block (text + button/progress-bar) as one visual unit,
@@ -2669,12 +2698,14 @@ private:
             do_ok = true;
         }
         ImGui::SameLine();
+        push_secondary_button_style();
         if (ImGui::Button(ui_str_.open_url_cancel.empty() ? "Cancel" : ui_str_.open_url_cancel.c_str(),
                 ImVec2(btn_w, btn_h))) {
             open_url_show_error_ = false;
             open_url_show_load_error_ = false;
             ImGui::CloseCurrentPopup();
         }
+        pop_secondary_button_style();
 
         if (do_ok) {
             std::string url = trim_url(open_url_buf_);
@@ -2711,94 +2742,293 @@ private:
         ImGui::PopStyleVar(3);
     }
 
-    // Web-stream server modal (Phase 2): port + video-root folder + 启动/停止. Matches the
-    // open-URL modal's chrome; writes ui_intents_.stream_start{port,root} / stream_stop.
+    // Web-stream server modal (Phase 2): port + video-root folder + 启动/停止. Chrome matches
+    // the open-URL modal exactly (self-drawn title strip + close X, 8px rounding + 1px border,
+    // centered footer buttons). While running it shows the access URL as a clickable link
+    // (TextLinkOpenURL → default browser) instead of the form -- no persistent status float.
     void build_stream_popup()
     {
         if (stream_popup_) { ImGui::OpenPopup("###sumu_stream"); stream_popup_ = false; }
         ImGuiIO& io = ImGui::GetIO();
-        const float rounding = ui_s(8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(16.0f), ui_s(14.0f)));
-        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
+        // Force center every frame (same fix as the open-URL modal's loading card): AlwaysAutoResize
+        // takes a frame to settle the content size, so Appearing-only centering lands once with a
+        // stale size and stays off-center on first open. Always re-centers so it settles exactly.
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+
+        const float rounding = ui_s(8.0f);
+        const float border_sz = 1.0f;
+        const ImU32 border_col = IM_COL32(120, 120, 120, 230);
+        const ImVec4 chrome_bg(0.14f, 0.14f, 0.16f, 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, chrome_bg);
+        ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.50f));
+
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoTitleBar;
         if (!ImGui::BeginPopupModal("###sumu_stream", nullptr, flags)) {
-            ImGui::PopStyleColor(1);
-            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(3);
             return;
         }
-        ImGui::TextUnformatted(ui_str_.stream_title.empty() ? "Web stream" : ui_str_.stream_title.c_str());
-        ImGui::Separator();
-        ImGui::SetNextItemWidth(ui_s(240.0f));
-        ImGui::InputInt(ui_str_.stream_port_label.empty() ? "Port" : ui_str_.stream_port_label.c_str(),
-            &stream_port_edit_, 1, 100);
-        if (stream_port_edit_ < 1) stream_port_edit_ = 1;
-        if (stream_port_edit_ > 65535) stream_port_edit_ = 65535;
-        ImGui::SetNextItemWidth(ui_s(240.0f));
-        ImGui::InputText(ui_str_.stream_root_label.empty() ? "Root" : ui_str_.stream_root_label.c_str(),
-            stream_root_buf_, sizeof(stream_root_buf_));
-        ImGui::SameLine();
-        if (ImGui::Button(ui_str_.stream_pick.empty() ? "Browse" : ui_str_.stream_pick.c_str())) {
-            std::string dir = pick_folder();
-            if (!dir.empty()) {
-                size_t n = std::min(dir.size(), sizeof(stream_root_buf_) - 1);
-                std::memcpy(stream_root_buf_, dir.c_str(), n);
-                stream_root_buf_[n] = '\0';
+
+        auto draw_popup_border = [&]() {
+            ImVec2 a = ImGui::GetWindowPos();
+            ImVec2 b = ImVec2(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
+            ImGui::GetForegroundDrawList()->AddRect(
+                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
+                border_col, rounding, 0, border_sz);
+        };
+
+        const float bar_h = top_bar_h();
+        const float pad = ui_s(12.0f);
+        const float content_w = ui_s(440.0f);
+        const float win_w = content_w + pad * 2.0f;
+        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+        const float icon_th = ui_s(1.5f);
+
+        // Reserve full width + title-strip height so AlwaysAutoResize matches main chrome.
+        ImGui::Dummy(ImVec2(win_w, bar_h));
+
+        // ---- self-drawn title strip (identical to the open-URL modal) ----
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        const float strip_w = ImGui::GetWindowSize().x;
+        dl->AddRectFilled(ImVec2(wpos.x + border_sz, wpos.y + border_sz),
+            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
+            IM_COL32(36, 36, 41, 255), std::max(0.0f, rounding - border_sz),
+            ImDrawFlags_RoundCornersTop);
+        dl->AddLine(ImVec2(wpos.x + border_sz, wpos.y + bar_h),
+            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
+            IM_COL32(120, 120, 120, 120), 1.0f);
+
+        const char* title = ui_str_.stream_title.empty() ? "Web stream" : ui_str_.stream_title.c_str();
+        const float chrome_btn_w = ui_s(28.0f);
+        const float chrome_btn_h = bar_h - ui_s(4.0f);
+        {
+            float th = ImGui::GetTextLineHeight();
+            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
+            ImGui::SetCursorPosX(pad);
+            ImGui::TextUnformatted(title);
+        }
+        ImGui::SetCursorPos(ImVec2(strip_w - chrome_btn_w - ui_s(4.0f), (bar_h - chrome_btn_h) * 0.5f));
+        {
+            IconButtonResult r = icon_button("##stream_close", ImVec2(chrome_btn_w, chrome_btn_h));
+            if (r.clicked) ImGui::CloseCurrentPopup();
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float half = ui_s(5.0f);
+            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
+        }
+
+        ImGui::SetCursorPosY(bar_h + pad);
+        ImGui::Indent(pad);
+        ImGui::PushItemWidth(content_w);
+
+        const float label_w = ui_s(120.0f);
+        const float field_w = content_w - label_w;
+        const float pick_w = ui_s(96.0f);
+
+        if (stream_running_) {
+            // Running: the access URL lives here (no persistent status float), clickable → browser.
+            if (!ui_str_.stream_url_label.empty())
+                ImGui::TextUnformatted(ui_str_.stream_url_label.c_str());
+            if (!stream_url_.empty())
+                ImGui::TextLinkOpenURL(stream_url_.c_str(), stream_url_.c_str());
+        } else {
+            // Form rows: left label + right input, laid out manually (not a table) so every row's
+            // right edge lands at pad + content_w with the same pad margin as the left indent.
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(ui_str_.stream_port_label.empty() ? "Port" : ui_str_.stream_port_label.c_str());
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(pad + label_w);
+            ImGui::SetNextItemWidth(field_w);
+            ImGui::InputInt("##stream_port", &stream_port_edit_, 1, 100);
+            if (stream_port_edit_ < 1) stream_port_edit_ = 1;
+            if (stream_port_edit_ > 65535) stream_port_edit_ = 65535;
+
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(ui_str_.stream_root_label.empty() ? "Root" : ui_str_.stream_root_label.c_str());
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(pad + label_w);
+            ImGui::SetNextItemWidth(field_w - pick_w - ImGui::GetStyle().ItemSpacing.x);
+            ImGui::InputText("##stream_root", stream_root_buf_, sizeof(stream_root_buf_));
+            ImGui::SameLine();
+            if (ImGui::Button(ui_str_.stream_pick.empty() ? "Browse" : ui_str_.stream_pick.c_str(),
+                    ImVec2(pick_w, 0.0f))) {
+                std::string dir = pick_folder();
+                if (!dir.empty()) {
+                    size_t n = std::min(dir.size(), sizeof(stream_root_buf_) - 1);
+                    std::memcpy(stream_root_buf_, dir.c_str(), n);
+                    stream_root_buf_[n] = '\0';
+                }
+            }
+
+            // Token row: a "无 token" checkbox (unchecked = use a token for auth). While checked
+            // the token input is hidden; while unchecked, an empty input means "generate a random
+            // token each start".
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(ui_str_.stream_no_token.empty() ? "No token" : ui_str_.stream_no_token.c_str());
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(pad + label_w);
+            ImGui::Checkbox("##stream_no_token", &stream_no_token_edit_);
+            if (!stream_no_token_edit_) {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(ui_str_.stream_token_label.empty() ? "Token" : ui_str_.stream_token_label.c_str());
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(pad + label_w);
+                ImGui::SetNextItemWidth(field_w);
+                ImGui::InputTextWithHint("##stream_token",
+                    ui_str_.stream_token_hint.empty() ? "" : ui_str_.stream_token_hint.c_str(),
+                    stream_token_buf_, sizeof(stream_token_buf_));
             }
         }
+
         ImGui::Spacing();
+        ImGui::Spacing();
+        const float btn_w = ui_s(100.0f);
+        const float btn_h = ui_s(28.0f);
+        const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
+
         if (stream_running_) {
-            if (ImGui::Button(ui_str_.stream_stop.empty() ? "Stop" : ui_str_.stream_stop.c_str())) {
+            if (ImGui::Button(ui_str_.stream_stop.empty() ? "Stop" : ui_str_.stream_stop.c_str(),
+                    ImVec2(btn_w, btn_h))) {
                 ui_intents_.stream_stop = true;
                 ImGui::CloseCurrentPopup();
             }
         } else {
-            if (ImGui::Button(ui_str_.stream_start.empty() ? "Start" : ui_str_.stream_start.c_str())) {
+            if (ImGui::Button(ui_str_.stream_start.empty() ? "Start" : ui_str_.stream_start.c_str(),
+                    ImVec2(btn_w, btn_h))) {
                 ui_intents_.stream_start = true;
                 ui_intents_.stream_port = stream_port_edit_;
                 ui_intents_.stream_root = stream_root_buf_;
-                ImGui::CloseCurrentPopup();
+                ui_intents_.stream_no_token = stream_no_token_edit_;
+                ui_intents_.stream_token = stream_token_buf_;
+                // Keep the popup open: the next tick flips stream_running_ and the body swaps to
+                // the running view (URL) in place.
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str()))
+        push_secondary_button_style();
+        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str(),
+                ImVec2(btn_w, btn_h)))
             ImGui::CloseCurrentPopup();
+        pop_secondary_button_style();
+
+        // Bottom inset; content_w Dummy keeps right pad (= left Indent) under AlwaysAutoResize.
+        ImGui::Dummy(ImVec2(content_w, pad));
+        ImGui::PopItemWidth();
+        ImGui::Unindent(pad);
+
+        draw_popup_border();
         ImGui::EndPopup();
-        ImGui::PopStyleColor(1);
-        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(3);
     }
 
-    // Offline-export modal (Phase 2): source file + output file + 开始导出. Writes
-    // ui_intents_.export_start{source,out}; the blocking export runs on a Python thread.
+    // Offline-export modal (Phase 2): source file + output file + 开始导出. Chrome matches the
+    // open-URL modal exactly; writes ui_intents_.export_start{source,out}. The blocking export
+    // runs on a Python thread.
     void build_export_popup()
     {
         if (export_popup_) { ImGui::OpenPopup("###sumu_export"); export_popup_ = false; }
         ImGuiIO& io = ImGui::GetIO();
-        const float rounding = ui_s(8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(16.0f), ui_s(14.0f)));
-        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
+        // See build_stream_popup: table + AlwaysAutoResize settle over a few frames, so center
+        // every frame instead of Appearing-only (which lands once with a stale size).
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+
+        const float rounding = ui_s(8.0f);
+        const float border_sz = 1.0f;
+        const ImU32 border_col = IM_COL32(120, 120, 120, 230);
+        const ImVec4 chrome_bg(0.14f, 0.14f, 0.16f, 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f);
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, chrome_bg);
+        ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.50f));
+
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoTitleBar;
         if (!ImGui::BeginPopupModal("###sumu_export", nullptr, flags)) {
-            ImGui::PopStyleColor(1);
-            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(3);
             return;
         }
-        ImGui::TextUnformatted(ui_str_.export_title.empty() ? "Export" : ui_str_.export_title.c_str());
-        ImGui::Separator();
-        ImGui::SetNextItemWidth(ui_s(280.0f));
-        ImGui::InputText(ui_str_.export_source_label.empty() ? "Source" : ui_str_.export_source_label.c_str(),
-            export_source_buf_, sizeof(export_source_buf_));
+
+        auto draw_popup_border = [&]() {
+            ImVec2 a = ImGui::GetWindowPos();
+            ImVec2 b = ImVec2(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
+            ImGui::GetForegroundDrawList()->AddRect(
+                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
+                border_col, rounding, 0, border_sz);
+        };
+
+        const float bar_h = top_bar_h();
+        const float pad = ui_s(12.0f);
+        const float content_w = ui_s(440.0f);
+        const float win_w = content_w + pad * 2.0f;
+        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+        const float icon_th = ui_s(1.5f);
+
+        ImGui::Dummy(ImVec2(win_w, bar_h));
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        const float strip_w = ImGui::GetWindowSize().x;
+        dl->AddRectFilled(ImVec2(wpos.x + border_sz, wpos.y + border_sz),
+            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
+            IM_COL32(36, 36, 41, 255), std::max(0.0f, rounding - border_sz),
+            ImDrawFlags_RoundCornersTop);
+        dl->AddLine(ImVec2(wpos.x + border_sz, wpos.y + bar_h),
+            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
+            IM_COL32(120, 120, 120, 120), 1.0f);
+
+        const char* title = ui_str_.export_title.empty() ? "Export" : ui_str_.export_title.c_str();
+        const float chrome_btn_w = ui_s(28.0f);
+        const float chrome_btn_h = bar_h - ui_s(4.0f);
+        {
+            float th = ImGui::GetTextLineHeight();
+            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
+            ImGui::SetCursorPosX(pad);
+            ImGui::TextUnformatted(title);
+        }
+        ImGui::SetCursorPos(ImVec2(strip_w - chrome_btn_w - ui_s(4.0f), (bar_h - chrome_btn_h) * 0.5f));
+        {
+            IconButtonResult r = icon_button("##export_close", ImVec2(chrome_btn_w, chrome_btn_h));
+            if (r.clicked) ImGui::CloseCurrentPopup();
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float half = ui_s(5.0f);
+            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
+        }
+
+        ImGui::SetCursorPosY(bar_h + pad);
+        ImGui::Indent(pad);
+        ImGui::PushItemWidth(content_w);
+
+        const float label_w = ui_s(120.0f);
+        const float field_w = content_w - label_w;
+        const float pick_w = ui_s(96.0f);
+
+        // Manual label-left / input-right rows (no table) so every row's right edge lands at
+        // pad + content_w with the same pad margin as the left indent.
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ui_str_.export_source_label.empty() ? "Source" : ui_str_.export_source_label.c_str());
         ImGui::SameLine();
-        if (ImGui::Button(ui_str_.export_pick.empty() ? "Browse" : ui_str_.export_pick.c_str())) {
+        ImGui::SetCursorPosX(pad + label_w);
+        ImGui::SetNextItemWidth(field_w - pick_w - ImGui::GetStyle().ItemSpacing.x);
+        ImGui::InputText("##export_source", export_source_buf_, sizeof(export_source_buf_));
+        ImGui::SameLine();
+        if (ImGui::Button(ui_str_.export_pick.empty() ? "Browse" : ui_str_.export_pick.c_str(),
+                ImVec2(pick_w, 0.0f))) {
             std::string f = pick_open_file();
             if (!f.empty()) {
                 size_t n = std::min(f.size(), sizeof(export_source_buf_) - 1);
@@ -2810,22 +3040,43 @@ private:
                 export_out_buf_[n] = '\0';
             }
         }
-        ImGui::SetNextItemWidth(ui_s(280.0f));
-        ImGui::InputText(ui_str_.export_out_label.empty() ? "Output" : ui_str_.export_out_label.c_str(),
-            export_out_buf_, sizeof(export_out_buf_));
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ui_str_.export_out_label.empty() ? "Output" : ui_str_.export_out_label.c_str());
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(pad + label_w);
+        ImGui::SetNextItemWidth(field_w);
+        ImGui::InputText("##export_out", export_out_buf_, sizeof(export_out_buf_));
+
         ImGui::Spacing();
-        if (ImGui::Button(ui_str_.export_start.empty() ? "Export" : ui_str_.export_start.c_str())) {
+        ImGui::Spacing();
+        const float btn_w = ui_s(100.0f);
+        const float btn_h = ui_s(28.0f);
+        const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
+
+        if (ImGui::Button(ui_str_.export_start.empty() ? "Export" : ui_str_.export_start.c_str(),
+                ImVec2(btn_w, btn_h))) {
             ui_intents_.export_start = true;
             ui_intents_.export_source = export_source_buf_;
             ui_intents_.export_out = export_out_buf_;
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str()))
+        push_secondary_button_style();
+        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str(),
+                ImVec2(btn_w, btn_h)))
             ImGui::CloseCurrentPopup();
+        pop_secondary_button_style();
+
+        ImGui::Dummy(ImVec2(content_w, pad));
+        ImGui::PopItemWidth();
+        ImGui::Unindent(pad);
+
+        draw_popup_border();
         ImGui::EndPopup();
-        ImGui::PopStyleColor(1);
-        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(3);
     }
 
     // Model-warmup status line (left-bottom float): built every build_ui() call (see its header
@@ -2883,6 +3134,18 @@ private:
             r.dl->AddRectFilled(r.min, r.max, IM_COL32(255, 255, 255, 30), ui_s(6.0f));
         return r;
     }
+
+    // Secondary (neutral gray) button styling -- used for every non-primary action (open URL /
+    // web-stream / offline-export entries, and every 取消/close button). Primary buttons keep
+    // ImGui's default StyleColorsDark blue. The base alpha mirrors the default blue button's
+    // 0.40 so gray reads at the same visual weight.
+    void push_secondary_button_style()
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.45f, 0.50f, 0.40f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.40f, 0.45f, 1.0f));
+    }
+    void pop_secondary_button_style() { ImGui::PopStyleColor(3); }
 
     void build_top_bar(float& out_height)
     {
@@ -2968,6 +3231,32 @@ private:
             const float dy = ui_s(2.0f);
             r.dl->AddCircle(ImVec2(cx - dx, cy + dy), r_link, icon_col, 12, icon_th);
             r.dl->AddCircle(ImVec2(cx + dx, cy - dy), r_link, icon_col, 12, icon_th);
+        }
+        ImGui::SameLine();
+        { // Web-stream server: globe glyph (circle + equator + meridian), hollow-line weight.
+            IconButtonResult r = icon_button("##stream_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) request_stream_popup();
+            if (ImGui::IsItemHovered() && !ui_str_.stream_server.empty())
+                ImGui::SetTooltip("%s", ui_str_.stream_server.c_str());
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            const float rr = ui_s(6.0f);
+            r.dl->AddCircle(ImVec2(cx, cy), rr, icon_col, 24, icon_th);
+            r.dl->AddLine(ImVec2(cx - rr, cy), ImVec2(cx + rr, cy), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx, cy - rr), ImVec2(cx, cy + rr), icon_col, icon_th);
+        }
+        ImGui::SameLine();
+        { // Offline export: download-tray arrow glyph, hollow-line weight.
+            IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) request_export_popup();
+            if (ImGui::IsItemHovered() && !ui_str_.export_video.empty())
+                ImGui::SetTooltip("%s", ui_str_.export_video.c_str());
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            r.dl->AddLine(ImVec2(cx, cy - ui_s(6.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - ui_s(4.0f), cy - ui_s(1.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx + ui_s(4.0f), cy - ui_s(1.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - ui_s(6.0f), cy + ui_s(6.0f)), ImVec2(cx + ui_s(6.0f), cy + ui_s(6.0f)), icon_col, icon_th);
         }
         ImGui::SameLine();
         {
@@ -4994,6 +5283,10 @@ private:
         std::string stream_pick;
         std::string stream_start;
         std::string stream_stop;
+        std::string stream_url_label;
+        std::string stream_no_token;
+        std::string stream_token_label;
+        std::string stream_token_hint;
         std::string export_title;
         std::string export_source_label;
         std::string export_out_label;
@@ -5015,7 +5308,10 @@ private:
     bool stream_popup_ = false;
     int stream_port_edit_ = 8080;
     char stream_root_buf_[2048] = {};
+    bool stream_no_token_edit_ = false;      // "无 token" checkbox (hide the token input while set)
+    char stream_token_buf_[256] = {};        // explicit token; empty = server generates a random one
     bool stream_running_ = false;           // Python flips this (start/stop) for the 停止/启动 toggle
+    std::string stream_url_;                // access URL while running (shown as a clickable link)
     bool export_popup_ = false;
     char export_source_buf_[2048] = {};
     char export_out_buf_[2048] = {};
@@ -5475,8 +5771,10 @@ PYBIND11_MODULE(sumu_core, m)
             py::arg("width_hint") = 1280, py::arg("height_hint") = 720, py::arg("maximized") = false)
         .def("pick_open_file", &Player::pick_open_file) // blocking Win32 dialog, call before open()
         .def("pick_folder", &Player::pick_folder) // web-stream video-root folder picker (blocking)
-        .def("set_stream_running", &Player::set_stream_running, py::arg("running")) // 停止/启动 toggle
-        .def("set_stream_defaults", &Player::set_stream_defaults, py::arg("port"), py::arg("root"))
+        .def("set_stream_running", &Player::set_stream_running,
+            py::arg("running"), py::arg("url") = std::string("")) // 停止/启动 toggle + access URL
+        .def("set_stream_defaults", &Player::set_stream_defaults, py::arg("port"), py::arg("root"),
+            py::arg("no_token"), py::arg("token"))
         // gil_scoped_release: network open/reopen can block tens of seconds; Python's main loop
         // (and async open worker) must keep pumping UI. CUDA context is rebound inside open_session.
         .def("open", &Player::open, py::arg("path"),
