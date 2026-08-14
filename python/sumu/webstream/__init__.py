@@ -8,3 +8,4 @@
 # native UI entry points live alongside it (server.py, and app.py / native player.cpp intents).
 from .transcode import TranscodeEngine, TranscodeError  # noqa: F401
 from .server import StreamingServer  # noqa: F401
+from .export import ExportJob  # noqa: F401
