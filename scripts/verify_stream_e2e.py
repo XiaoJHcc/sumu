@@ -59,7 +59,8 @@ def main():
 
     from sumu.webstream import TranscodeEngine, StreamingServer  # noqa: E402
     engine = TranscodeEngine(det_model, res_model, pad_mode, cfg)
-    srv = StreamingServer(src, 0, engine, host="127.0.0.1", token="tok", cache_dir=cache)
+    srv = StreamingServer(src, 0, engine, host="127.0.0.1", token="tok", cache_dir=cache,
+                          passthrough=False)
     srv.start()
     port = srv.httpd.server_address[1]
     base = f"http://127.0.0.1:{port}"

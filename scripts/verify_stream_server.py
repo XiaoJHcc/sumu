@@ -60,7 +60,7 @@ def main():
     open(os.path.join(src, "readme.txt"), "w").close()  # non-video -> filtered
 
     srv = StreamingServer(src, 0, FakeEngine(), host="127.0.0.1", token="testtoken",
-                          cache_dir=cache)
+                          cache_dir=cache, passthrough=False)
     srv.start()
     port = srv.httpd.server_address[1]
     base = f"http://127.0.0.1:{port}"
@@ -81,11 +81,17 @@ def main():
     check("subfolder", code == 200 and "b.mp4" in body, f"code={code}")
 
     code, body = fetch(base, "/play/a.mp4?token=testtoken")
-    check("player page", code == 200 and "<video" in body, f"code={code}")
+    check("player page", code == 200 and "<video" in body and "hls.min.js" in body,
+          f"code={code}")
+
+    code, body = fetch(base, "/static/hls.min.js?token=testtoken")
+    check("hls.js served", code == 200 and "!function" in body and "Hls" in body,
+          f"code={code}")
 
     code, body = fetch(base, "/stream/a.mp4/index.m3u8?token=testtoken")
     check("playlist", code == 200 and "index0.ts" in body, f"code={code}")
     check("token injected", "index0.ts?token=testtoken" in body)
+    check("EXT-X-START injected", "#EXT-X-START:TIME-OFFSET=0" in body)
 
     code, body = fetch(base, "/stream/a.mp4/index0.ts?token=testtoken")
     check("segment", code == 200 and body == "fake-seg0", f"code={code}")

@@ -121,6 +121,11 @@ class Settings:
     stream_root: str = ""
     stream_token: str = ""
     stream_no_token: bool = False
+    # Web streaming mode: True = 原片直出 (pure ffmpeg -ss + NVENC passthrough, no AI; correct
+    # color + seekable VOD + stop-on-idle), False = AI 去码 (headless decode -> BasicVSR -> NVENC,
+    # the slower live-transcode path). Passthrough is the default for the web acceptance work;
+    # flip this (or the native UI toggle, when added) to switch back to the AI path.
+    stream_passthrough: bool = True
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
@@ -317,6 +322,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             stream_root=data.get("stream_root", "") if isinstance(data.get("stream_root"), str) else "",
             stream_token=data.get("stream_token", "") if isinstance(data.get("stream_token"), str) else "",
             stream_no_token=_coerce_bool(data.get("stream_no_token"), False),
+            stream_passthrough=_coerce_bool(data.get("stream_passthrough"), True),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -347,6 +353,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "stream_root": settings.stream_root,
             "stream_token": settings.stream_token,
             "stream_no_token": bool(settings.stream_no_token),
+            "stream_passthrough": bool(settings.stream_passthrough),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

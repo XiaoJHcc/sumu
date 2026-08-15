@@ -735,7 +735,10 @@ def main():
                 root = (intents["stream_root"] or "").strip()
                 no_token = bool(intents.get("stream_no_token", False))
                 token = (intents.get("stream_token") or "").strip()
-                if transcode_engine is None:
+                # Passthrough (原片直出, the default) never touches the AI engine, so the
+                # server can start immediately -- no model-warmup gate. Only the AI transcode
+                # mode needs the shared TranscodeEngine (built lazily once warmup finishes).
+                if not settings.stream_passthrough and transcode_engine is None:
                     status_text = i18n_mod.t("warmup_status")
                 elif not root or not os.path.isdir(root):
                     status_text = i18n_mod.t("stream_start_failed",
@@ -743,8 +746,10 @@ def main():
                 else:
                     try:
                         from sumu.webstream import StreamingServer
-                        stream_server = StreamingServer(root, port, transcode_engine,
-                                                        token=token, no_token=no_token)
+                        engine = None if settings.stream_passthrough else transcode_engine
+                        stream_server = StreamingServer(root, port, engine,
+                                                        token=token, no_token=no_token,
+                                                        passthrough=settings.stream_passthrough)
                         stream_server.start()
                         settings.stream_port = port
                         settings.stream_root = root

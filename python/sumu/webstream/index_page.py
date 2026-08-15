@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import html as _html
+import json as _json
 from urllib.parse import quote as _quote
 
 
@@ -104,17 +105,141 @@ def render_index(title: str, crumbs: list[tuple[str, str]], items: list[dict], t
 
 
 def render_player(title: str, stream_rel: str, token: str) -> str:
-    src = "/stream/%s/index.m3u8%s" % (_quote(stream_rel), ("?token=" + _quote(token)) if token else "")
+    """Player page: hls.js (bundled) on desktop Chrome/Firefox/Edge, native HLS on Safari, over a
+    custom seekbar that shows the FULL duration immediately (from /meta) and jumps by server
+    reposition (`?start=<seconds>`), so seek works right away -- not only once the whole file has
+    finished transcoding. Absolute time = basePos (server start/seek position) + video.currentTime
+    (a 0-based offset thanks to EXT-X-START:TIME-OFFSET=0 injected by the server)."""
+    qs = ("?token=" + _quote(token)) if token else ""
+    hls_src = "/static/hls.min.js" + qs
     back = ("/?token=" + _quote(token)) if token else "/"
+    rel_js = _json.dumps(stream_rel)
+    token_js = _json.dumps(token)
     return (
         '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/>'
         '<meta name="viewport" content="width=device-width, initial-scale=1"/>'
-        '<title>%s · sumu</title>%s</head><body class="player">'
+        '<title>%s · sumu</title>%s%s</head><body class="player">'
         '<main><header><h1>%s</h1><a class="back" href="%s">← 返回目录</a></header>'
-        '<video controls autoplay playsinline src="%s"></video>'
-        '<p class="hint">iOS Safari 原生播放 HLS；桌面浏览器需支持 HLS（Safari）或安装 hls.js。</p>'
-        '</main></body></html>'
-    ) % (_esc(title), _CSS, _esc(title), back, src)
+        '<div class="stage"><video id="v" playsinline preload="auto"></video>'
+        '<button id="bigplay" class="bigplay" title="播放" aria-label="播放">▶</button></div>'
+        '<div class="ctl">'
+        '<button id="playbtn" class="pbtn">▶ 播放</button>'
+        '<span id="tcur" class="t">0:00</span>'
+        '<input id="seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="进度条"/>'
+        '<span id="tdur" class="t">0:00</span>'
+        '<button id="fsbtn" class="pbtn" title="全屏" aria-label="全屏">⛶</button>'
+        '</div>'
+        '<div class="ctl subrow"><span id="st" class="st">就绪</span></div>'
+        '<p class="hint">桌面浏览器由内置 hls.js 播放（iOS Safari 原生 HLS）；拖动进度条即跳转，'
+        '暂停/关闭页面即停止转码。</p>'
+        '</main>'
+        '<script src="%s"></script>'
+        '<script>%s</script>'
+        '</body></html>'
+    ) % (_esc(title), _CSS, _PLAYER_CSS, _esc(title), back, hls_src, _player_js(rel_js, token_js))
+
+
+def _player_js(rel_js: str, token_js: str) -> str:
+    """Vanilla-JS player controller (rel/token are already JSON-encoded string literals).
+
+    Seek is a *server reposition carried on the m3u8 URL* (?start=<seconds>): dragging the bar
+    beyond the current stream's buffered/seekable range reloads the stream at the new absolute
+    position synchronously inside the user gesture (video.load()+play()), which keeps iOS Safari
+    autoplay working. Within the already-available range we seek locally (instant). Pause/end/close
+    stop the transcode via /stop.
+    """
+    return (
+        "var REL=%s,TOKEN=%s;" % (rel_js, token_js)
+        + "var QS=TOKEN?('?token='+encodeURIComponent(TOKEN)):'';"
+        + "var video=document.getElementById('v');"
+        + "var seek=document.getElementById('seek');"
+        + "var tcur=document.getElementById('tcur');"
+        + "var tdur=document.getElementById('tdur');"
+        + "var st=document.getElementById('st');"
+        + "var playbtn=document.getElementById('playbtn');"
+        + "var bigplay=document.getElementById('bigplay');"
+        + "var fsbtn=document.getElementById('fsbtn');"
+        + "var duration=0,basePos=0,hls=null,scrubbing=false,reloading=false,ended=false,isLive=true;"
+        + "function fmt(s){s=Math.max(0,Math.floor(s||0));"
+        + "var h=Math.floor(s/3600),m=Math.floor(s/60)-h*60,ss=s-h*3600-m*60;"
+        + "function p(n){return (n<10?'0':'')+n;}"
+        + "return h>0?(h+':'+p(m)+':'+p(ss)):(m+':'+p(ss));}"
+        + "function clamp(t){t=parseFloat(t);if(!isFinite(t))t=0;t=Math.max(0,t);"
+        + "if(duration>0)t=Math.min(duration,t);return t;}"
+        + "function m3u8Url(pos){var u='/stream/'+REL+'/index.m3u8',s='?';"
+        + "if(TOKEN){u+=s+'token='+encodeURIComponent(TOKEN);s='&';}"
+        + "u+=s+'start='+pos+'&_='+Date.now();return u;}"
+        + "function destroyHls(){if(hls){try{hls.destroy();}catch(e){}hls=null;}}"
+        + "function showBig(){bigplay.style.display='block';}"
+        + "function hideBig(){bigplay.style.display='none';}"
+        + "function setUi(s){"
+        + "if(s==='playing'){playbtn.textContent='❚❚ 暂停';hideBig();st.textContent='播放中';}"
+        + "else if(s==='paused'){playbtn.textContent='▶ 播放';showBig();st.textContent='已暂停';}"
+        + "else if(s==='buffering'){playbtn.textContent='❚❚ 暂停';st.textContent='缓冲中…';}"
+        + "else if(s==='ended'){playbtn.textContent='↻ 重播';showBig();st.textContent='已结束';}"
+        + "else{playbtn.textContent='▶ 播放';showBig();st.textContent='播放失败';}}"
+        + "function playFrom(pos){"
+        + "pos=clamp(pos);basePos=pos;ended=false;reloading=true;isLive=true;destroyHls();"
+        + "video.removeAttribute('src');"
+        + "var url=m3u8Url(basePos);"
+        + "if(window.Hls&&Hls.isSupported()){"
+        + "hls=new Hls({enableWorker:true});"
+        + "hls.loadSource(url);hls.attachMedia(video);"
+        + "hls.on(Hls.Events.LEVEL_LOADED,function(e,d){"
+        + "if(d&&d.details){isLive=!!d.details.live;}});"
+        + "hls.on(Hls.Events.MANIFEST_PARSED,function(){reloading=false;"
+        + "var p=video.play();if(p&&p.then){p.then(function(){setUi('playing');},"
+        + "function(){setUi('paused');});}else{setUi('playing');}});"
+        + "hls.on(Hls.Events.ERROR,function(e,d){"
+        + "if(d&&d.fatal){reloading=false;setUi('error');}});"
+        + "setUi('buffering');}"
+        + "else if(video.canPlayType('application/vnd.apple.mpegurl')){"
+        + "video.src=url;video.load();reloading=false;"
+        + "var p=video.play();if(p&&p.then){p.then(function(){setUi('playing');},"
+        + "function(){setUi('paused');});}else{setUi('playing');}"
+        + "setUi('buffering');}"
+        + "else{reloading=false;setUi('error');"
+        + "st.textContent='此浏览器不支持 HLS，请用 Chrome/Edge/Firefox 或 Safari';}}"
+        + "function syncTime(){if(scrubbing||reloading)return;"
+        + "var a=basePos+video.currentTime;if(!isFinite(a))return;"
+        + "seek.value=a;tcur.textContent=fmt(a);}"
+        + "function seekTo(t){t=clamp(t);var off=t-basePos;"
+        + "if(!isLive&&video.seekable&&video.seekable.length){"
+        + "for(var i=0;i<video.seekable.length;i++){"
+        + "if(off>=video.seekable.start(i)-0.5&&off<=video.seekable.end(i)+0.5){"
+        + "video.currentTime=off;syncTime();return;}}}"
+        + "playFrom(t);}"
+        + "bigplay.addEventListener('click',function(){"
+        + "playFrom(ended?0:(basePos+video.currentTime));});"
+        + "playbtn.addEventListener('click',function(){"
+        + "if(video.paused||ended){playFrom(ended?0:(basePos+video.currentTime));}"
+        + "else{video.pause();}});"
+        + "fsbtn.addEventListener('click',function(){"
+        + "var el=video.parentNode;"
+        + "if(document.fullscreenElement||document.webkitFullscreenElement){"
+        + "(document.exitFullscreen||document.webkitExitFullscreen).call(document);}"
+        + "else if(el.requestFullscreen){el.requestFullscreen();}"
+        + "else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen();}});"
+        + "video.addEventListener('timeupdate',syncTime);"
+        + "video.addEventListener('progress',syncTime);"
+        + "video.addEventListener('playing',function(){setUi('playing');});"
+        + "video.addEventListener('waiting',function(){setUi('buffering');});"
+        + "video.addEventListener('pause',function(){if(reloading)return;setUi('paused');"
+        + "fetch('/stream/'+REL+'/stop'+QS).catch(function(){});});"
+        + "video.addEventListener('ended',function(){ended=true;setUi('ended');"
+        + "fetch('/stream/'+REL+'/stop'+QS).catch(function(){});});"
+        + "seek.addEventListener('input',function(){scrubbing=true;"
+        + "tcur.textContent=fmt(parseFloat(seek.value)||0);});"
+        + "seek.addEventListener('change',function(){scrubbing=false;"
+        + "var t=parseFloat(seek.value);if(isFinite(t))seekTo(t);});"
+        + "window.addEventListener('pagehide',function(){"
+        + "if(navigator.sendBeacon){navigator.sendBeacon('/stream/'+REL+'/stop'+QS);}});"
+        + "fetch('/stream/'+REL+'/meta'+QS).then(function(r){return r.json();})"
+        + ".then(function(m){if(m.duration&&m.duration>0){duration=m.duration;"
+        + "seek.max=duration;tdur.textContent=fmt(duration);}"
+        + "basePos=m.position||0;playFrom(basePos);})"
+        + ".catch(function(){playFrom(0);});"
+    )
 
 
 def render_message(title: str, text: str) -> str:
@@ -167,5 +292,25 @@ border:1px dashed var(--line);border-radius:14px}footer{margin-top:22px;color:va
 .back{color:var(--link);text-decoration:none;font-size:14px}.hint{color:var(--muted);font-size:13px}
 @media(max-width:560px){.grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
 main{padding:18px 12px 40px}}
+</style>
+"""
+
+_PLAYER_CSS = """
+<style>
+.stage{position:relative;background:#000;border-radius:12px;border:1px solid var(--line);overflow:hidden}
+.stage video{width:100%;max-height:70vh;display:block;background:#000;object-fit:contain}
+.stage:fullscreen video,.stage:-webkit-full-screen video{max-height:100vh;height:100vh}
+.bigplay{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:72px;height:72px;
+border-radius:50%;border:1px solid rgba(255,255,255,.35);background:rgba(0,0,0,.55);color:#fff;
+font-size:26px;cursor:pointer;line-height:1}
+.bigplay:hover{background:rgba(0,0,0,.75)}
+.ctl{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
+.ctl.subrow{margin-top:6px}
+.pbtn{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;
+padding:6px 14px;font-size:14px;cursor:pointer}
+.pbtn:hover{border-color:#334155}
+#seek{flex:1;min-width:180px;accent-color:#8ab4f8}
+.t{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
+.st{font-size:12px;color:var(--muted);min-width:64px;text-align:right}
 </style>
 """

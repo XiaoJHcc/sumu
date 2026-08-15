@@ -123,6 +123,10 @@ hiddenimports += [
 # shipping the files keeps translations editable without a rebuild.
 datas += [(os.path.join(ROOT, "python", "sumu", "locales"), "sumu/locales")]
 
+# Vendored hls.js (Apache-2.0) for the web-streaming player: desktop browsers get HLS playback
+# without a CDN. webstream.server reads it from the same dir as its module at runtime.
+datas += [(os.path.join(ROOT, "python", "sumu", "webstream", "hls.min.js"), "sumu/webstream")]
+
 # native extension + its co-located ffmpeg DLLs (loaded by sumu_core via
 # load-time import / LOAD_WITH_ALTERED_SEARCH_PATH -- must stay next to it)
 binaries += [(os.path.join(ROOT, "python", "sumu", "sumu_core.cp313-win_amd64.pyd"), ".")]

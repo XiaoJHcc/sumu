@@ -4,8 +4,37 @@
 # Web streaming + offline export pipeline: headless d3d11va decode -> BasicVSR decensor ->
 # NVENC -> HLS (streaming) / MP4 (export). See docs/webstream.md for the architecture.
 #
-# This subpackage is the transcode engine; the HTTP server / folder-browser front-end and the
-# native UI entry points live alongside it (server.py, and app.py / native player.cpp intents).
-from .transcode import TranscodeEngine, TranscodeError  # noqa: F401
-from .server import StreamingServer  # noqa: F401
-from .export import ExportJob  # noqa: F401
+# Lazy submodule surface (PEP 562 __getattr__): importing `sumu.webstream` itself, or its
+# stdlib-only submodules (server / passthrough / index_page / thumbnail), must NOT import the
+# torch/cv2-heavy transcode chain. That chain (transcode.py -> decensor.py -> torch) is pulled in
+# only when the caller actually references TranscodeEngine/TranscodeError -- i.e. the AI transcode
+# path. This is what lets the passthrough (原片直出) web server start instantly, before the app's
+# background AI model warmup finishes.
+
+__all__ = [
+    "TranscodeEngine",
+    "TranscodeError",
+    "StreamingServer",
+    "ExportJob",
+    "PassthroughSession",
+]
+
+
+def __getattr__(name: str):
+    if name in ("TranscodeEngine", "TranscodeError"):
+        from .transcode import TranscodeEngine, TranscodeError
+
+        return TranscodeEngine if name == "TranscodeEngine" else TranscodeError
+    if name == "StreamingServer":
+        from .server import StreamingServer
+
+        return StreamingServer
+    if name == "ExportJob":
+        from .export import ExportJob
+
+        return ExportJob
+    if name == "PassthroughSession":
+        from .passthrough import PassthroughSession
+
+        return PassthroughSession
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

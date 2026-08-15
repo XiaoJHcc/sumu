@@ -40,6 +40,12 @@ class TranscodeEngine:
         self.config = config
         self.video_meta = video_meta
         self._cancel = threading.Event()
+        # Serializes run(): the engine holds ONE shared AI model set and ONE GPU pipeline, so two
+        # concurrent run() calls (web-streaming vs offline-export started together) would corrupt
+        # each other's cancel state and share non-reentrant model state. This is a *conflict*
+        # guard (state safety), NOT a throttle: the second caller simply blocks until the first
+        # finishes. Mere GPU contention is deliberately left for the machine to handle.
+        self._run_lock = threading.Lock()
         self.last_stats = None
 
     def cancel(self) -> None:
@@ -53,7 +59,18 @@ class TranscodeEngine:
             progress_cb=None) -> int:
         """Transcode `source` (local path or http(s) URL) to HLS (`mode="hls"`, dir `out`) or
         MP4 (`mode="mp4"`, file `out`). Returns the number of frames emitted. Raises
-        TranscodeError on failure/cancel."""
+        TranscodeError on failure/cancel.
+
+        Non-reentrant (see _run_lock): the second concurrent caller blocks here until the first
+        run finishes, instead of corrupting shared model/cancel state."""
+        with self._run_lock:
+            return self._run_locked(source, out, mode, bitrate=bitrate,
+                                    video_meta=video_meta, audio_source=audio_source,
+                                    progress_cb=progress_cb)
+
+    def _run_locked(self, source: str, out: str, mode: str, *, bitrate: str = "8M",
+                    video_meta=None, audio_source: str | None = None,
+                    progress_cb=None) -> int:
         self._cancel.clear()
         dec = sumu_core.HeadlessDecode()
         try:
