@@ -504,35 +504,41 @@ def _make_handler(server: "StreamingServer"):
             if session is None:
                 return self._send_html(503, index_page.render_message(
                     "忙", "正在处理其它视频，请稍后刷新。"), {"Retry-After": "5"})
-            # Seek is carried on the m3u8 URL as ?start=<seconds> (so the client can set
-            # video.src and call play() synchronously, inside the user gesture). Reposition only
-            # when it actually changed -- a live HLS re-fetch re-sends the same ?start= and must
-            # NOT restart the transcode. `_` is the client's per-seek cache-buster timestamp, used
-            # as a monotonic generation so an out-of-order stale request (from a player that was
-            # destroyed+reloaded on seek) can't regress the transcode. Works for BOTH modes.
+            # Seek/resume is carried on the m3u8 URL as ?start=<seconds> + `_` (a monotonic
+            # per-load generation, Date.now() per playFrom). A *newer* `_` than the last one seen
+            # is a FRESH playFrom (resume / seek / new viewer); a re-sent `_` is a live-sync poll
+            # of the same URL. A paused client's poll re-sends the same `_` and must NOT resurrect
+            # the transcode (that was the "pause -> GPU comes right back" bug) -- only a fresh
+            # load, or a client that carries no `_` at all (direct URL / generic HLS client), may
+            # (re)start it. A *finished* session (ran to EOF, complete VOD playlist with ENDLIST)
+            # is always served as-is and never restarted. Both modes.
             q = parse_qs(urlparse(self.path).query)
+            s = None
             start = q.get("start", [None])[0]
             if start is not None:
                 try:
                     s = float(start)
                 except ValueError:
                     s = None
-                if s is not None:
+            seq = None
+            seq_raw = q.get("_", [None])[0]
+            if seq_raw is not None:
+                try:
+                    seq = float(seq_raw)
+                except ValueError:
                     seq = None
-                    seq_raw = q.get("_", [None])[0]
-                    if seq_raw is not None:
-                        try:
-                            seq = float(seq_raw)
-                        except ValueError:
-                            seq = None
-                    if abs(s - session.start_seconds) > 0.5:
-                        session.apply_seek(s, seq)
+            fresh = session.note_seq(seq)
+
+            if s is not None and abs(s - session.start_seconds) > 0.5:
+                session.apply_seek(s, seq)
+            elif (fresh or seq is None) and not session.running() and not session.finished():
+                # (Re)start only on a fresh playFrom (newer `_`), or for a client that doesn't
+                # carry our `_` cache-buster at all (direct URL / generic HLS client / the fake-
+                # engine verify). A live-sync poll re-sending the same `_` (fresh=False with a
+                # non-None seq) must NOT resurrect a paused/idle-swept session.
+                session.start(s if s is not None else session.start_seconds)
+
             session.touch()
-            # (Re)start only when there is no producer at all. A *finished* session (ran to EOF and
-            # wrote a complete VOD playlist with ENDLIST) is served as-is -- a later m3u8 refresh /
-            # second viewer would otherwise restart the transcode and regress to a live stream.
-            if not session.running() and not session.finished():
-                session.start(session.start_seconds)
             m3u8 = session.m3u8_path
             deadline = time.monotonic() + 30.0
             while not os.path.isfile(m3u8) and time.monotonic() < deadline:

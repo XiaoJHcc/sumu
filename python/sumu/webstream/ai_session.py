@@ -130,6 +130,22 @@ class AiStreamSession:
                 self._last_seq = seq
         return self.start(seconds)
 
+    def note_seq(self, seq: float | None) -> bool:
+        """Record the newest client load generation (`_` cache-buster, Date.now() per playFrom)
+        and report whether `seq` is strictly newer than the last one seen.
+
+        A newer value is a *fresh* playFrom (resume / seek / new viewer); a re-sent value is a
+        live-sync poll of the same URL. This is what lets the playlist route restart a paused /
+        idle-swept session on resume WITHOUT resurrecting it on a paused client's poll (the
+        "pause -> GPU comes back" bug)."""
+        if seq is None:
+            return False
+        with self._lock:
+            if seq > self._last_seq:
+                self._last_seq = seq
+                return True
+            return False
+
     def stop(self) -> None:
         """Cancel the current transcode and wait for the worker to exit (frees the shared GPU).
         Keeps already-written segments on disk; a later start()/seek() resumes."""
