@@ -28,7 +28,7 @@ class FakeEngine:
         self.cancelled = True
 
     def run(self, source, out, mode, *, bitrate="8M", video_meta=None, audio_source=None,
-            progress_cb=None):
+            progress_cb=None, start_seconds=0.0):
         time.sleep(0.4)  # simulate first-segment latency
         with open(os.path.join(out, "index.m3u8"), "w") as f:
             f.write("#EXTM3U\n#EXT-X-TARGETDURATION:2\n"

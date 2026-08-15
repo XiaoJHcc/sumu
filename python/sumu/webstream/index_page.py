@@ -56,6 +56,45 @@ _PLACEHOLDER = (
 )
 
 
+def _mode_button_html() -> str:
+    """The 去码/原片 mode toggle button (shared by the directory index and the player page)."""
+    return ('<button id="modebtn" class="pbtn modebtn" title="切换 AI 去码 / 原片直出" '
+            'aria-label="切换去码">…</button>')
+
+
+def _mode_js(token_js: str) -> str:
+    """JS for #modebtn: fetch /mode to show the current mode, and toggle it via
+    /mode?passthrough=0|1. A 503 (AI engine still warming up) shows a "正在预热…" hint. After a
+    successful switch it calls window.onModeSwitch (if defined) so the player page can reload the
+    stream at the current position."""
+    return (
+        "var MODE_TOK=%s;" % token_js
+        + "function modeUrl(extra){var u='/mode',s='?';"
+        + "if(MODE_TOK){u+=s+'token='+encodeURIComponent(MODE_TOK);s='&';}"
+        + "if(extra!==undefined){u+=s+extra;}"
+        + "return u;}"
+        + "function setModeLabel(p){var b=document.getElementById('modebtn');"
+        + "if(!b)return;b.textContent=p?'原片直出':'AI 去码';b.dataset.passthrough=p?'1':'0';"
+        + "b.classList.toggle('on',!p);}"
+        + "function showWarmup(){var b=document.getElementById('modebtn');"
+        + "if(!b)return;b.textContent='正在预热…';b.dataset.passthrough='1';"
+        + "setTimeout(function(){fetch(modeUrl()).then(function(r){return r.json();})"
+        + ".then(function(m){setModeLabel(m.passthrough);}).catch(function(){});},2000);}"
+        + "var _mb=document.getElementById('modebtn');"
+        + "_mb.addEventListener('click',function(){"
+        + "var p=_mb.dataset.passthrough==='1'?0:1;"
+        + "fetch(modeUrl('passthrough='+p)).then(function(r){"
+        + "if(r.status===503){showWarmup();return;}"
+        + "if(!r.ok)return;"
+        + "return r.json();})"
+        + ".then(function(m){if(!m)return;setModeLabel(m.passthrough);"
+        + "if(window.onModeSwitch){window.onModeSwitch(m.passthrough);}})"
+        + ".catch(function(){});});"
+        + "fetch(modeUrl()).then(function(r){return r.json();})"
+        + ".then(function(m){setModeLabel(m.passthrough);}).catch(function(){});"
+    )
+
+
 def render_index(title: str, crumbs: list[tuple[str, str]], items: list[dict], token: str) -> str:
     """`items`: list of {name, is_dir, rel, size} sorted dirs-first. `crumbs`: [(label, rel)]."""
     root_href = "/" + ("?token=" + _quote(token) if token else "")
@@ -94,12 +133,14 @@ def render_index(title: str, crumbs: list[tuple[str, str]], items: list[dict], t
         '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/>'
         '<meta name="viewport" content="width=device-width, initial-scale=1"/>'
         '<title>%s · sumu</title>%s</head><body>'
-        '<main><header><h1>sumu 去码流媒体</h1><div class="crumb">%s</div></header>'
+        '<main><header><div class="hrow"><h1>sumu 去码流媒体</h1>%s</div>'
+        '<div class="crumb">%s</div></header>'
         '<div class="grid">%s</div>'
         '<footer>点击视频即实时去码直播（HLS）· 仅限同一局域网 · 端口请勿暴露公网</footer>'
-        '</main></body></html>'
-    ) % (_esc(title), _CSS, crumb_html,
-         "\n".join(cards) if cards else '<div class="empty">空目录</div>')
+        '</main><script>%s</script></body></html>'
+    ) % (_esc(title), _CSS, _mode_button_html(), crumb_html,
+         "\n".join(cards) if cards else '<div class="empty">空目录</div>',
+         _mode_js(_json.dumps(token)))
 
     return body
 
@@ -128,15 +169,18 @@ def render_player(title: str, stream_rel: str, token: str) -> str:
         '<input id="seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="进度条"/>'
         '<span id="tdur" class="t">0:00</span>'
         '<button id="fsbtn" class="pbtn" title="全屏" aria-label="全屏">⛶</button>'
+        '%s'
         '</div>'
         '<div class="ctl subrow"><span id="st" class="st">就绪</span></div>'
         '<p class="hint">桌面浏览器由内置 hls.js 播放（iOS Safari 原生 HLS）；拖动进度条即跳转，'
-        '暂停/关闭页面即停止转码。</p>'
+        '暂停/关闭页面即停止转码。右上角「AI 去码 / 原片直出」可随时切换。</p>'
         '</main>'
         '<script src="%s"></script>'
         '<script>%s</script>'
+        '<script>%s</script>'
         '</body></html>'
-    ) % (_esc(title), _CSS, _PLAYER_CSS, _esc(title), back, hls_src, _player_js(rel_js, token_js))
+    ) % (_esc(title), _CSS, _PLAYER_CSS, _esc(title), back, _mode_button_html(), hls_src,
+         _player_js(rel_js, token_js), _mode_js(token_js))
 
 
 def _player_js(rel_js: str, token_js: str) -> str:
@@ -239,6 +283,8 @@ def _player_js(rel_js: str, token_js: str) -> str:
         + "seek.max=duration;tdur.textContent=fmt(duration);}"
         + "basePos=m.position||0;playFrom(basePos);})"
         + ".catch(function(){playFrom(0);});"
+        + "window.onModeSwitch=function(){"
+        + "playFrom(ended?0:(basePos+video.currentTime));};"
     )
 
 
@@ -275,6 +321,9 @@ main{max-width:1280px;margin:0 auto;padding:28px 18px 56px}header{margin-bottom:
 h1{font-size:22px;font-weight:650;margin:0 0 8px;letter-spacing:-.02em}
 .crumb{color:var(--muted);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .crumb a{color:var(--link);text-decoration:none}.crumb a:hover{text-decoration:underline}
+.hrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hrow h1{margin:0}.hrow .modebtn{margin-left:auto}
+.modebtn.on{background:rgba(59,130,246,.18);border-color:#8ab4f8;color:#dbe7ff}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:14px}
 .card{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--line);
 border-radius:14px;overflow:hidden;text-decoration:none;color:inherit;transition:transform .15s ease}

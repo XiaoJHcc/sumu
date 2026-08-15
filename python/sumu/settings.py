@@ -123,9 +123,9 @@ class Settings:
     stream_no_token: bool = False
     # Web streaming mode: True = 原片直出 (pure ffmpeg -ss + NVENC passthrough, no AI; correct
     # color + seekable VOD + stop-on-idle), False = AI 去码 (headless decode -> BasicVSR -> NVENC,
-    # the slower live-transcode path). Passthrough is the default for the web acceptance work;
-    # flip this (or the native UI toggle, when added) to switch back to the AI path.
-    stream_passthrough: bool = True
+    # colour-correct + seekable + stop-on-idle). AI 去码 is the default; flip this back to True
+    # (or the native UI toggle) to use the passthrough fallback.
+    stream_passthrough: bool = False
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
@@ -322,7 +322,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             stream_root=data.get("stream_root", "") if isinstance(data.get("stream_root"), str) else "",
             stream_token=data.get("stream_token", "") if isinstance(data.get("stream_token"), str) else "",
             stream_no_token=_coerce_bool(data.get("stream_no_token"), False),
-            stream_passthrough=_coerce_bool(data.get("stream_passthrough"), True),
+            stream_passthrough=_coerce_bool(data.get("stream_passthrough"), False),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()

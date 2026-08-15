@@ -2,14 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0
 #
 # Web streaming server: a stdlib-only ThreadingHTTPServer that serves (a) a directory-browser
-# front-end over a source folder, and (b) per-video HLS live-transcode streams produced by
-# TranscodeEngine (headless decode -> decensor -> NVENC). Token auth guards every route except
-# OPTIONS. Designed to run on a dedicated daemon thread inside the sumu app; callers drive it
-# via start()/stop()/status().
+# front-end over a source folder, and (b) per-video HLS live-transcode streams in two modes:
+#   - 原片直出 (passthrough): pure ffmpeg -ss + NVENC (PassthroughSession, one ffmpeg per video).
+#   - AI 去码: TranscodeEngine (headless decode -> decensor -> NVENC) via AiStreamSession.
+# Both session types share one interface, so the routes are mode-agnostic (start/seek/stop/
+# idle-sweep/status all work for both). Token auth guards every route except OPTIONS. Designed to
+# run on a dedicated daemon thread inside the sumu app; callers drive it via start()/stop()/
+# status().
 #
-# Concurrency model (v1): one transcode session at a time (the AI models are shared and
-# BasicVSR is GPU-bound). A finished video's HLS output is cached on disk and re-served without
-# re-transcoding; a request for a *different* video while one is transcoding returns 503.
+# Concurrency model: passthrough runs one independent ffmpeg per video (no gate); the AI path is
+# one transcode at a time (shared models, BasicVSR is GPU-bound). A finished video's HLS output is
+# cached on disk and re-served without re-transcoding; a request for a *different* video while the
+# AI path is busy returns 503.
 from __future__ import annotations
 
 import json
@@ -22,7 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs
 
 from . import index_page, thumbnail
-from .passthrough import IDLE_TIMEOUT, PassthroughSession
+from .ai_session import AiStreamSession
+from .passthrough import IDLE_TIMEOUT, PassthroughSession, _probe
 
 # Vendored hls.js (Apache-2.0) served to desktop browsers that lack native HLS. Loaded once at
 # server construction so a frozen bundle can read it from the same dir as this module.
@@ -38,50 +43,13 @@ def _load_hls_js() -> bytes:
                 b"window.Hls=undefined;")
 
 
-class _Session:
-    def __init__(self, rel: str, video_path: str, out_dir: str, engine, bitrate: str):
-        self.rel = rel
-        self.video_path = video_path
-        self.out_dir = out_dir
-        self.engine = engine
-        self.bitrate = bitrate
-        self.error = None
-        self.done = False
-        self.frames = 0
-        self.total = 0
-        self.thread = None
-
-    def start(self):
-        self.thread = threading.Thread(target=self._run, name="sumu-stream-session", daemon=True)
-        self.thread.start()
-
-    def _run(self):
-        try:
-            self.engine.run(
-                self.video_path, self.out_dir, "hls", bitrate=self.bitrate,
-                progress_cb=lambda f, total: self._progress(f, total),
-            )
-        except Exception as e:  # noqa: BLE001
-            self.error = str(e)
-        finally:
-            self.done = True
-
-    def _progress(self, fnum, total):
-        self.frames = fnum + 1
-        self.total = total or 0
-
-    def status(self) -> dict:
-        return {
-            "rel": self.rel,
-            "video_path": self.video_path,
-            "done": self.done,
-            "error": self.error,
-            "frames": self.frames,
-            "total": self.total,
-        }
-
-
 class StreamManager:
+    """Owns the per-video stream sessions. Passthrough and AI sessions share one interface
+    (start/seek/apply_seek/stop/touch/idle_seconds/running/finished/status/out_dir/m3u8_path), so
+    the server routes are mode-agnostic. The one semantic difference lives in get_or_start: the AI
+    path enforces a busy gate (one transcode at a time -- shared models, BasicVSR is GPU-bound),
+    while passthrough runs one independent ffmpeg per video."""
+
     def __init__(self, engine, root: str, cache_dir: str, bitrate: str = "8M",
                  passthrough: bool = True, hwaccel: str | None = None):
         self.engine = engine
@@ -90,96 +58,107 @@ class StreamManager:
         self.bitrate = bitrate
         self.passthrough = passthrough
         self.hwaccel = hwaccel
-        self.sessions: dict[str, "_Session | PassthroughSession"] = {}
+        self.sessions: dict[str, "PassthroughSession | AiStreamSession"] = {}
         self._lock = threading.Lock()
+
+    def _make_session(self, rel: str, video_path: str):
+        base = os.path.join(self.cache_dir, _safe_key(rel))
+        if self.passthrough:
+            # 原片直出: one independent ffmpeg process per video (NVENC is cheap, no shared AI
+            # models), started lazily on the first m3u8/segment fetch -- no busy gate.
+            return PassthroughSession(rel, video_path, base, bitrate=self.bitrate,
+                                      hwaccel=self.hwaccel)
+        # AI 去码: one repositionable transcode backed by the shared engine.
+        return AiStreamSession(rel, video_path, base, self.engine, bitrate=self.bitrate)
 
     def get_or_start(self, rel: str, video_path: str):
         with self._lock:
             s = self.sessions.get(rel)
             if s is not None:
                 return s
-            if self.passthrough:
-                # 原片直出: one independent ffmpeg process per video (NVENC is cheap, no shared
-                # AI models), started lazily on the first m3u8/segment fetch -- no busy gate.
-                base = os.path.join(self.cache_dir, _safe_key(rel))
-                s = PassthroughSession(rel, video_path, base, bitrate=self.bitrate,
-                                       hwaccel=self.hwaccel)
-                self.sessions[rel] = s
-                return s
-            # AI path: one transcode at a time (shared models, BasicVSR is GPU-bound).
-            for o in self.sessions.values():
-                if not o.done:
-                    return None  # busy: one transcode at a time
-            out_dir = os.path.join(self.cache_dir, _safe_key(rel))
-            os.makedirs(out_dir, exist_ok=True)
-            s = _Session(rel, video_path, out_dir, self.engine, self.bitrate)
+            if not self.passthrough:
+                # AI: one transcode at a time (shared models, BasicVSR is GPU-bound).
+                for o in self.sessions.values():
+                    if o.running():
+                        return None  # busy
+            s = self._make_session(rel, video_path)
             self.sessions[rel] = s
-            s.start()
             return s
 
-    # ---- passthrough-only operations (no-ops / None in AI mode) -------------------------
+    # ---- unified session operations (both modes) ---------------------------------------
 
     def seek(self, rel: str, video_path: str, seconds: float):
-        if not self.passthrough:
-            return None
         s = self.get_or_start(rel, video_path)
-        if not isinstance(s, PassthroughSession):
+        if s is None:
             return None
         s.seek(seconds)
         return s
 
     def stop(self, rel: str):
         s = self.sessions.get(rel)
-        if isinstance(s, PassthroughSession):
+        if s is not None:
             s.stop()
 
     def meta(self, rel: str, video_path: str):
-        if not self.passthrough:
-            return None
-        s = self.get_or_start(rel, video_path)
-        if not isinstance(s, PassthroughSession):
-            return None
-        s.probe_meta()
-        return {"duration": s.duration, "position": s.start_seconds, "fps": s.fps,
-                "running": s.running()}
+        s = self.sessions.get(rel)
+        if s is not None:
+            s.probe_meta()
+            return {"duration": s.duration, "position": s.start_seconds, "fps": s.fps,
+                    "running": s.running()}
+        # No session yet: probe directly (ffprobe is independent of the busy GPU gate).
+        duration, fps = _probe(video_path)
+        return {"duration": duration, "position": 0.0, "fps": fps, "running": False}
 
     def touch(self, rel: str):
         s = self.sessions.get(rel)
-        if isinstance(s, PassthroughSession):
+        if s is not None:
             s.touch()
 
     def sweep_idle(self):
-        """Stop any passthrough session whose ffmpeg has run IDLE_TIMEOUT without a client
-        fetch -- the safety net beyond the client's explicit pause/close signals."""
-        if not self.passthrough:
-            return
+        """Stop any session that has run IDLE_TIMEOUT without a client fetch -- the safety net
+        beyond the client's explicit pause/close signals (works for both passthrough and AI)."""
         for s in list(self.sessions.values()):
-            if isinstance(s, PassthroughSession) and s.running() and s.idle_seconds() > IDLE_TIMEOUT:
+            if s.running() and s.idle_seconds() > IDLE_TIMEOUT:
                 s.stop()
 
     def cancel_all(self):
-        # Passthrough never runs the engine, so cancelling it here would clobber a CONCURRENT
-        # offline-export's cancel state (the shared _cancel event). Only the AI mode owns engine
-        # sessions to cancel.
-        if not self.passthrough and self.engine is not None:
-            self.engine.cancel()
+        # Both session types own their stop(): passthrough kills its ffmpeg, AI cancels the
+        # shared engine and joins its worker. Stopping is what frees the GPU/process.
         for s in list(self.sessions.values()):
-            if isinstance(s, PassthroughSession):
+            if s.running():
                 s.stop()
-            elif not s.done:
-                s.done = True
+
+    def set_passthrough(self, passthrough: bool) -> None:
+        """Switch 直出/AI 去码 mode at runtime: stop every running session (they are the wrong
+        mode now) and drop them, so the browser's next m3u8/segment fetch recreates a session in
+        the new mode. The server keeps its port/token; the live-HLS client re-fetches and picks
+        up the switch (repositioning to the ?start= position it already carries)."""
+        with self._lock:
+            sessions = list(self.sessions.values())
+        # Stop OUTSIDE the lock: a session's stop() can join its worker for up to ~5s (AI).
+        for s in sessions:
+            if s.running():
+                s.stop()
+        with self._lock:
+            self.sessions.clear()
+            self.passthrough = passthrough
+
+    def set_engine(self, engine) -> None:
+        """Fill in the shared AI engine reference after construction (used when the server started
+        in passthrough mode with engine=None, then warmup finishes and a web-UI switch to AI needs
+        the engine)."""
+        self.engine = engine
 
     def status(self) -> list[dict]:
         with self._lock:
-            return [s.status() for s in self.sessions.values()
-                    if isinstance(s, PassthroughSession) or not s.done]
+            return [s.status() for s in self.sessions.values()]
 
 
 class StreamingServer:
     def __init__(self, root: str, port: int, engine, host: str = "0.0.0.0",
                  token: str = "", no_token: bool = False, bitrate: str = "8M",
                  cache_dir: str | None = None, passthrough: bool = True,
-                 hwaccel: str | None = None):
+                 hwaccel: str | None = None, on_mode_change=None):
         self.root = os.path.abspath(root)
         self.port = int(port)
         self.host = host
@@ -188,6 +167,8 @@ class StreamingServer:
         self.token = "" if no_token else (token or secrets.token_urlsafe(18))
         self.bitrate = bitrate
         self.passthrough = passthrough
+        self.engine = engine  # shared AI engine; may be None (passthrough start) then filled later
+        self.on_mode_change = on_mode_change  # called(passthrough) after a web-UI mode switch
         self.cache_dir = cache_dir or os.path.join(os.path.dirname(self.root) or self.root,
                                                    ".sumu_stream_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -208,11 +189,13 @@ class StreamingServer:
         self._thread = threading.Thread(target=self.httpd.serve_forever,
                                         name="sumu-stream-http", daemon=True)
         self._thread.start()
-        if self.passthrough:
-            self._sweep_stop.clear()
-            self._sweep_thread = threading.Thread(target=self._sweep_loop,
-                                                  name="sumu-stream-sweep", daemon=True)
-            self._sweep_thread.start()
+        # Idle sweep runs for BOTH modes: passthrough stops its ffmpeg, AI cancels its shared
+        # engine -- a dead client (crashed / closed without a signal) must never leave the GPU
+        # burning indefinitely.
+        self._sweep_stop.clear()
+        self._sweep_thread = threading.Thread(target=self._sweep_loop,
+                                              name="sumu-stream-sweep", daemon=True)
+        self._sweep_thread.start()
 
     def _sweep_loop(self):
         while not self._sweep_stop.wait(5.0):
@@ -236,6 +219,21 @@ class StreamingServer:
 
     def status(self) -> list[dict]:
         return self.manager.status()
+
+    def set_passthrough(self, passthrough: bool) -> None:
+        """Runtime 直出/AI 去码 mode switch (keeps port/token; stops + drops live sessions)."""
+        self.passthrough = passthrough
+        self.manager.set_passthrough(passthrough)
+        if self.on_mode_change is not None:
+            try:
+                self.on_mode_change(passthrough)
+            except Exception:  # noqa: BLE001 -- a broken persistence hook must not break the switch
+                pass
+
+    def set_engine(self, engine) -> None:
+        """Update the shared AI engine reference (e.g. warmup finishing after a passthrough start)."""
+        self.engine = engine
+        self.manager.engine = engine
 
     # ---- routing helpers ----------------------------------------------------------
 
@@ -383,6 +381,8 @@ def _make_handler(server: "StreamingServer"):
                     return self._thumb(rel, head_only)
                 if path == "/static/hls.min.js":
                     return self._hls_js(head_only)
+                if path == "/mode":
+                    return self._mode_route()
                 return self._send_html(404, index_page.render_message("404", "Not Found"))
             except ValueError:
                 return self._send_plain(403, "Forbidden")
@@ -408,6 +408,29 @@ def _make_handler(server: "StreamingServer"):
         def _hls_js(self, head_only: bool):
             self._send(200, server._hls_js, "application/javascript; charset=utf-8",
                        {"Cache-Control": "public, max-age=86400"})
+
+        def _mode_route(self):
+            """GET /mode -> current {passthrough}. GET /mode?passthrough=0|1 -> switch mode
+            (immediately: stops + drops live sessions; the client re-fetches the m3u8 and picks up
+            the new mode). Switching to AI (passthrough=0) while the engine isn't warm yet returns
+            503 so the UI can surface "warming up"."""
+            q = parse_qs(urlparse(self.path).query)
+            if "passthrough" in q:
+                raw = q["passthrough"][0].strip().lower()
+                if raw in ("1", "true", "on", "yes"):
+                    new_passthrough = True
+                elif raw in ("0", "false", "off", "no"):
+                    new_passthrough = False
+                else:
+                    return self._send_plain(400, "Bad passthrough value")
+                if not new_passthrough and server.engine is None:
+                    return self._send(503, json.dumps(
+                        {"passthrough": server.passthrough, "error": "warmup"}
+                    ).encode("utf-8"), "application/json", {"Cache-Control": "no-store"})
+                server.set_passthrough(new_passthrough)
+            return self._send(200, json.dumps(
+                {"passthrough": server.passthrough}
+            ).encode("utf-8"), "application/json", {"Cache-Control": "no-store"})
 
         def _finalize_playlist(self, body: bytes) -> bytes:
             """Post-process a served HLS playlist: inject ?token= into segment URIs (auth) and an
@@ -480,52 +503,33 @@ def _make_handler(server: "StreamingServer"):
             if session is None:
                 return self._send_html(503, index_page.render_message(
                     "忙", "正在处理其它视频，请稍后刷新。"), {"Retry-After": "5"})
-            if server.passthrough:
-                # Seek is carried on the m3u8 URL as ?start=<seconds> (so the client can set
-                # video.src and call play() synchronously, inside the user gesture). Reposition
-                # only when it actually changed -- a live HLS re-fetch re-sends the same ?start=
-                # and must NOT restart the transcode. `_` is the client's per-seek cache-buster
-                # timestamp, used as a monotonic generation so an out-of-order stale request (from
-                # a player that was destroyed+reloaded on seek) can't regress the transcode.
-                q = parse_qs(urlparse(self.path).query)
-                start = q.get("start", [None])[0]
-                if start is not None:
-                    try:
-                        s = float(start)
-                    except ValueError:
-                        s = None
-                    if s is not None:
-                        seq = None
-                        seq_raw = q.get("_", [None])[0]
-                        if seq_raw is not None:
-                            try:
-                                seq = float(seq_raw)
-                            except ValueError:
-                                seq = None
-                        if abs(s - session.start_seconds) > 0.5:
-                            session.apply_seek(s, seq)
-                return self._passthrough_playlist(session)
-            m3u8 = os.path.join(session.out_dir, "index.m3u8")
-            deadline = time.monotonic() + 30.0
-            while not os.path.isfile(m3u8) and time.monotonic() < deadline:
-                time.sleep(0.2)
-            if not os.path.isfile(m3u8):
-                if session.error:
-                    return self._send_html(500, index_page.render_message("错误", session.error))
-                return self._send_html(504, index_page.render_message("超时", "转码启动超时，请重试"))
-            with open(m3u8, "rb") as f:
-                body = f.read()
-            body = self._finalize_playlist(body)
-            return self._send(200, body, "application/vnd.apple.mpegurl",
-                              {"Cache-Control": "no-cache"})
-
-        def _passthrough_playlist(self, session):
-            """Serve the passthrough session's (growing) index.m3u8, starting ffmpeg on demand."""
+            # Seek is carried on the m3u8 URL as ?start=<seconds> (so the client can set
+            # video.src and call play() synchronously, inside the user gesture). Reposition only
+            # when it actually changed -- a live HLS re-fetch re-sends the same ?start= and must
+            # NOT restart the transcode. `_` is the client's per-seek cache-buster timestamp, used
+            # as a monotonic generation so an out-of-order stale request (from a player that was
+            # destroyed+reloaded on seek) can't regress the transcode. Works for BOTH modes.
+            q = parse_qs(urlparse(self.path).query)
+            start = q.get("start", [None])[0]
+            if start is not None:
+                try:
+                    s = float(start)
+                except ValueError:
+                    s = None
+                if s is not None:
+                    seq = None
+                    seq_raw = q.get("_", [None])[0]
+                    if seq_raw is not None:
+                        try:
+                            seq = float(seq_raw)
+                        except ValueError:
+                            seq = None
+                    if abs(s - session.start_seconds) > 0.5:
+                        session.apply_seek(s, seq)
             session.touch()
-            # (Re)start only when there is no producer at all. A *finished* session (ffmpeg ran to
-            # EOF and wrote a complete VOD playlist with ENDLIST) must be served as-is -- a later
-            # m3u8 refresh / second viewer would otherwise restart the whole transcode and regress
-            # to a live stream, losing the completed seekable playlist.
+            # (Re)start only when there is no producer at all. A *finished* session (ran to EOF and
+            # wrote a complete VOD playlist with ENDLIST) is served as-is -- a later m3u8 refresh /
+            # second viewer would otherwise restart the transcode and regress to a live stream.
             if not session.running() and not session.finished():
                 session.start(session.start_seconds)
             m3u8 = session.m3u8_path
@@ -536,9 +540,11 @@ def _make_handler(server: "StreamingServer"):
                 if session.finished():
                     session.refresh_error()
                     return self._send_html(500, index_page.render_message(
-                        "错误", session.error or "ffmpeg 未能产生输出"))
+                        "错误", session.error or "转码未能产生输出"))
                 time.sleep(0.2)
             if not os.path.isfile(m3u8):
+                if session.error:
+                    return self._send_html(500, index_page.render_message("错误", session.error))
                 return self._send_html(504, index_page.render_message("超时", "转码启动超时，请重试"))
             with open(m3u8, "rb") as f:
                 body = f.read()
@@ -555,7 +561,7 @@ def _make_handler(server: "StreamingServer"):
                 return self._send_plain(404, "Not Found")
             m = server.manager.meta(rel, abs_path)
             if m is None:
-                return self._send_plain(404, "Not Found")
+                return self._send_plain(503, "Busy")
             return self._send(200, json.dumps(m).encode("utf-8"), "application/json",
                               {"Cache-Control": "no-store"})
 
@@ -568,7 +574,7 @@ def _make_handler(server: "StreamingServer"):
                 return self._send_plain(404, "Not Found")
             s = server.manager.seek(rel, abs_path, seconds)
             if s is None:
-                return self._send_plain(404, "Not Found")
+                return self._send_plain(503, "Busy")
             return self._send(200, json.dumps({
                 "position": s.start_seconds, "duration": s.duration,
             }).encode("utf-8"), "application/json", {"Cache-Control": "no-store"})
@@ -589,25 +595,20 @@ def _make_handler(server: "StreamingServer"):
                 return self._send_plain(503, "Busy")
             if not re.fullmatch(r"[A-Za-z0-9._-]+", seg):
                 return self._send_plain(404, "Not Found")
-            if server.passthrough:
-                session.touch()
-                # Serve only segments already on disk; do NOT auto-(re)start ffmpeg here -- that
-                # would restart the transcode from `start_seconds` (position 0) on a late segment
-                # fetch after an idle sweep, desyncing the client. Only the m3u8 route (which
-                # carries the authoritative ?start=) starts/repositions the producer.
-                out_dir = session.out_dir
-                if not out_dir:
-                    return self._send_plain(404, "Not Found")
-                seg_path = os.path.join(out_dir, seg)
-                if not os.path.isfile(seg_path):
-                    return self._send_plain(404, "Not Found")
-                # no-store: a seek reuses bare `s<nonce>.NNNNN.ts` names in a new position dir;
-                # never let the browser serve a stale same-named segment from the previous seek.
-                return self._send_file(seg_path, "video/mp2t", head_only, cache_control="no-store")
-            seg_path = os.path.join(session.out_dir, seg)
+            session.touch()
+            # Serve only segments already on disk; do NOT auto-(re)start the producer here -- that
+            # would restart the transcode from `start_seconds` (position 0) on a late segment fetch
+            # after an idle sweep, desyncing the client. Only the m3u8 route (which carries the
+            # authoritative ?start=) starts/repositions the producer.
+            out_dir = session.out_dir
+            if not out_dir:
+                return self._send_plain(404, "Not Found")
+            seg_path = os.path.join(out_dir, seg)
             if not os.path.isfile(seg_path):
                 return self._send_plain(404, "Not Found")
-            self._send_file(seg_path, "video/mp2t", head_only)
+            # no-store: a seek reuses bare segment names in a new position dir; never let the
+            # browser serve a stale same-named segment from the previous seek.
+            return self._send_file(seg_path, "video/mp2t", head_only, cache_control="no-store")
 
         def _send_file(self, path: str, ctype: str, head_only: bool,
                        cache_control: str | None = None):

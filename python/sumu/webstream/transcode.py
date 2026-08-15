@@ -56,21 +56,24 @@ class TranscodeEngine:
 
     def run(self, source: str, out: str, mode: str, *, bitrate: str = "8M",
             video_meta=None, audio_source: str | None = None,
-            progress_cb=None) -> int:
+            progress_cb=None, start_seconds: float = 0.0) -> int:
         """Transcode `source` (local path or http(s) URL) to HLS (`mode="hls"`, dir `out`) or
         MP4 (`mode="mp4"`, file `out`). Returns the number of frames emitted. Raises
         TranscodeError on failure/cancel.
+
+        `start_seconds` re-anchors decode at that offset (I6 reposition: HeadlessDecode
+        seek_to_frame) before transcoding to EOF -- the AI streaming server uses this for seek.
 
         Non-reentrant (see _run_lock): the second concurrent caller blocks here until the first
         run finishes, instead of corrupting shared model/cancel state."""
         with self._run_lock:
             return self._run_locked(source, out, mode, bitrate=bitrate,
                                     video_meta=video_meta, audio_source=audio_source,
-                                    progress_cb=progress_cb)
+                                    progress_cb=progress_cb, start_seconds=start_seconds)
 
     def _run_locked(self, source: str, out: str, mode: str, *, bitrate: str = "8M",
                     video_meta=None, audio_source: str | None = None,
-                    progress_cb=None) -> int:
+                    progress_cb=None, start_seconds: float = 0.0) -> int:
         self._cancel.clear()
         dec = sumu_core.HeadlessDecode()
         try:
@@ -79,18 +82,29 @@ class TranscodeEngine:
             fps = float(dec.fps())
             fc = int(dec.frame_count()) if dec.frame_count() > 0 else 0
 
+            # Re-anchor decode at start_seconds (seek = reposition). The processor's own frame
+            # numbering is a fresh 0-based local counter (contiguity is all the scene/clip math
+            # needs), so we only use the landed frame to derive the remaining-frame count for
+            # progress reporting.
+            start_frame = 0
+            if start_seconds > 0.0:
+                start_frame = int(dec.seek_to_frame(int(round(start_seconds * fps))))
+
             meta = video_meta or self.video_meta or self._build_meta(source, dec)
             proc = DecensorProcessor(self.det_model, self.res_model, self.pad_mode, meta, self.config)
             enc = NvencEncoder(w, h, fps, mode, out, bitrate=bitrate,
-                               audio_source=audio_source if audio_source is not None else source)
+                               audio_source=audio_source if audio_source is not None else source,
+                               start_seconds=start_seconds,
+                               bt709=self.config.bt709, full_range=self.config.full_range)
+            remaining = max(0, fc - start_frame) if fc > 0 else 0
 
-            def _emit(proc, enc, fc):
+            def _emit(proc, enc, remaining):
                 for fnum, final_bgr in proc.emit():
                     if self._cancel.is_set():
                         return False
-                    enc.write_bgr(final_bgr.cpu().numpy())
+                    enc.write_frame(final_bgr.cpu().numpy())
                     if progress_cb is not None:
-                        progress_cb(fnum, fc)
+                        progress_cb(fnum, remaining)
                 return True
 
             ingest_n = 0
@@ -103,13 +117,13 @@ class TranscodeEngine:
                     break
                 proc.ingest(ingest_n, g["dev_ptr"], g["width"], g["height"], g["pitch_bytes"])
                 ingest_n += 1
-                if not _emit(proc, enc, fc):
+                if not _emit(proc, enc, remaining):
                     enc.abort()
                     raise TranscodeError("transcode cancelled")
 
             # EOF: drain the tail.
             proc.flush_eof()
-            _emit(proc, enc, fc)
+            _emit(proc, enc, remaining)
 
             rc, err = enc.finish()
             if rc != 0:

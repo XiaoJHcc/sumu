@@ -226,6 +226,28 @@ public:
         return d;
     }
 
+    // I6: seek = reposition, not teardown. Re-anchors sequential decode at `target_frame`
+    // (nearest keyframe + forward decode to the exact real-PTS frame, see Decoder::seek_to_frame)
+    // and returns the ACTUAL landed frame number (round(pts_seconds * fps)) so the caller can
+    // align its emit frontier to real decoded PTS. Throws on failure.
+    int64_t seek_to_frame(int64_t target_frame)
+    {
+        if (!opened_) throw std::runtime_error("HeadlessDecode.seek_to_frame: not opened");
+        // Decoder::seek_to_frame requires the PTS origin established by a first decode (its
+        // "no PTS origin yet" guard). A transcode consumer seeks right after open() without any
+        // prior next_frame(), so decode (and discard) one frame to establish that origin first.
+        if (!decoder_.have_first_pts()) {
+            DecodedFrame warmup;
+            if (!decoder_.next_frame(warmup))
+                throw std::runtime_error("HeadlessDecode.seek_to_frame: no first frame to decode");
+        }
+        DecodedFrame df;
+        std::string err;
+        if (!decoder_.seek_to_frame(target_frame, df, err))
+            throw std::runtime_error("HeadlessDecode.seek_to_frame: " + err);
+        return static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
+    }
+
     double fps() const { return fps_; }
     int64_t frame_count() const { return frame_count_; }
     int width() const { return width_; }
@@ -373,6 +395,7 @@ void init_headless_decode(py::module_& m)
         .def(py::init<>())
         .def("open", &HeadlessDecode::open, py::arg("path"))
         .def("next_frame", &HeadlessDecode::next_frame)
+        .def("seek_to_frame", &HeadlessDecode::seek_to_frame, py::arg("target_frame"))
         .def("fps", &HeadlessDecode::fps)
         .def("frame_count", &HeadlessDecode::frame_count)
         .def("width", &HeadlessDecode::width)

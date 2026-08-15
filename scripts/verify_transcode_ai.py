@@ -90,6 +90,14 @@ def main():
         capture_output=True, text=True, startupinfo=_startupinfo())
     print(f"== probe mp4 == {probe.stdout.strip()}", file=sys.stderr)
 
+    # Colour metadata: the AI path must tag output as BT.709 (colour fix, see encoder.py).
+    probe_color = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=color_space,color_primaries,color_transfer,color_range",
+         "-of", "csv=p=0", mp4_out],
+        capture_output=True, text=True, startupinfo=_startupinfo())
+    print(f"== colour == {probe_color.stdout.strip()}", file=sys.stderr)
+
     # HLS
     t1 = time.perf_counter()
     hls_dir = os.path.join(out, "hls")
@@ -98,10 +106,21 @@ def main():
     segs = [f for f in os.listdir(hls_dir) if f.endswith(".ts")]
     print(f"== hls == frames={n2} wall={dt2:.2f}s segments={len(segs)}", file=sys.stderr)
 
+    # Seek: reposition (I6) to 4s and transcode to EOF -- expect fewer frames than the full run
+    # but still >= 1 restored clip (test_video.mp4 is fully mosaic).
+    t2 = time.perf_counter()
+    seek_hls_dir = os.path.join(out, "hls_seek")
+    n_seek = eng.run(clip, seek_hls_dir, "hls", progress_cb=progress, start_seconds=4.0)
+    dt3 = time.perf_counter() - t2
+    print(f"== hls(seek 4s) == frames={n_seek} wall={dt3:.2f}s", file=sys.stderr)
+
     ok = (
         n == n2 > 0
+        and n_seek > 0
+        and n_seek < n
         and "h264" in probe.stdout
         and str(meta.video_width) in probe.stdout
+        and "bt709" in probe_color.stdout
         and st.get("clips_restored", 0) > 0
     )
     print(f"== RESULT == {'PASS' if ok else 'FAIL'}", file=sys.stderr)

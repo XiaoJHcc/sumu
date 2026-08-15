@@ -279,6 +279,40 @@ def main():
     stream_server = None
     export_job = None
 
+    def _on_mode_change(passthrough):
+        """Persist a web-UI 直出/AI 去码 switch (called from the server's HTTP thread; settings
+        attribute writes + atomic save are GIL-safe)."""
+        settings.stream_passthrough = passthrough
+        settings_mod.save(settings)
+
+    def _start_stream(port, root, no_token, token):
+        """Start the web-stream server immediately with the given params. Before model warmup the
+        AI engine isn't ready, so the server starts in 原片直出 fallback and the web-UI toggle
+        surfaces a "正在预热" hint if the user tries to switch to AI 去码. Returns
+        (ok, error_status_or_None)."""
+        nonlocal stream_server
+        try:
+            from sumu.webstream import StreamingServer
+            # AI 去码 is only usable once the engine is warm; otherwise fall back to passthrough.
+            effective_passthrough = settings.stream_passthrough or (transcode_engine is None)
+            engine = None if effective_passthrough else transcode_engine
+            server = StreamingServer(root, port, engine,
+                                     token=token, no_token=no_token,
+                                     passthrough=effective_passthrough,
+                                     on_mode_change=_on_mode_change)
+            server.start()
+            stream_server = server
+            settings.stream_port = port
+            settings.stream_root = root
+            settings.stream_no_token = no_token
+            if not no_token:
+                settings.stream_token = token  # "" = random next time
+            settings_mod.save(settings)
+            player.set_stream_running(True, stream_server.access_url())
+            return True, None
+        except Exception as e:  # noqa: BLE001 -- start failure must not kill the main loop
+            return False, i18n_mod.t("stream_start_failed", error=str(e))
+
     def apply_target_fps_for_open():
         """Map global target_fps + this file's source_fps → native fps_div (1..4)."""
         try:
@@ -720,6 +754,10 @@ def main():
                                             lead=cfg_lead)
                 from sumu.webstream import TranscodeEngine
                 transcode_engine = TranscodeEngine(det_model, res_model, pad_mode, config)
+                # A passthrough-fallback server has engine=None; hand it the now-warm engine so a
+                # web-UI switch to AI 去码 works from here on.
+                if stream_server is not None:
+                    stream_server.set_engine(transcode_engine)
 
             if intents["stream_stop"]:
                 if stream_server is not None:
@@ -735,31 +773,16 @@ def main():
                 root = (intents["stream_root"] or "").strip()
                 no_token = bool(intents.get("stream_no_token", False))
                 token = (intents.get("stream_token") or "").strip()
-                # Passthrough (原片直出, the default) never touches the AI engine, so the
-                # server can start immediately -- no model-warmup gate. Only the AI transcode
-                # mode needs the shared TranscodeEngine (built lazily once warmup finishes).
-                if not settings.stream_passthrough and transcode_engine is None:
-                    status_text = i18n_mod.t("warmup_status")
-                elif not root or not os.path.isdir(root):
+                # Always start immediately. If the user prefers AI 去码 but the engine isn't warm
+                # yet, _start_stream falls back to 原片直出; the web-UI toggle surfaces a
+                # "正在预热" hint when they try to switch to AI before then.
+                if not root or not os.path.isdir(root):
                     status_text = i18n_mod.t("stream_start_failed",
                                              error=root or i18n_mod.t("stream_root_label"))
                 else:
-                    try:
-                        from sumu.webstream import StreamingServer
-                        engine = None if settings.stream_passthrough else transcode_engine
-                        stream_server = StreamingServer(root, port, engine,
-                                                        token=token, no_token=no_token,
-                                                        passthrough=settings.stream_passthrough)
-                        stream_server.start()
-                        settings.stream_port = port
-                        settings.stream_root = root
-                        settings.stream_no_token = no_token
-                        if not no_token:
-                            settings.stream_token = token  # "" = random next time
-                        settings_mod.save(settings)
-                        player.set_stream_running(True, stream_server.access_url())
-                    except Exception as e:  # noqa: BLE001
-                        status_text = i18n_mod.t("stream_start_failed", error=str(e))
+                    ok, err = _start_stream(port, root, no_token, token)
+                    if err:
+                        status_text = err
 
             if intents["export_start"]:
                 source = (intents["export_source"] or "").strip()

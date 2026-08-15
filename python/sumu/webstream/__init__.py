@@ -17,6 +17,7 @@ __all__ = [
     "StreamingServer",
     "ExportJob",
     "PassthroughSession",
+    "AiStreamSession",
 ]
 
 
@@ -37,4 +38,8 @@ def __getattr__(name: str):
         from .passthrough import PassthroughSession
 
         return PassthroughSession
+    if name == "AiStreamSession":
+        from .ai_session import AiStreamSession
+
+        return AiStreamSession
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -4,11 +4,11 @@ sumu 除了本地实时预览，还能作为**去码转码后端**：把「处�
 实时流式传输给局域网内任意设备（iPad 浏览器等），或离线导出成单个 MP4 文件。入口在首屏
 「打开文件 / 打开 URL」之后的两个按钮——**Web 服务器** 与 **离线导出**。
 
-Web 服务器有**两种转码模式**，由 `settings.stream_passthrough` 切换（默认 `True`）：
+Web 服务器有**两种转码模式**，由 `settings.stream_passthrough` 切换（默认 `False`，即 AI 去码）：
 
-- **原片直出（passthrough，默认）**：不经过 AI，纯 ffmpeg `-ss` + NVENC 直出。用于 Web 验收，
-  解决 AI 直播 v1 的三处 blocker（色彩、seek、停转），见下节。
-- **AI 去码（passthrough=False）**：headless 解码 → BasicVSR 去码 → NVENC，即本文档原有链路。
+- **AI 去码（默认）**：headless 解码 → YOLO + BasicVSR 去码 → NVENC，即本文档原有链路，
+  现已对齐直出的三项能力（色彩、seek、停转），见「AI 去码」一节。
+- **原片直出（passthrough）**：不经过 AI，纯 ffmpeg `-ss` + NVENC 直出，作兜底/对照。
 
 ## 心智模型与边界
 
@@ -87,6 +87,35 @@ live 流的 hls.js 本地 seek 不可靠，故不采用。绝对播放位置 =
 - 启动不依赖 AI 预热：passthrough 模式 `StreamingServer(engine=None)`，`stream_start` 直接起服，
   点击「启动服务器」即生效。
 
+## AI 去码（默认）
+
+`python/sumu/webstream/ai_session.py` 的 `AiStreamSession` 是直出的 AI 对应物：同一套公开接口
+（`start/seek/apply_seek/stop/touch/idle_seconds/running/finished/status/out_dir/m3u8_path`），
+所以服务器路由对两种模式走同一条代码路径（`server.py` 不再按 `passthrough` 分叉）。三处 v1
+blocker 的对齐方式（与直出同思路，映射到转码进程上）：
+
+- **色彩**：`encoder.py` 不再喂 `bgr24`（ffmpeg 会用 BT.601 转回 YUV）。现在每帧 BGR 在喂给
+  ffmpeg 前用 `_bgr_to_yuv420()` 按**与解码侧相同的 BT.709 矩阵/range** 转回 YUV420p 再入管
+  （`-pix_fmt yuv420p`），并给输出打 `-color_primaries/trc/colorspace/range` 标签。ffmpeg/NVENC
+  不再做 RGB↔YUV 矩阵转换（yuv420p→nv12 只是色度重排），消除了 NV12→BGR(BT.709)→YUV(BT.601)
+  的往返色偏。
+- **seek**：seek = 取消当前转码、用 `HeadlessDecode.seek_to_frame`（原生 `Decoder::seek_to_frame`，
+  关键帧级、~1-2s 重定位）在新位置重启，并新建一个 `DecensorProcessor`（scene/clip 状态重置，
+  即 DESIGN.md I6「reposition，不 teardown」）。音频侧 ffmpeg 用 `-ss` 对齐到同一偏移。
+  每个 (re)start 写入独立位置目录（`p<ms>_<run_id>_<nonce>/`），分片走 `no-store`，seek 不与
+  上一位置的浏览器缓存冲突。
+- **停转**：`stop()` 取消共享引擎并 join worker；服务器空闲清扫线程对**两种模式**都生效
+  （AI 会话超时即取消引擎，释放 GPU）。
+
+### AI 模式已知边界
+
+- **单路转码**：AI 模型共享、BasicVSR 吃 GPU，同时只转一个视频；忙时请求其它视频返回 503。
+  完成后的 HLS 落盘缓存复用。
+- 启动依赖 AI 预热：`stream_start` 在模型未预热完成前会提示稍后（app.py 的 warmup 闸门）。
+- seek 到新位置后，BasicVSR 需重新冷启动（首个 clip 需 `clip_length` 帧前瞻 + 去码 + 2s 分片，
+  起播 ~3-5s，比直出的 ~1-2s 略慢）。
+- 网络 URL 源：音频由 ffmpeg 单独拉一次源（未做音轨经内存透传），seek 对网络源为 best-effort。
+
 ## 运行时依赖
 
 - **`ffmpeg.exe` 必须在 PATH 上**（编码/封装）。这是新增软依赖；`ffprobe.exe` 早已是既有软依赖
@@ -94,23 +123,21 @@ live 流的 hls.js 本地 seek 不可靠，故不采用。绝对播放位置 =
 - `sumu.webstream` 由 `packaging/sumu.spec` 的 `collect_submodules("sumu")` 一并收集，懒 import
   不影响冻结分析。
 
-## 已知限制（AI 去码路径）
+## 通用限制
 
-- **单路转码**：AI 模型共享、BasicVSR 吃 GPU，同时只转一个视频；完成后的 HLS 落盘缓存复用，
-  忙时请求其它视频返回 503。
 - 目录仅列文件夹 + 视频（卡片缩略图按需 ffmpeg 生成）。
 - **桌面 Chrome/Firefox 不原生播 HLS**：由内置 hls.js（`/static/hls.min.js`）补齐，无需 CDN；
   iOS Safari 原生 HLS。
 - 4K 去码吞吐同播放器一样是 best-effort（BasicVSR 追不上 1x 时客户端在 live edge 缓冲）。
-- 网络 URL 源：ffmpeg 会为音频单独拉一次源（v1 未做音轨经内存透传）。
+- 网络 URL 源：ffmpeg 会为音频单独拉一次源（未做音轨经内存透传）。
 - 服务器/导出与本地播放共享 GPU，并发时互相降速（torch 序列化 GPU 算子，不冲突）。
 
 ## 验证
 
 - `scripts/verify_transcode.py`：编码 spike（native 硬解→NVENC→HLS/MP4，无 AI）。
-- `scripts/verify_transcode_ai.py`：端到端（headless→去码→NVENC→MP4/HLS），实测 1080p 全马赛克
-  片段 BasicVSR 净 ~125fps、总管线 ~23fps。
-- `scripts/verify_stream_server.py`：假引擎路由/token/m3u8 注入/hls.js 静态路由（AI 路径），10 项全过。
+- `scripts/verify_transcode_ai.py`：端到端（headless→去码→NVENC→MP4/HLS，含 `start_seconds`
+  seek 与 BT.709 色彩路径），实测 1080p 全马赛克片段 BasicVSR 净 ~125fps、总管线 ~23fps。
+- `scripts/verify_stream_server.py`：假引擎路由/token/m3u8 注入/hls.js 静态路由（AI 路径）。
 - `scripts/verify_stream_passthrough.py`：原片直出端到端（假引擎 + 真 ffmpeg）——索引/hls.js +
   自定义 seekbar 播放页/`/static/hls.min.js`/meta/HLS（唯一分片名 + token 注入 +
   `EXT-X-START`）/真实 h264 分片/重定位 seek/陈旧请求 `_` 代数守卫/m3u8 URL `&` 分隔符回归守卫
