@@ -102,7 +102,9 @@ class TranscodeEngine:
                 for fnum, final_bgr in proc.emit():
                     if self._cancel.is_set():
                         return False
-                    enc.write_frame(final_bgr.cpu().numpy())
+                    # final_bgr stays CUDA-resident; write_frame does the BGR->YUV420 conversion
+                    # on the GPU and the single D2H copy + pipe write (no numpy round-trip here).
+                    enc.write_frame(final_bgr)
                     if progress_cb is not None:
                         progress_cb(fnum, remaining)
                 return True

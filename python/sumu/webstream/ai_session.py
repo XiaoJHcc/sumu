@@ -17,14 +17,15 @@
 #      HeadlessDecode.seek_to_frame (keyframe-accurate reposition, ~1-2s to re-anchor) + a fresh
 #      DecensorProcessor (scene/clip state resets, matching DESIGN.md I6).
 #   3. 停转: stop() cancels the shared engine and joins the worker; the server's idle sweeper
-#      stops a session after IDLE_TIMEOUT without a client fetch.
+#      stops a session after AI_IDLE_TIMEOUT (short: GPU burn must stop promptly on browser close)
+#      without a client fetch.
 from __future__ import annotations
 
 import os
 import threading
 import time
 
-from .passthrough import IDLE_TIMEOUT, _next_run_id, _probe
+from .passthrough import AI_IDLE_TIMEOUT, _next_run_id, _probe
 
 
 class AiStreamSession:
@@ -55,6 +56,10 @@ class AiStreamSession:
         self._last_seq = 0.0
         self._frames = 0
         self._total = 0
+        # AI transcode burns the GPU, so this session is swept after a shorter idle window than
+        # passthrough (see passthrough.AI_IDLE_TIMEOUT) -- closing the browser must free the GPU
+        # promptly even when the /stop beacon never fires (hard kill / crash).
+        self.idle_timeout = AI_IDLE_TIMEOUT
         # Terminal state for the CURRENT position, written by the worker thread / stop().
         self._done = False        # worker thread exited (position terminal)
         self._finished = False    # transcoded to EOF successfully (ENDLIST written)

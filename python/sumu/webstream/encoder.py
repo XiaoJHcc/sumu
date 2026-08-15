@@ -63,6 +63,52 @@ def _bgr_to_yuv420(arr, bt709: bool = True, full_range: bool = False) -> np.ndar
                            v.astype(np.uint8).ravel()])
 
 
+def _bgr_to_yuv420_gpu(bgr, bt709: bool = True, full_range: bool = False):
+    """GPU twin of `_bgr_to_yuv420`: convert a full-range BGR (H,W,3) uint8 CUDA tensor to the
+    SAME planar YUV420p byte layout (flat uint8 tensor of H*W*3/2 elements) using the SAME
+    matrix/range math, so the round trip stays matrix-consistent with the decode side's
+    `_nv12_to_bgr_hwc_gpu`. The ~15-25ms-per-frame numpy float conversion above becomes a handful
+    of CUDA kernels (~1ms) AND the D2H copy shrinks from 3 bytes/pixel (BGR) to 1.5 (YUV420) --
+    both matter because the encoder feed runs on the transcode thread, and every ms it spends on
+    CPU colour math is a ms the GPU sits idle between AI frames."""
+    import torch
+    r = bgr[..., 2].to(torch.float32) / 255.0
+    g = bgr[..., 1].to(torch.float32) / 255.0
+    b = bgr[..., 0].to(torch.float32) / 255.0
+    kr, kb = (0.2126, 0.0722) if bt709 else (0.299, 0.114)
+    kg = 1.0 - kr - kb
+    y = kr * r + kg * g + kb * b
+    if full_range:
+        yy = y * 255.0
+        uu = ((b - y) / (2.0 - 2.0 * kb) + 0.5) * 255.0
+        vv = ((r - y) / (2.0 - 2.0 * kr) + 0.5) * 255.0
+    else:
+        yy = 16.0 + 219.0 * y
+        uu = 128.0 + 224.0 * (b - y) / (2.0 - 2.0 * kb)
+        vv = 128.0 + 224.0 * (r - y) / (2.0 - 2.0 * kr)
+    yy = torch.clamp(yy, 0.0, 255.0).round_().to(torch.uint8)
+    uu = torch.clamp(uu, 0.0, 255.0).round_().to(torch.uint8)
+    vv = torch.clamp(vv, 0.0, 255.0).round_().to(torch.uint8)
+    h, w = yy.shape
+    # 4:2:0 box downsample of chroma (2x2 average, +2>>2 rounding) -- identical to the numpy
+    # path above so a CPU/GPU split never shifts colour between the two code paths. Cast to int64
+    # first: torch has no uint32<->uint8 promotion rule, and int64 keeps the +2>>2 sum exact.
+    uu64 = uu.to(torch.int64)
+    vv64 = vv.to(torch.int64)
+    u = ((uu64[0:h:2, 0:w:2] + uu64[1:h:2, 0:w:2]
+          + uu64[0:h:2, 1:w:2] + uu64[1:h:2, 1:w:2] + 2) >> 2).to(torch.uint8)
+    v = ((vv64[0:h:2, 0:w:2] + vv64[1:h:2, 0:w:2]
+          + vv64[0:h:2, 1:w:2] + vv64[1:h:2, 1:w:2] + 2) >> 2).to(torch.uint8)
+    return torch.cat([yy.reshape(-1), u.reshape(-1), v.reshape(-1)])
+
+
+def _is_cuda_tensor(x) -> bool:
+    try:
+        return bool(x.is_cuda)
+    except AttributeError:
+        return False
+
+
 def _startupinfo():
     if sys.platform != "win32":
         return None
@@ -150,17 +196,23 @@ class NvencEncoder:
     def cmd(self) -> list[str]:
         return list(self._cmd)
 
-    def write_frame(self, arr) -> None:
-        """Convert one full-range BGR (H,W,3) uint8 numpy frame to YUV420p (BT.709/BT.601,
-        matching the decode side's matrix) and feed it to ffmpeg. Raises EncoderError if ffmpeg
-        died."""
+    def write_frame(self, frame) -> None:
+        """Feed one frame to ffmpeg. Accepts a full-range BGR (H,W,3) uint8 numpy array (CPU) or
+        a full-range BGR (H,W,3) uint8 CUDA tensor. CUDA frames are converted to YUV420p ON THE
+        GPU (see `_bgr_to_yuv420_gpu`) so the numpy float conversion never lands on the transcode
+        thread; the single D2H copy + pipe write happen here. Raises EncoderError if ffmpeg died."""
         if self._proc.poll() is not None:
             err = self._proc.stderr.read().decode("utf-8", "replace")
             raise EncoderError(
                 f"ffmpeg exited early (rc={self._proc.returncode}) after {self._frames} frames:\n"
                 f"{err[-2000:]}")
         try:
-            self._proc.stdin.write(_bgr_to_yuv420(arr, self._bt709, self._full_range).tobytes())
+            if _is_cuda_tensor(frame):
+                yuv = _bgr_to_yuv420_gpu(frame, self._bt709, self._full_range)
+                data = yuv.cpu().numpy().tobytes()
+            else:
+                data = _bgr_to_yuv420(frame, self._bt709, self._full_range).tobytes()
+            self._proc.stdin.write(data)
         except OSError as e:
             err = ""
             try:

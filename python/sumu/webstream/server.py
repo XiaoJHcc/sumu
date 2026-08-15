@@ -115,10 +115,11 @@ class StreamManager:
             s.touch()
 
     def sweep_idle(self):
-        """Stop any session that has run IDLE_TIMEOUT without a client fetch -- the safety net
-        beyond the client's explicit pause/close signals (works for both passthrough and AI)."""
+        """Stop any session that has run its idle window without a client fetch -- the safety net
+        beyond the client's explicit pause/close signals. Works for both modes; the AI path uses a
+        much shorter window (AI_IDLE_TIMEOUT) so a closed browser frees the GPU promptly."""
         for s in list(self.sessions.values()):
-            if s.running() and s.idle_seconds() > IDLE_TIMEOUT:
+            if s.running() and s.idle_seconds() > getattr(s, "idle_timeout", IDLE_TIMEOUT):
                 s.stop()
 
     def cancel_all(self):

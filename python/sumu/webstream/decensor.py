@@ -127,12 +127,15 @@ class DecensorProcessor:
     def _restore_clip(self, clip) -> None:
         frame_start, frame_end = clip.frame_start, clip.frame_end
         n_frames = frame_end - frame_start + 1
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # No torch.cuda.synchronize() here: a sync per clip forces a full GPU drain every
+        # clip_length frames, which starves the encoder's async pipeline (GPU util collapses to
+        # single digits and the whole transcode becomes latency-bound). CUDA stream ordering
+        # already guarantees restore_clip's writes are visible to the later blend/emit kernels,
+        # so the sync is only needed for the *timing* diagnostic below -- which is therefore an
+        # approximate submission-time measure (an upper bound on restore fps), not wall-clock GPU
+        # time. The player-side scheduler keeps its own precise measurement (scheduler.py).
         t0 = time.perf_counter()
         restore_clip(self.res_model, self.config.model_name, clip)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         if dt > 0.0 and n_frames > 0:
             self.restore_frames += n_frames

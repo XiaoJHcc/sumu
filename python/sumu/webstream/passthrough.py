@@ -37,6 +37,12 @@ GOP_SECONDS = 2.0
 # swept mid-playback; only a genuinely dead client (crashed / closed without a signal) trips it.
 IDLE_TIMEOUT = 120.0
 
+# AI 去码 sessions burn the GPU (YOLO + BasicVSR), so a dead client must be swept much sooner than
+# passthrough: a live HLS client fetches a segment every ~2s, so 30s is ~15x the fetch gap and
+# still never trips during playback -- it only catches a browser that was killed without firing
+# the /stop beacon. This directly addresses the "关了浏览器 GPU 还在烧" complaint.
+AI_IDLE_TIMEOUT = 30.0
+
 
 def _startupinfo():
     if sys.platform != "win32":
@@ -137,6 +143,9 @@ class PassthroughSession:
         self._lock = threading.Lock()
         self._meta_done = False
         self._last_activity = time.monotonic()
+        # NVENC is cheap; keep the long idle window. (AI sessions override this with the shorter
+        # AI_IDLE_TIMEOUT -- see ai_session.py.) The sweeper reads this per session.
+        self.idle_timeout = IDLE_TIMEOUT
         # Monotonic "seek generation" stamped by the client's `_` cache-buster on each reposition.
         # Guards against an out-of-order stale playlist request (from a destroyed+reloaded player)
         # regressing the transcode back to an older position.

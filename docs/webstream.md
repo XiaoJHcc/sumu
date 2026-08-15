@@ -95,17 +95,19 @@ live 流的 hls.js 本地 seek 不可靠，故不采用。绝对播放位置 =
 blocker 的对齐方式（与直出同思路，映射到转码进程上）：
 
 - **色彩**：`encoder.py` 不再喂 `bgr24`（ffmpeg 会用 BT.601 转回 YUV）。现在每帧 BGR 在喂给
-  ffmpeg 前用 `_bgr_to_yuv420()` 按**与解码侧相同的 BT.709 矩阵/range** 转回 YUV420p 再入管
-  （`-pix_fmt yuv420p`），并给输出打 `-color_primaries/trc/colorspace/range` 标签。ffmpeg/NVENC
+  ffmpeg 前按**与解码侧相同的 BT.709 矩阵/range** 转回 YUV420p 再入管（`-pix_fmt yuv420p`），
+  并给输出打 `-color_primaries/trc/colorspace/range` 标签。转换在 **GPU** 上做
+  （`_bgr_to_yuv420_gpu`，与 `_bgr_to_yuv420` numpy 版逐位同矩阵、仅 ±1 取整），ffmpeg/NVENC
   不再做 RGB↔YUV 矩阵转换（yuv420p→nv12 只是色度重排），消除了 NV12→BGR(BT.709)→YUV(BT.601)
-  的往返色偏。
+  的往返色偏，也顺带把每帧 ~20-60ms 的 numpy 浮点转换压到 ~1ms 的 CUDA kernel。
 - **seek**：seek = 取消当前转码、用 `HeadlessDecode.seek_to_frame`（原生 `Decoder::seek_to_frame`，
   关键帧级、~1-2s 重定位）在新位置重启，并新建一个 `DecensorProcessor`（scene/clip 状态重置，
   即 DESIGN.md I6「reposition，不 teardown」）。音频侧 ffmpeg 用 `-ss` 对齐到同一偏移。
   每个 (re)start 写入独立位置目录（`p<ms>_<run_id>_<nonce>/`），分片走 `no-store`，seek 不与
   上一位置的浏览器缓存冲突。
-- **停转**：`stop()` 取消共享引擎并 join worker；服务器空闲清扫线程对**两种模式**都生效
-  （AI 会话超时即取消引擎，释放 GPU）。
+- **停转**：`stop()` 取消共享引擎并 join worker；服务器空闲清扫线程对**两种模式**都生效。
+  AI 会话用更短的 `AI_IDLE_TIMEOUT=30s`（直出仍 `IDLE_TIMEOUT=120s`），因为 BasicVSR 烧 GPU，
+  浏览器被硬关（`/stop` beacon 发不出）后必须在 ~30s 内释放 GPU，而不是等 2 分钟。
 
 ### AI 模式已知边界
 
@@ -136,7 +138,9 @@ blocker 的对齐方式（与直出同思路，映射到转码进程上）：
 
 - `scripts/verify_transcode.py`：编码 spike（native 硬解→NVENC→HLS/MP4，无 AI）。
 - `scripts/verify_transcode_ai.py`：端到端（headless→去码→NVENC→MP4/HLS，含 `start_seconds`
-  seek 与 BT.709 色彩路径），实测 1080p 全马赛克片段 BasicVSR 净 ~125fps、总管线 ~23fps。
+  seek 与 BT.709 色彩路径），实测 1080p 全马赛克片段 BasicVSR 净 ~125fps。编码侧 BGR→YUV 走 GPU
+  （`_bgr_to_yuv420_gpu` 单帧 ~1-2ms，vs numpy 版 ~20-60ms），总管线不再被 CPU 色彩转换卡在
+  ~23fps，恢复为 GPU 绑定（BasicVSR/YOLO）。
 - `scripts/verify_stream_server.py`：假引擎路由/token/m3u8 注入/hls.js 静态路由（AI 路径）。
 - `scripts/verify_stream_passthrough.py`：原片直出端到端（假引擎 + 真 ffmpeg）——索引/hls.js +
   自定义 seekbar 播放页/`/static/hls.min.js`/meta/HLS（唯一分片名 + token 注入 +
