@@ -238,6 +238,16 @@ class PassthroughSession:
                 return True
             return False
 
+    def reserved(self) -> bool:
+        """Passthrough has no single-transcode gate (one ffmpeg per video, NVENC is cheap), so
+        nothing is ever reserved. Present for interface parity with AiStreamSession (the server's
+        mode-agnostic routes + busy gate treat the two session types uniformly)."""
+        return False
+
+    def release_reservation(self) -> None:
+        """No-op for interface parity with AiStreamSession (passthrough never reserves)."""
+        return
+
     def stop(self) -> None:
         """Kill the ffmpeg process (pause / last-viewer-left). Keeps already-written segments on
         disk; a later start()/seek() resumes from the requested position."""

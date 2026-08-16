@@ -78,8 +78,11 @@ class StreamManager:
                 return s
             if not self.passthrough:
                 # AI: one transcode at a time (shared models, BasicVSR is GPU-bound).
+                # `reserved()` closes the TOCTOU between a fresh session's creation here and its
+                # start() in the playlist route (which happens after this lock is released): a
+                # just-created-but-not-yet-started session still counts as busy.
                 for o in self.sessions.values():
-                    if o.running():
+                    if o.running() or o.reserved():
                         return None  # busy
             s = self._make_session(rel, video_path)
             self.sessions[rel] = s
@@ -239,11 +242,20 @@ class StreamingServer:
     # ---- routing helpers ----------------------------------------------------------
 
     def _resolve(self, rel: str) -> str:
-        """Join a URL-decoded relative path onto root with traversal protection."""
+        """Join a URL-decoded relative path onto root with traversal protection.
+
+        Two layers: a lexical check (normpath collapses `..`) plus a symlink check (realpath
+        resolves links) -- os.path.isdir/isfile follow symlinks, so a link inside root pointing
+        outside it would otherwise be listable/servable.
+        """
         rel = rel.replace("\\", "/").strip("/")
         candidate = os.path.normpath(os.path.join(self.root, *rel.split("/")))
         if candidate != self.root and not candidate.startswith(self.root + os.sep):
             raise ValueError("path escapes root")
+        real_root = os.path.realpath(self.root)
+        real = os.path.realpath(candidate)
+        if real != real_root and not real.startswith(real_root + os.sep):
+            raise ValueError("path escapes root (symlink)")
         return candidate
 
     def _list_dir(self, abs_dir: str, rel_prefix: str) -> list[dict]:
@@ -308,7 +320,8 @@ def _make_handler(server: "StreamingServer"):
                 for k, v in (extra or {}).items():
                     self.send_header(k, v)
                 self.end_headers()
-                self.wfile.write(body)
+                if not getattr(self, "_head_only", False):
+                    self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client aborted mid-response (hls.js destroys + reloads the stream on seek;
                 # a browser closing the tab aborts in-flight segment/playlist fetches). Not an
@@ -362,6 +375,7 @@ def _make_handler(server: "StreamingServer"):
             return self._send_plain(404, "Not Found")
 
         def _route(self, head_only: bool):
+            self._head_only = head_only
             if not self._token_ok():
                 return self._send_plain(401, "Unauthorized: missing or invalid token (?token=)")
             path = urlparse(self.path).path
@@ -529,14 +543,21 @@ def _make_handler(server: "StreamingServer"):
                     seq = None
             fresh = session.note_seq(seq)
 
+            started = False
             if s is not None and abs(s - session.start_seconds) > 0.5:
-                session.apply_seek(s, seq)
+                started = session.apply_seek(s, seq) is not None
             elif (fresh or seq is None) and not session.running() and not session.finished():
                 # (Re)start only on a fresh playFrom (newer `_`), or for a client that doesn't
                 # carry our `_` cache-buster at all (direct URL / generic HLS client / the fake-
                 # engine verify). A live-sync poll re-sending the same `_` (fresh=False with a
                 # non-None seq) must NOT resurrect a paused/idle-swept session.
                 session.start(s if s is not None else session.start_seconds)
+                started = True
+            if not started:
+                # A fresh session can end up NOT starting (e.g. a stale poll arrived before any
+                # fresh playFrom); release its single-transcode reservation so it doesn't block
+                # other videos forever. start() releases it on the normal path.
+                session.release_reservation()
 
             session.touch()
             m3u8 = session.m3u8_path
@@ -623,16 +644,30 @@ def _make_handler(server: "StreamingServer"):
             rng = self.headers.get("Range")
             start, end, status = 0, size - 1, 200
             if rng:
-                m = re.match(r"bytes=(\d*)-(\d*)", rng.strip())
+                m = re.fullmatch(r"bytes=(\d*)-(\d*)", rng.strip())
                 if m:
                     a, b = m.group(1), m.group(2)
-                    if a == "" and b:
-                        start = max(0, size - int(b))
+                    try:
+                        if a == "" and b != "":
+                            # suffix range: the last N bytes
+                            start = max(0, size - int(b))
+                            end = size - 1
+                        else:
+                            start = int(a) if a else 0
+                            end = int(b) if b else size - 1
+                    except ValueError:
+                        m = None  # malformed -> serve the full body (200)
                     else:
-                        start = int(a) if a else 0
-                        end = int(b) if b else size - 1
-                    end = min(end, size - 1)
-                    status = 206
+                        if start >= size or start > end:
+                            # Unsatisfiable range (e.g. bytes=5-3, bytes=99999999-): return 416
+                            # instead of a negative Content-Length.
+                            self.send_response(416)
+                            self.send_header("Content-Range", f"bytes */{size}")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        end = min(end, size - 1)
+                        status = 206
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Accept-Ranges", "bytes")

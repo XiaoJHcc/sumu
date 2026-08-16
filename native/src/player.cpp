@@ -2334,11 +2334,11 @@ private:
         ImVec2 tsize = ImGui::CalcTextSize(prompt);
         const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(32.0f);
         const float open_btn_gap = ui_s(8.0f);
-        const float open_btn_vgap = ui_s(8.0f);
         const float gap = ui_s(16.0f);
-        // 2×2 entry grid: local file (primary blue) + network URL / web-stream / offline export.
-        const float open_row_w = open_btn_w * 2.0f + open_btn_gap;
-        const float open_grid_h = open_btn_h * 2.0f + open_btn_vgap;
+        // Single row of three entries: local file (primary blue) + network URL / web-stream
+        // (secondary gray). Offline export is temporarily hidden (Phase 2 entry, not yet exposed).
+        const float open_row_w = open_btn_w * 3.0f + open_btn_gap * 2.0f;
+        const float open_grid_h = open_btn_h;
 
         // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
         // it first so the whole prompt+button+compile block stays vertically centered.
@@ -2374,19 +2374,14 @@ private:
 
         const float open_row_x = (io.DisplaySize.x - open_row_w) * 0.5f;
         const float open_row_y = y + tsize.y + gap;
-        // Row 1: primary "open file" keeps the default blue; "open URL" is secondary gray.
+        // Primary "open file" keeps the default blue; "open URL" + web-stream are secondary gray.
         ImGui::SetCursorPos(ImVec2(open_row_x, open_row_y));
         if (ImGui::Button(ui_str_.open_file.c_str(), ImVec2(open_btn_w, open_btn_h))) record_open_dialog();
         ImGui::SameLine(0.0f, open_btn_gap);
         push_secondary_button_style();
         if (ImGui::Button(ui_str_.open_url.c_str(), ImVec2(open_btn_w, open_btn_h))) request_open_url_popup();
-        pop_secondary_button_style();
-        // Row 2: web-stream server + offline export (both secondary gray).
-        ImGui::SetCursorPos(ImVec2(open_row_x, open_row_y + open_btn_h + open_btn_vgap));
-        push_secondary_button_style();
-        if (ImGui::Button(ui_str_.stream_server.c_str(), ImVec2(open_btn_w, open_btn_h))) request_stream_popup();
         ImGui::SameLine(0.0f, open_btn_gap);
-        if (ImGui::Button(ui_str_.export_video.c_str(), ImVec2(open_btn_w, open_btn_h))) request_export_popup();
+        if (ImGui::Button(ui_str_.stream_server.c_str(), ImVec2(open_btn_w, open_btn_h))) request_stream_popup();
         pop_secondary_button_style();
 
         if (show_compile) {
@@ -3244,19 +3239,6 @@ private:
             r.dl->AddCircle(ImVec2(cx, cy), rr, icon_col, 24, icon_th);
             r.dl->AddLine(ImVec2(cx - rr, cy), ImVec2(cx + rr, cy), icon_col, icon_th);
             r.dl->AddLine(ImVec2(cx, cy - rr), ImVec2(cx, cy + rr), icon_col, icon_th);
-        }
-        ImGui::SameLine();
-        { // Offline export: download-tray arrow glyph, hollow-line weight.
-            IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) request_export_popup();
-            if (ImGui::IsItemHovered() && !ui_str_.export_video.empty())
-                ImGui::SetTooltip("%s", ui_str_.export_video.c_str());
-            float cx = (r.min.x + r.max.x) * 0.5f;
-            float cy = (r.min.y + r.max.y) * 0.5f;
-            r.dl->AddLine(ImVec2(cx, cy - ui_s(6.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx - ui_s(4.0f), cy - ui_s(1.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx + ui_s(4.0f), cy - ui_s(1.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx - ui_s(6.0f), cy + ui_s(6.0f)), ImVec2(cx + ui_s(6.0f), cy + ui_s(6.0f)), icon_col, icon_th);
         }
         ImGui::SameLine();
         {

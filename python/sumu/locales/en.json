@@ -55,7 +55,6 @@
   "export_pick": "Browse",
   "export_start": "Export",
   "cancel": "Cancel",
-  "stream_running": "Server running: {url}",
   "stream_stopped": "Server stopped",
   "stream_start_failed": "Server start failed: {error}",
   "export_running": "Exporting {progress}%",

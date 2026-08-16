@@ -55,7 +55,6 @@
   "export_pick": "選択",
   "export_start": "書き出し",
   "cancel": "キャンセル",
-  "stream_running": "サーバー稼働中：{url}",
   "stream_stopped": "サーバー停止",
   "stream_start_failed": "起動失敗：{error}",
   "export_running": "書き出し中 {progress}%",

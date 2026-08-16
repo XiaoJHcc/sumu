@@ -55,7 +55,6 @@
   "export_pick": "选择文件",
   "export_start": "开始导出",
   "cancel": "取消",
-  "stream_running": "服务器运行中：{url}",
   "stream_stopped": "服务器已停止",
   "stream_start_failed": "启动服务器失败：{error}",
   "export_running": "导出中 {progress}%",

@@ -16,6 +16,18 @@ def _esc(s) -> str:
     return _html.escape(str(s))
 
 
+def _json_js(s) -> str:
+    """JSON-encode `s` for safe embedding inside an inline <script>: on top of JSON quoting,
+    escape the characters that could terminate the script element even within a JS string
+    literal (`<`, `>`, `&`) plus the JS line separators U+2028/U+2029."""
+    return (_json.dumps(s)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029"))
+
+
 VIDEO_EXT = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".flv",
     ".mpg", ".mpeg", ".3gp", ".ogv",
@@ -133,14 +145,13 @@ def render_index(title: str, crumbs: list[tuple[str, str]], items: list[dict], t
         '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/>'
         '<meta name="viewport" content="width=device-width, initial-scale=1"/>'
         '<title>%s · sumu</title>%s</head><body>'
-        '<main><header><div class="hrow"><h1>sumu 去码流媒体</h1>%s</div>'
+        '<main><header><div class="hrow"><h1>sumu</h1>%s</div>'
         '<div class="crumb">%s</div></header>'
         '<div class="grid">%s</div>'
-        '<footer>点击视频即实时去码直播（HLS）· 仅限同一局域网 · 端口请勿暴露公网</footer>'
         '</main><script>%s</script></body></html>'
     ) % (_esc(title), _CSS, _mode_button_html(), crumb_html,
          "\n".join(cards) if cards else '<div class="empty">空目录</div>',
-         _mode_js(_json.dumps(token)))
+         _mode_js(_json_js(token)))
 
     return body
 
@@ -154,8 +165,8 @@ def render_player(title: str, stream_rel: str, token: str) -> str:
     qs = ("?token=" + _quote(token)) if token else ""
     hls_src = "/static/hls.min.js" + qs
     back = ("/?token=" + _quote(token)) if token else "/"
-    rel_js = _json.dumps(stream_rel)
-    token_js = _json.dumps(token)
+    rel_js = _json_js(stream_rel)
+    token_js = _json_js(token)
     return (
         '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"/>'
         '<meta name="viewport" content="width=device-width, initial-scale=1"/>'
@@ -171,9 +182,7 @@ def render_player(title: str, stream_rel: str, token: str) -> str:
         '<button id="fsbtn" class="pbtn" title="全屏" aria-label="全屏">⛶</button>'
         '%s'
         '</div>'
-        '<div class="ctl subrow"><span id="st" class="st">就绪</span></div>'
-        '<p class="hint">桌面浏览器由内置 hls.js 播放（iOS Safari 原生 HLS）；拖动进度条即跳转，'
-        '暂停/关闭页面即停止转码。右上角「AI 去码 / 原片直出」可随时切换。</p>'
+        '<div class="ctl subrow"><span id="st" class="st"></span></div>'
         '</main>'
         '<script src="%s"></script>'
         '<script>%s</script>'
@@ -217,10 +226,10 @@ def _player_js(rel_js: str, token_js: str) -> str:
         + "function showBig(){bigplay.style.display='block';}"
         + "function hideBig(){bigplay.style.display='none';}"
         + "function setUi(s){"
-        + "if(s==='playing'){playbtn.textContent='❚❚ 暂停';hideBig();st.textContent='播放中';}"
-        + "else if(s==='paused'){playbtn.textContent='▶ 播放';showBig();st.textContent='已暂停';}"
-        + "else if(s==='buffering'){playbtn.textContent='❚❚ 暂停';st.textContent='缓冲中…';}"
-        + "else if(s==='ended'){playbtn.textContent='↻ 重播';showBig();st.textContent='已结束';}"
+        + "if(s==='playing'){playbtn.textContent='❚❚ 暂停';hideBig();}"
+        + "else if(s==='paused'){playbtn.textContent='▶ 播放';showBig();}"
+        + "else if(s==='buffering'){playbtn.textContent='❚❚ 暂停';}"
+        + "else if(s==='ended'){playbtn.textContent='↻ 重播';showBig();}"
         + "else{playbtn.textContent='▶ 播放';showBig();st.textContent='播放失败';}}"
         + "function playFrom(pos){"
         + "pos=clamp(pos);basePos=pos;ended=false;reloading=true;isLive=true;destroyHls();"
@@ -266,6 +275,9 @@ def _player_js(rel_js: str, token_js: str) -> str:
         + "else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen();}});"
         + "video.addEventListener('timeupdate',syncTime);"
         + "video.addEventListener('progress',syncTime);"
+        + "video.addEventListener('loadedmetadata',function(){"
+        + "if(video.videoWidth&&video.videoHeight)"
+        + "{video.style.aspectRatio=video.videoWidth+' / '+video.videoHeight;}});"
         + "video.addEventListener('playing',function(){setUi('playing');});"
         + "video.addEventListener('waiting',function(){setUi('buffering');});"
         + "video.addEventListener('pause',function(){if(reloading)return;setUi('paused');"

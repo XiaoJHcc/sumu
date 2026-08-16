@@ -79,7 +79,6 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "export_pick",
     "export_start",
     "cancel",
-    "stream_running",
     "stream_stopped",
     "stream_start_failed",
     "export_running",

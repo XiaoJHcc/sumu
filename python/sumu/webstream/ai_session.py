@@ -66,6 +66,12 @@ class AiStreamSession:
         # True while a reposition/stop is cancelling the worker, so its TranscodeError(cancel)
         # is NOT surfaced as a user-facing error.
         self._repositioning = False
+        # Reserved from creation until start() launches the worker: the server's single-transcode
+        # gate counts a just-created-but-not-yet-started session as busy, closing the TOCTOU
+        # between get_or_start() (under the manager lock) and start() (called after that lock is
+        # released, once the ?start= query is in hand). Released by start(); release_reservation()
+        # handles the rare path where a fresh session never starts.
+        self._reserved = True
 
     # ---- metadata ------------------------------------------------------------------
 
@@ -114,7 +120,10 @@ class AiStreamSession:
             self._total = 0
             self._last_activity = time.monotonic()
             self._thread = threading.Thread(target=self._run, name="sumu-stream-ai", daemon=True)
-        self._thread.start()
+            # Launch while still holding the lock and release the reservation only after the
+            # worker is live, so running()/reserved() never both read False in between.
+            self._thread.start()
+            self._reserved = False
         return os.path.join(out_dir, "index.m3u8")
 
     def seek(self, seconds: float) -> str:
@@ -145,6 +154,18 @@ class AiStreamSession:
                 self._last_seq = seq
                 return True
             return False
+
+    def reserved(self) -> bool:
+        """True while this session is created-but-not-started (still holds its single-transcode
+        reservation). The server's busy gate uses this together with running()."""
+        with self._lock:
+            return self._reserved
+
+    def release_reservation(self) -> None:
+        """Release the reservation when a fresh session ends up NOT starting (e.g. a stale poll
+        arrived before any fresh playFrom). start() releases it on the normal path."""
+        with self._lock:
+            self._reserved = False
 
     def stop(self) -> None:
         """Cancel the current transcode and wait for the worker to exit (frees the shared GPU).
