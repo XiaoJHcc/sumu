@@ -145,84 +145,103 @@ public:
     // FFmpeg decodes (local files: ~ms/frame; network URLs may block on IO).
     py::dict next_frame()
     {
-        py::dict d;
         if (!opened_) throw std::runtime_error("HeadlessDecode.next_frame: not opened");
 
         DecodedFrame df;
-        if (!decoder_.next_frame(df)) {
+        bool eof = false;
+        uint64_t dev_ptr = 0;
+        size_t pitch = 0;
+        int64_t frame_num = 0;
+        double pts_seconds = 0.0;
+        {
+            // Release the GIL across the blocking FFmpeg decode + D3D11/CUDA blit: network sources
+            // can block on socket IO for seconds, which must not freeze the rest of the app (UI +
+            // scheduler). The py::dict is built AFTER this scope, once the GIL is re-acquired.
+            py::gil_scoped_release release;
+            if (!decoder_.next_frame(df)) {
+                eof = true;
+            } else {
+                // Decoder texture -> display-size NV12 intermediate (same nullptr-box full copy the
+                // validated decode_loop/scrub blit use), then identity-blit into the CUDA-registered
+                // R8/R8G8 plane targets and copy out to the persistent device buffer.
+                context_->CopySubresourceRegion(nv12_tex_.Get(), 0, 0, 0, 0,
+                    df.texture, df.array_slice, nullptr);
+
+                D3D11_VIEWPORT vp_y{ 0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_), 0.0f, 1.0f };
+                context_->RSSetViewports(1, &vp_y);
+                ID3D11RenderTargetView* rtv_y[] = { y_rtv_.Get() };
+                context_->OMSetRenderTargets(1, rtv_y, nullptr);
+                context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context_->VSSetShader(vs_.Get(), nullptr, 0);
+                context_->PSSetShader(ps_y_.Get(), nullptr, 0);
+                ID3D11ShaderResourceView* srv_y[] = { srv_y_.Get() };
+                context_->PSSetShaderResources(0, 1, srv_y);
+                ID3D11SamplerState* samplers[] = { sampler_.Get() };
+                context_->PSSetSamplers(0, 1, samplers);
+                context_->Draw(3, 0);
+
+                D3D11_VIEWPORT vp_uv{ 0.0f, 0.0f, static_cast<float>(width_ / 2), static_cast<float>(height_ / 2), 0.0f, 1.0f };
+                context_->RSSetViewports(1, &vp_uv);
+                ID3D11RenderTargetView* rtv_uv[] = { uv_rtv_.Get() };
+                context_->OMSetRenderTargets(1, rtv_uv, nullptr);
+                context_->PSSetShader(ps_uv_.Get(), nullptr, 0);
+                ID3D11ShaderResourceView* srv_uv[] = { srv_uv_.Get() };
+                context_->PSSetShaderResources(0, 1, srv_uv);
+                context_->Draw(3, 0);
+
+                context_->Flush();
+
+                check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (next_frame)");
+                CUgraphicsResource res[2] = { cu_res_y_, cu_res_uv_ };
+                check_cu(cuGraphicsMapResources(2, res, 0), "cuGraphicsMapResources");
+
+                CUarray cu_arr_y = nullptr, cu_arr_uv = nullptr;
+                check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_y, cu_res_y_, 0, 0),
+                    "cuGraphicsSubResourceGetMappedArray(y)");
+                check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_uv, cu_res_uv_, 0, 0),
+                    "cuGraphicsSubResourceGetMappedArray(uv)");
+
+                CUDA_MEMCPY2D cp_y{};
+                cp_y.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+                cp_y.srcArray = cu_arr_y;
+                cp_y.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+                cp_y.dstDevice = cu_buf_;
+                cp_y.dstPitch = static_cast<size_t>(width_);
+                cp_y.WidthInBytes = static_cast<size_t>(width_);
+                cp_y.Height = static_cast<size_t>(height_);
+                check_cu(cuMemcpy2D(&cp_y), "cuMemcpy2D(Y: array -> device)");
+
+                CUDA_MEMCPY2D cp_uv{};
+                cp_uv.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+                cp_uv.srcArray = cu_arr_uv;
+                cp_uv.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+                cp_uv.dstDevice = cu_buf_ + static_cast<size_t>(height_) * static_cast<size_t>(width_);
+                cp_uv.dstPitch = static_cast<size_t>(width_);
+                cp_uv.WidthInBytes = static_cast<size_t>(width_);
+                cp_uv.Height = static_cast<size_t>(height_ / 2);
+                check_cu(cuMemcpy2D(&cp_uv), "cuMemcpy2D(UV: array -> device)");
+
+                check_cu(cuGraphicsUnmapResources(2, res, 0), "cuGraphicsUnmapResources");
+
+                dev_ptr = static_cast<uint64_t>(cu_buf_);
+                pitch = static_cast<size_t>(width_);
+                frame_num = static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
+                pts_seconds = df.pts_seconds;
+            }
+        } // GIL re-acquired here
+
+        py::dict d;
+        if (eof) {
             d["eof"] = true;
             return d;
         }
-
-        // Decoder texture -> display-size NV12 intermediate (same nullptr-box full copy the
-        // validated decode_loop/scrub blit use), then identity-blit into the CUDA-registered
-        // R8/R8G8 plane targets and copy out to the persistent device buffer.
-        context_->CopySubresourceRegion(nv12_tex_.Get(), 0, 0, 0, 0,
-            df.texture, df.array_slice, nullptr);
-
-        D3D11_VIEWPORT vp_y{ 0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_), 0.0f, 1.0f };
-        context_->RSSetViewports(1, &vp_y);
-        ID3D11RenderTargetView* rtv_y[] = { y_rtv_.Get() };
-        context_->OMSetRenderTargets(1, rtv_y, nullptr);
-        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context_->VSSetShader(vs_.Get(), nullptr, 0);
-        context_->PSSetShader(ps_y_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* srv_y[] = { srv_y_.Get() };
-        context_->PSSetShaderResources(0, 1, srv_y);
-        ID3D11SamplerState* samplers[] = { sampler_.Get() };
-        context_->PSSetSamplers(0, 1, samplers);
-        context_->Draw(3, 0);
-
-        D3D11_VIEWPORT vp_uv{ 0.0f, 0.0f, static_cast<float>(width_ / 2), static_cast<float>(height_ / 2), 0.0f, 1.0f };
-        context_->RSSetViewports(1, &vp_uv);
-        ID3D11RenderTargetView* rtv_uv[] = { uv_rtv_.Get() };
-        context_->OMSetRenderTargets(1, rtv_uv, nullptr);
-        context_->PSSetShader(ps_uv_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* srv_uv[] = { srv_uv_.Get() };
-        context_->PSSetShaderResources(0, 1, srv_uv);
-        context_->Draw(3, 0);
-
-        context_->Flush();
-
-        check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (next_frame)");
-        CUgraphicsResource res[2] = { cu_res_y_, cu_res_uv_ };
-        check_cu(cuGraphicsMapResources(2, res, 0), "cuGraphicsMapResources");
-
-        CUarray cu_arr_y = nullptr, cu_arr_uv = nullptr;
-        check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_y, cu_res_y_, 0, 0),
-            "cuGraphicsSubResourceGetMappedArray(y)");
-        check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_uv, cu_res_uv_, 0, 0),
-            "cuGraphicsSubResourceGetMappedArray(uv)");
-
-        CUDA_MEMCPY2D cp_y{};
-        cp_y.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-        cp_y.srcArray = cu_arr_y;
-        cp_y.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-        cp_y.dstDevice = cu_buf_;
-        cp_y.dstPitch = static_cast<size_t>(width_);
-        cp_y.WidthInBytes = static_cast<size_t>(width_);
-        cp_y.Height = static_cast<size_t>(height_);
-        check_cu(cuMemcpy2D(&cp_y), "cuMemcpy2D(Y: array -> device)");
-
-        CUDA_MEMCPY2D cp_uv{};
-        cp_uv.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-        cp_uv.srcArray = cu_arr_uv;
-        cp_uv.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-        cp_uv.dstDevice = cu_buf_ + static_cast<size_t>(height_) * static_cast<size_t>(width_);
-        cp_uv.dstPitch = static_cast<size_t>(width_);
-        cp_uv.WidthInBytes = static_cast<size_t>(width_);
-        cp_uv.Height = static_cast<size_t>(height_ / 2);
-        check_cu(cuMemcpy2D(&cp_uv), "cuMemcpy2D(UV: array -> device)");
-
-        check_cu(cuGraphicsUnmapResources(2, res, 0), "cuGraphicsUnmapResources");
-
         d["eof"] = false;
-        d["dev_ptr"] = static_cast<uint64_t>(cu_buf_);
+        d["dev_ptr"] = dev_ptr;
         d["width"] = width_;
         d["height"] = height_;
-        d["pitch_bytes"] = static_cast<size_t>(width_);
-        d["frame_num"] = static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
-        d["pts_seconds"] = df.pts_seconds;
+        d["pitch_bytes"] = pitch;
+        d["frame_num"] = frame_num;
+        d["pts_seconds"] = pts_seconds;
         return d;
     }
 
@@ -393,9 +412,13 @@ void init_headless_decode(py::module_& m)
 {
     py::class_<HeadlessDecode>(m, "HeadlessDecode")
         .def(py::init<>())
-        .def("open", &HeadlessDecode::open, py::arg("path"))
+        // open/seek_to_frame release the GIL: they block on FFmpeg (network IO can take seconds)
+        // and must not freeze the app. next_frame releases it internally around the decode+blit.
+        .def("open", &HeadlessDecode::open, py::arg("path"),
+            py::call_guard<py::gil_scoped_release>())
         .def("next_frame", &HeadlessDecode::next_frame)
-        .def("seek_to_frame", &HeadlessDecode::seek_to_frame, py::arg("target_frame"))
+        .def("seek_to_frame", &HeadlessDecode::seek_to_frame, py::arg("target_frame"),
+            py::call_guard<py::gil_scoped_release>())
         .def("fps", &HeadlessDecode::fps)
         .def("frame_count", &HeadlessDecode::frame_count)
         .def("width", &HeadlessDecode::width)

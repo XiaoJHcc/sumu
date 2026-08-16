@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -121,6 +123,59 @@ class EncoderError(RuntimeError):
     """ffmpeg failed to start or exited early / non-zero."""
 
 
+@dataclass
+class EncodeOptions:
+    """User-facing encode knobs for the offline-export presets. codec: "hevc"|"h264";
+    rate_mode: "cq" (constant quality) | "vbr" (target bitrate + derived maxrate). Serialized as
+    plain dicts into settings.json (see settings.EXPORT_PRESET_DEFAULTS for the shipped presets)."""
+
+    codec: str = "hevc"
+    rate_mode: str = "cq"
+    cq: int = 33
+    bitrate: str = "8M"           # vbr mode only
+    preset: str = "p7"            # NVENC preset p1..p7 (p7 = slowest / best quality)
+    audio_copy: bool = True
+    audio_bitrate: str = "320k"   # aac mode only (audio_copy=False)
+    subtitle: bool = True
+
+    def codec_ffmpeg(self) -> str:
+        return "hevc_nvenc" if self.codec == "hevc" else "h264_nvenc"
+
+    def to_dict(self) -> dict:
+        return {
+            "codec": self.codec, "rate_mode": self.rate_mode, "cq": int(self.cq),
+            "bitrate": self.bitrate, "preset": self.preset,
+            "audio_copy": bool(self.audio_copy), "audio_bitrate": self.audio_bitrate,
+            "subtitle": bool(self.subtitle),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "EncodeOptions":
+        d = d or {}
+        return cls(
+            codec="h264" if d.get("codec") == "h264" else "hevc",
+            rate_mode="vbr" if d.get("rate_mode") == "vbr" else "cq",
+            cq=int(d.get("cq") or 0),
+            bitrate=str(d.get("bitrate") or "8M"),
+            preset=str(d.get("preset") or "p7"),
+            audio_copy=bool(d.get("audio_copy", True)),
+            audio_bitrate=str(d.get("audio_bitrate") or "320k"),
+            subtitle=bool(d.get("subtitle", True)),
+        )
+
+
+def _derive_maxrate(bitrate: str) -> str:
+    """maxrate ≈ 1.2× bitrate (VBV cap), matching the user's ffmpeg bats (e.g. 1000k→1200k,
+    30M→35M). Keeps the rate-control ceiling tight without hand-editing every preset."""
+    m = re.match(r"^(\d+(?:\.\d+)?)([kKmM]?)$", str(bitrate).strip())
+    if not m:
+        return str(bitrate)
+    val = float(m.group(1)) * 1.2
+    unit = m.group(2)  # preserve the caller's unit case (e.g. "30M" -> "36M")
+    s = f"{val:.1f}".rstrip("0").rstrip(".")
+    return f"{s}{unit}"
+
+
 class NvencEncoder:
     """One ffmpeg h264_nvenc process fed BGR frames (converted to YUV420p) over stdin.
 
@@ -131,12 +186,18 @@ class NvencEncoder:
     """
 
     def __init__(self, width: int, height: int, fps: float, mode: str, out: str,
-                 bitrate: str = "8M", audio_source: str | None = None,
-                 preset: str = "p4", gop_seconds: float = 2.0,
+                 encode: "EncodeOptions | None" = None, quality_first: bool = False,
+                 audio_source: str | None = None, gop_seconds: float = 2.0,
                  start_seconds: float = 0.0, bt709: bool = True,
                  full_range: bool = False):
         if mode not in ("hls", "mp4"):
             raise ValueError(f"bad mode {mode!r}")
+        # Default = the live-streaming profile (h264 / VBR 8M / p4 / AAC re-encode): browser HLS
+        # wants h264 + AAC, and p4 keeps encode latency low. Offline export passes a quality-first
+        # EncodeOptions (HEVC / CQ / p7 / copy) + quality_first=True instead.
+        enc = encode if encode is not None else EncodeOptions(
+            codec="h264", rate_mode="vbr", bitrate="8M", preset="p4",
+            audio_copy=False, subtitle=False)
         w, h = int(width), int(height)
         gop = max(1, int(round(float(fps) * gop_seconds)))
         if mode == "hls":
@@ -167,13 +228,47 @@ class NvencEncoder:
             "-i", "pipe:0",
         ]
         if audio_source:
-            # rawvideo is input #1; source audio is input #0's first audio stream (optional `?`).
+            # rawvideo is input #1; source audio is input #0's first audio stream (optional `?`);
+            # subtitles are mapped + converted to mov_text (MP4-compatible) when enabled.
             cmd += ["-map", "1:v:0", "-map", "0:a:0?"]
+            if enc.subtitle:
+                cmd += ["-map", "0:s?"]
         else:
             cmd += ["-map", "0:v:0"]
-        cmd += ["-c:v", "h264_nvenc", "-preset", preset, "-b:v", bitrate, "-g", str(gop)]
+
+        # Video encode: codec + preset + rate control (CQ constant-quality or VBR bitrate+maxrate).
+        cmd += ["-c:v", enc.codec_ffmpeg(), "-preset", enc.preset]
+        if enc.codec == "hevc":
+            # Apple/QuickTime compatibility tag (the user's bat habit; not set for H.264).
+            cmd += ["-tag:v", "hvc1"]
+        if enc.rate_mode == "cq":
+            cmd += ["-cq", str(int(enc.cq))]
+        else:
+            cmd += ["-b:v", enc.bitrate]
+            if quality_first:
+                # VBV cap only for offline export VBR; the live-streaming h264 profile stays
+                # bit-exact to its previous command (no -maxrate).
+                cmd += ["-maxrate", _derive_maxrate(enc.bitrate)]
+        if quality_first:
+            # Offline-export "always-on" quality flags (deliberately NOT in the preset panel):
+            # max spatial/temporal AQ, B-frame references, full lookahead, and the hq tune. Even
+            # at maximum these cost far less than the AI decensor pipeline, so there is no reason
+            # to leave quality headroom on the table for a non-realtime export.
+            cmd += ["-tune", "hq", "-b_ref_mode", "middle",
+                    "-spatial_aq", "1", "-temporal_aq", "1", "-rc-lookahead", "32"]
+        cmd += ["-g", str(gop)]
+
         if audio_source:
-            cmd += ["-c:a", "aac", "-shortest"]
+            if enc.audio_copy:
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-c:a", "aac"]
+                if quality_first:
+                    cmd += ["-b:a", enc.audio_bitrate]
+            cmd += ["-shortest"]
+            if enc.subtitle:
+                cmd += ["-c:s", "mov_text"]
+
         if mode == "hls":
             cmd += ["-f", "hls", "-hls_playlist_type", "event", "-hls_time", "2",
                     "-hls_list_size", "0", "-hls_flags", "independent_segments",

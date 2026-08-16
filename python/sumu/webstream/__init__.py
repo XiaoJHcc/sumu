@@ -15,7 +15,7 @@ __all__ = [
     "TranscodeEngine",
     "TranscodeError",
     "StreamingServer",
-    "ExportJob",
+    "ExportQueue",
     "PassthroughSession",
     "AiStreamSession",
 ]
@@ -30,10 +30,10 @@ def __getattr__(name: str):
         from .server import StreamingServer
 
         return StreamingServer
-    if name == "ExportJob":
-        from .export import ExportJob
+    if name == "ExportQueue":
+        from .export import ExportQueue
 
-        return ExportJob
+        return ExportQueue
     if name == "PassthroughSession":
         from .passthrough import PassthroughSession
 

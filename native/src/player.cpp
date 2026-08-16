@@ -415,17 +415,68 @@ struct UiIntents {
     // responds by spawning the blocking compile off the main thread and driving the compile UI
     // via set_compile_ui(). Doubles as the "retry" click in the failed state.
     bool compile_engine = false;
-    // Web-streaming server + offline-export (Phase 2, additive). The stream/export popups write
-    // these; Python drains them in take_ui_intents() and drives the background server/job.
+    // Web-streaming server (Phase 2). The stream popup writes these; Python drains them.
     bool stream_start = false;
     int stream_port = 0;
     std::string stream_root;
     bool stream_no_token = false;
     std::string stream_token;
     bool stream_stop = false;
-    bool export_start = false;
-    std::string export_source;
-    std::string export_out;
+    // Offline-export full-screen mode (Phase 2 extension): enter/exit + queue + preset intents.
+    bool export_enter = false;
+    bool export_exit = false;
+    bool export_add_files = false;    // "添加文件" button -> Python opens the file picker
+    bool export_start = false;        // "开始导出" -> run the queue
+    bool export_pick_global = false;  // pick the global output dir
+    int export_pick_custom = -1;      // item id to pick a custom output path for
+    int export_remove = -1;           // item id to remove
+    int export_cancel = -1;           // item id to cancel
+    int export_move_id = -1;          // item id to reorder
+    int export_move_dir = 0;          // -1 up / +1 down
+    int export_item_preset_id = -1;   // item id whose preset dropdown changed
+    int export_item_preset_idx = -1;  // new preset index
+    int export_item_out_id = -1;      // item id whose output-mode dropdown changed
+    int export_item_out_mode = 0;     // 0 auto / 1 global / 2 custom
+    int export_clip_length = -1;      // AI pipeline clip length (commit on release)
+    // preset editor (commit-on-save)
+    bool export_preset_save = false;
+    bool export_preset_delete = false;
+    int export_preset_edit_idx = -1;  // -1 none / -2 new / >=0 edit existing
+    std::string export_preset_name;
+    int export_preset_codec = 0;      // 0 hevc / 1 h264
+    int export_preset_rate = 0;       // 0 cq / 1 vbr
+    int export_preset_cq = 33;
+    std::string export_preset_bitrate;
+    int export_preset_quality = 6;    // 0..6 -> p1..p7
+    bool export_preset_audio = true;
+    bool export_preset_subtitle = true;
+    // Files dropped on the window while in export mode (multi-file drop -> queue).
+    std::vector<std::string> export_drop_paths;
+};
+
+// Offline-export screen state pushed by Python via set_export_snapshot() (main-thread only, same
+// discipline as set_ui_strings). Plain value copies; the Python-side queue is the source of truth
+// and is re-pushed every tick.
+struct ExportPresetView {
+    std::string name;
+    std::string codec;     // "hevc" | "h264"
+    std::string rate_mode; // "cq" | "vbr"
+    int cq = 0;
+    std::string bitrate;
+    std::string preset;    // "p1".."p7"
+    bool audio_copy = true;
+    bool subtitle = true;
+};
+
+struct ExportItemView {
+    int id = 0;
+    std::string source;
+    std::string out_path;
+    std::string out_mode;   // "auto" | "global" | "custom"
+    int preset_idx = 0;
+    std::string status;     // pending|running|done|failed|cancelled|interrupted
+    float progress = -1.0f; // 0..1, -1 = unknown
+    std::string error;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -919,6 +970,30 @@ public:
         return frame_count_;
     }
 
+    // Export-mode teardown: detach present into splash, then tear down the playback session and
+    // clear opened_ so the open-prompt returns. Mirrors reopen()'s present-detach handshake
+    // WITHOUT opening a new session. Safe to call with no live session (present is already in
+    // splash, close_session() handles the empty state).
+    void close_current_session()
+    {
+        session_active_.store(false, std::memory_order_release);
+        LARGE_INTEGER t0;
+        QueryPerformanceCounter(&t0);
+        for (;;) {
+            if (present_in_splash_.load(std::memory_order_acquire)) break;
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double waited_s = static_cast<double>(now.QuadPart - t0.QuadPart) / qpc_freq_d();
+            if (waited_s > 2.0)
+                throw std::runtime_error("close_current_session: present failed to detach within 2s");
+            Sleep(1);
+        }
+        close_session();
+        opened_ = false;
+        video_path_.clear();
+        network_source_ = false;
+    }
+
     void close()
     {
         if (closed_) return;
@@ -1018,6 +1093,43 @@ public:
         int utf8_len = WideCharToMultiByte(CP_UTF8, 0, file_buf, -1, nullptr, 0, nullptr, nullptr);
         if (utf8_len <= 0) return std::string();
         std::string utf8_path(static_cast<size_t>(utf8_len - 1), '\0'); // -1: drop the NUL WideCharToMultiByte counts
+        WideCharToMultiByte(CP_UTF8, 0, file_buf, -1, utf8_path.data(), utf8_len, nullptr, nullptr);
+        return utf8_path;
+    }
+
+    // Save-file dialog for the export "单独路径" output picker (GetSaveFileNameW + overwrite
+    // prompt). `default_name` seeds the file name; empty falls back to "output.mp4".
+    std::string pick_save_file(const std::string& default_name)
+    {
+        wchar_t file_buf[MAX_PATH] = {};
+        std::wstring def = utf8_to_wide(default_name.empty() ? "output.mp4" : default_name);
+        size_t n = std::min(def.size(), static_cast<size_t>(ARRAYSIZE(file_buf) - 1));
+        for (size_t i = 0; i < n; ++i) file_buf[i] = def[i];
+        file_buf[n] = L'\0';
+
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        std::wstring filter;
+        auto append_filter_pair = [&](const std::string& label_utf8, const wchar_t* patterns) {
+            std::wstring label = utf8_to_wide(label_utf8);
+            filter.append(label);
+            filter.push_back(L'\0');
+            filter.append(patterns);
+            filter.push_back(L'\0');
+        };
+        append_filter_pair(ui_str_.dialog_video_files, L"*.mp4");
+        append_filter_pair(ui_str_.dialog_all_files, L"*.*");
+        filter.push_back(L'\0');
+        ofn.lpstrFilter = filter.c_str();
+        ofn.lpstrFile = file_buf;
+        ofn.nMaxFile = static_cast<DWORD>(ARRAYSIZE(file_buf));
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetSaveFileNameW(&ofn)) return std::string();
+
+        int utf8_len = WideCharToMultiByte(CP_UTF8, 0, file_buf, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8_len <= 0) return std::string();
+        std::string utf8_path(static_cast<size_t>(utf8_len - 1), '\0');
         WideCharToMultiByte(CP_UTF8, 0, file_buf, -1, utf8_path.data(), utf8_len, nullptr, nullptr);
         return utf8_path;
     }
@@ -1278,19 +1390,13 @@ public:
     // M-C2: WM_DROPFILES (a file dropped on the window) and the top-bar "open" button -- see
     // UiIntents' own header comment. Both main-thread-only, same as record_seek() above.
     void record_open_path(const std::string& path) { ui_intents_.open_path = path; }
+    void record_export_drop(const std::string& path) { ui_intents_.export_drop_paths.push_back(path); }
     void record_open_dialog() { ui_intents_.open_dialog = true; }
     void record_compile_engine() { ui_intents_.compile_engine = true; }
-    // Web-stream / export popup requests (main-thread-only, see UiIntents header comment).
+    // Web-stream popup request (main-thread-only, see UiIntents header comment). The offline
+    // export entry is a full-screen mode, driven by ui_intents_.export_enter (see build_top_bar /
+    // build_open_prompt_overlay) + Python's set_export_mode().
     void request_stream_popup() { stream_popup_ = true; }
-    void request_export_popup()
-    {
-        export_popup_ = true;
-        // Seed the export source from the currently-open file (if any) for convenience.
-        if (export_source_buf_[0] == '\0' && !video_path_.empty()) {
-            std::memcpy(export_source_buf_, video_path_.c_str(),
-                std::min(video_path_.size(), sizeof(export_source_buf_) - 1));
-        }
-    }
     // Python flips this when it starts/stops the server, so the stream popup shows 停止 vs 启动.
     // The access URL is passed on start so the popup can render it as a clickable link (open in
     // the default browser) instead of a persistent status float.
@@ -1314,6 +1420,81 @@ public:
             std::memcpy(stream_token_buf_, token.c_str(),
                 std::min(token.size(), sizeof(stream_token_buf_) - 1));
             stream_token_buf_[std::min(token.size(), sizeof(stream_token_buf_) - 1)] = '\0';
+        }
+    }
+    // Offline-export full-screen mode (Phase 2 extension). Python flips this after tearing down
+    // playback/streaming (or on exit); the export screen is the sole UI while set.
+    void set_export_mode(bool on)
+    {
+        export_mode_ = on;
+        if (on) export_clip_edit_init_ = false; // re-seed the clip slider on entry
+    }
+    bool export_mode() const { return export_mode_; }
+
+    // Python pushes the export screen's state every tick (clip_length, global_dir, presets[],
+    // items[], running, engine_ready). Plain value copies; the Python queue is the source of truth.
+    void set_export_snapshot(const py::dict& d)
+    {
+        auto get_str = [&](const py::dict& dd, const char* k, const char* def) -> std::string {
+            if (!dd.contains(k)) return std::string(def);
+            try { return py::cast<std::string>(dd[k]); } catch (const py::cast_error&) { return std::string(def); }
+        };
+        auto get_int = [&](const py::dict& dd, const char* k, int def) -> int {
+            if (!dd.contains(k)) return def;
+            try { return py::cast<int>(dd[k]); } catch (const py::cast_error&) { return def; }
+        };
+        auto get_bool = [&](const py::dict& dd, const char* k, bool def) -> bool {
+            if (!dd.contains(k)) return def;
+            try { return py::cast<bool>(dd[k]); } catch (const py::cast_error&) { return def; }
+        };
+
+        export_engine_ready_ = get_bool(d, "engine_ready", false);
+        export_running_ = get_bool(d, "running", false);
+        export_clip_length_ = get_int(d, "clip_length", 120);
+        export_global_dir_ = get_str(d, "global_dir", "");
+
+        export_presets_.clear();
+        if (d.contains("presets")) {
+            try {
+                py::list presets = d["presets"].cast<py::list>();
+                for (py::handle h : presets) {
+                    py::dict p = h.cast<py::dict>();
+                    ExportPresetView v;
+                    v.name = get_str(p, "name", "");
+                    v.codec = get_str(p, "codec", "hevc");
+                    v.rate_mode = get_str(p, "rate_mode", "cq");
+                    v.cq = get_int(p, "cq", 0);
+                    v.bitrate = get_str(p, "bitrate", "");
+                    v.preset = get_str(p, "preset", "p7");
+                    v.audio_copy = get_bool(p, "audio_copy", true);
+                    v.subtitle = get_bool(p, "subtitle", true);
+                    export_presets_.push_back(std::move(v));
+                }
+            } catch (const py::error_already_set&) { PyErr_Clear(); }
+        }
+
+        export_items_.clear();
+        if (d.contains("items")) {
+            try {
+                py::list items = d["items"].cast<py::list>();
+                for (py::handle h : items) {
+                    py::dict it = h.cast<py::dict>();
+                    ExportItemView v;
+                    v.id = get_int(it, "id", 0);
+                    v.source = get_str(it, "source", "");
+                    v.out_path = get_str(it, "out_path", "");
+                    v.out_mode = get_str(it, "out_mode", "auto");
+                    v.preset_idx = get_int(it, "preset_idx", 0);
+                    v.status = get_str(it, "status", "pending");
+                    v.progress = -1.0f;
+                    if (it.contains("progress") && !it["progress"].is_none()) {
+                        try { v.progress = py::cast<float>(it["progress"]); }
+                        catch (const py::cast_error&) { v.progress = -1.0f; }
+                    }
+                    v.error = get_str(it, "error", "");
+                    export_items_.push_back(std::move(v));
+                }
+            } catch (const py::error_already_set&) { PyErr_Clear(); }
         }
     }
     void request_open_url_popup()
@@ -1471,6 +1652,42 @@ public:
         take("export_pick", ui_str_.export_pick);
         take("export_start", ui_str_.export_start);
         take("cancel", ui_str_.cancel);
+        take("export_return", ui_str_.export_return);
+        take("export_section_ai", ui_str_.export_section_ai);
+        take("export_clip_length_label", ui_str_.export_clip_length_label);
+        take("export_section_path", ui_str_.export_section_path);
+        take("export_global_dir_label", ui_str_.export_global_dir_label);
+        take("export_pick_dir", ui_str_.export_pick_dir);
+        take("export_section_queue", ui_str_.export_section_queue);
+        take("export_add_files", ui_str_.export_add_files);
+        take("export_preset", ui_str_.export_preset);
+        take("export_output", ui_str_.export_output);
+        take("export_out_auto", ui_str_.export_out_auto);
+        take("export_out_global", ui_str_.export_out_global);
+        take("export_out_custom", ui_str_.export_out_custom);
+        take("export_remove", ui_str_.export_remove);
+        take("export_up", ui_str_.export_up);
+        take("export_down", ui_str_.export_down);
+        take("export_empty", ui_str_.export_empty);
+        take("export_not_ready", ui_str_.export_not_ready);
+        take("export_presets_title", ui_str_.export_presets_title);
+        take("export_preset_new", ui_str_.export_preset_new);
+        take("export_preset_delete", ui_str_.export_preset_delete);
+        take("export_preset_name_label", ui_str_.export_preset_name_label);
+        take("export_preset_codec_label", ui_str_.export_preset_codec_label);
+        take("export_preset_rate_label", ui_str_.export_preset_rate_label);
+        take("export_preset_cq_label", ui_str_.export_preset_cq_label);
+        take("export_preset_bitrate_label", ui_str_.export_preset_bitrate_label);
+        take("export_preset_quality_label", ui_str_.export_preset_quality_label);
+        take("export_preset_audio_label", ui_str_.export_preset_audio_label);
+        take("export_preset_subtitle_label", ui_str_.export_preset_subtitle_label);
+        take("export_preset_save", ui_str_.export_preset_save);
+        take("export_status_pending", ui_str_.export_status_pending);
+        take("export_status_running", ui_str_.export_status_running);
+        take("export_status_done", ui_str_.export_status_done);
+        take("export_status_failed", ui_str_.export_status_failed);
+        take("export_status_cancelled", ui_str_.export_status_cancelled);
+        take("export_status_interrupted", ui_str_.export_status_interrupted);
     }
 
     py::dict take_ui_intents()
@@ -1492,9 +1709,33 @@ public:
         d["stream_no_token"] = ui_intents_.stream_no_token;
         d["stream_token"] = ui_intents_.stream_token;
         d["stream_stop"] = ui_intents_.stream_stop; // web-stream server: stop
-        d["export_start"] = ui_intents_.export_start; // offline export: start with source/out
-        d["export_source"] = ui_intents_.export_source;
-        d["export_out"] = ui_intents_.export_out;
+        d["export_enter"] = ui_intents_.export_enter;
+        d["export_exit"] = ui_intents_.export_exit;
+        d["export_add_files"] = ui_intents_.export_add_files;
+        d["export_start"] = ui_intents_.export_start;
+        d["export_pick_global"] = ui_intents_.export_pick_global;
+        d["export_pick_custom"] = ui_intents_.export_pick_custom;
+        d["export_remove"] = ui_intents_.export_remove;
+        d["export_cancel"] = ui_intents_.export_cancel;
+        d["export_move_id"] = ui_intents_.export_move_id;
+        d["export_move_dir"] = ui_intents_.export_move_dir;
+        d["export_item_preset_id"] = ui_intents_.export_item_preset_id;
+        d["export_item_preset_idx"] = ui_intents_.export_item_preset_idx;
+        d["export_item_out_id"] = ui_intents_.export_item_out_id;
+        d["export_item_out_mode"] = ui_intents_.export_item_out_mode;
+        d["export_clip_length"] = ui_intents_.export_clip_length;
+        d["export_preset_save"] = ui_intents_.export_preset_save;
+        d["export_preset_delete"] = ui_intents_.export_preset_delete;
+        d["export_preset_edit_idx"] = ui_intents_.export_preset_edit_idx;
+        d["export_preset_name"] = ui_intents_.export_preset_name;
+        d["export_preset_codec"] = ui_intents_.export_preset_codec;
+        d["export_preset_rate"] = ui_intents_.export_preset_rate;
+        d["export_preset_cq"] = ui_intents_.export_preset_cq;
+        d["export_preset_bitrate"] = ui_intents_.export_preset_bitrate;
+        d["export_preset_quality"] = ui_intents_.export_preset_quality;
+        d["export_preset_audio"] = ui_intents_.export_preset_audio;
+        d["export_preset_subtitle"] = ui_intents_.export_preset_subtitle;
+        d["export_drop_paths"] = ui_intents_.export_drop_paths;
         ui_intents_ = UiIntents{}; // drain
         return d;
     }
@@ -2256,6 +2497,14 @@ private:
     // executor (see take_ui_intents() and scripts/run_player.py).
     void build_ui()
     {
+        // Offline-export full-screen mode: the export screen owns the whole window. Its own
+        // header carries 返回 / preset / start; no normal chrome (top bar / seekbar / settings).
+        if (export_mode_) {
+            build_export_screen();
+            build_export_preset_editor(); // modal above the screen (when open)
+            build_status_float();
+            return;
+        }
         // M-C1 / warmup-UX: no session open yet (or one was just closed) -- the normal
         // bottom bar / seekbar read session-scoped state (frame_count_, seekbar position, ...)
         // that isn't meaningful yet. Two sub-cases: never opened a file at all (full title bar
@@ -2282,7 +2531,6 @@ private:
         }
         build_open_url_popup(); // modal above chrome; first-screen + live session both use it
         build_stream_popup(); // web-stream server modal (port + root + start/stop)
-        build_export_popup(); // offline-export modal (source + output + start)
         build_status_float(); // model-warmup status line -- drawn in every branch above
     }
 
@@ -2335,9 +2583,9 @@ private:
         const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(32.0f);
         const float open_btn_gap = ui_s(8.0f);
         const float gap = ui_s(16.0f);
-        // Single row of three entries: local file (primary blue) + network URL / web-stream
-        // (secondary gray). Offline export is temporarily hidden (Phase 2 entry, not yet exposed).
-        const float open_row_w = open_btn_w * 3.0f + open_btn_gap * 2.0f;
+        // Single row of four entries: local file (primary blue) + network URL / web-stream /
+        // offline export (secondary gray).
+        const float open_row_w = open_btn_w * 4.0f + open_btn_gap * 3.0f;
         const float open_grid_h = open_btn_h;
 
         // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
@@ -2382,6 +2630,8 @@ private:
         if (ImGui::Button(ui_str_.open_url.c_str(), ImVec2(open_btn_w, open_btn_h))) request_open_url_popup();
         ImGui::SameLine(0.0f, open_btn_gap);
         if (ImGui::Button(ui_str_.stream_server.c_str(), ImVec2(open_btn_w, open_btn_h))) request_stream_popup();
+        ImGui::SameLine(0.0f, open_btn_gap);
+        if (ImGui::Button(ui_str_.export_video.c_str(), ImVec2(open_btn_w, open_btn_h))) ui_intents_.export_enter = true;
         pop_secondary_button_style();
 
         if (show_compile) {
@@ -2926,152 +3176,359 @@ private:
         ImGui::PopStyleVar(3);
     }
 
-    // Offline-export modal (Phase 2): source file + output file + 开始导出. Chrome matches the
-    // open-URL modal exactly; writes ui_intents_.export_start{source,out}. The blocking export
-    // runs on a Python thread.
-    void build_export_popup()
+    // ---- offline-export full-screen mode (Phase 2 extension) ------------------------------
+    // The export screen owns the whole window while export_mode_ is set. Python re-pushes the
+    // queue/preset snapshot every tick via set_export_snapshot(); this only renders + records
+    // intents (never mutates Python state directly).
+
+    const char* export_status_label(const std::string& s) const
     {
-        if (export_popup_) { ImGui::OpenPopup("###sumu_export"); export_popup_ = false; }
+        if (s == "running") return ui_str_.export_status_running.c_str();
+        if (s == "done") return ui_str_.export_status_done.c_str();
+        if (s == "failed") return ui_str_.export_status_failed.c_str();
+        if (s == "cancelled") return ui_str_.export_status_cancelled.c_str();
+        if (s == "interrupted") return ui_str_.export_status_interrupted.c_str();
+        return ui_str_.export_status_pending.c_str();
+    }
+
+    static std::string export_preset_summary(const ExportPresetView& p)
+    {
+        std::string s = p.name;
+        s += " · ";
+        s += (p.rate_mode == "vbr") ? p.bitrate : ("CQ " + std::to_string(p.cq));
+        s += " · ";
+        s += p.preset;
+        s += p.codec == "h264" ? " · H.264" : " · HEVC";
+        return s;
+    }
+
+    static int export_quality_idx_of(const std::string& preset)
+    {
+        if (preset.size() >= 2 && preset[0] == 'p') {
+            int n = preset[1] - '0';
+            if (n >= 1 && n <= 7) return n - 1;
+        }
+        return 6;
+    }
+
+    void build_export_screen()
+    {
         ImGuiIO& io = ImGui::GetIO();
-        // See build_stream_popup: table + AlwaysAutoResize settle over a few frames, so center
-        // every frame instead of Appearing-only (which lands once with a stale size).
+        const float bar_h = top_bar_h();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.14f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(12.0f), ui_s(10.0f)));
+        ImGui::Begin("##sumu_export_screen", nullptr, flags);
+
+        const char* t_return = ui_str_.export_return.empty() ? "Back" : ui_str_.export_return.c_str();
+        const char* t_title = ui_str_.export_title.empty() ? "Export" : ui_str_.export_title.c_str();
+        const char* t_presets = ui_str_.export_presets_title.empty() ? "Presets" : ui_str_.export_presets_title.c_str();
+        const char* t_start = ui_str_.export_start.empty() ? "Start" : ui_str_.export_start.c_str();
+
+        // ---- header: 返回 | title | [预设设置] [开始导出] ----
+        {
+            const float btn_h = ui_s(26.0f);
+            const float y = (bar_h - btn_h) * 0.5f;
+            ImGui::SetCursorPosY(y);
+            push_secondary_button_style();
+            if (ImGui::Button(t_return, ImVec2(ui_s(88.0f), btn_h)))
+                ui_intents_.export_exit = true;
+            pop_secondary_button_style();
+            ImGui::SameLine();
+            ImGui::SetCursorPosY((bar_h - ImGui::GetTextLineHeight()) * 0.5f);
+            ImGui::TextUnformatted(t_title);
+
+            const float start_w = ui_s(96.0f), preset_w = ui_s(96.0f);
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(io.DisplaySize.x - ui_s(12.0f) - start_w);
+            ImGui::SetCursorPosY(y);
+            if (ImGui::Button(t_start, ImVec2(start_w, btn_h)))
+                ui_intents_.export_start = true;
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(io.DisplaySize.x - ui_s(12.0f) - start_w - preset_w - spacing);
+            ImGui::SetCursorPosY(y);
+            push_secondary_button_style();
+            if (ImGui::Button(t_presets, ImVec2(preset_w, btn_h)))
+                export_presets_open_ = true;
+            pop_secondary_button_style();
+        }
+        ImGui::Separator();
+
+        const float left_w = ui_s(280.0f);
+        const float gap = ui_s(16.0f);
+
+        // ---- left column: AI 管线设置 + 导出路径 ----
+        ImGui::BeginChild("##export_left", ImVec2(left_w, 0.0f), false);
+        {
+            ImGui::PushFont(nullptr, kFontSizeSm);
+            ImGui::TextUnformatted(ui_str_.export_section_ai.c_str());
+            ImGui::PopFont();
+            ImGui::Spacing();
+            ImGui::TextUnformatted(ui_str_.export_clip_length_label.c_str());
+            if (!export_clip_edit_init_) {
+                export_clip_length_edit_ = export_clip_length_;
+                export_clip_edit_init_ = true;
+            }
+            ImGui::SetNextItemWidth(left_w - ui_s(24.0f));
+            ImGui::SliderInt("##export_clip_length", &export_clip_length_edit_, 30, 180);
+            if (ImGui::IsItemDeactivatedAfterEdit() &&
+                export_clip_length_edit_ != export_clip_length_)
+                ui_intents_.export_clip_length = export_clip_length_edit_;
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+            ImGui::PushFont(nullptr, kFontSizeSm);
+            ImGui::TextUnformatted(ui_str_.export_section_path.c_str());
+            ImGui::PopFont();
+            ImGui::Spacing();
+            ImGui::TextUnformatted(ui_str_.export_global_dir_label.c_str());
+            ImGui::TextWrapped("%s", export_global_dir_.empty() ? "-" : export_global_dir_.c_str());
+            if (ImGui::Button(ui_str_.export_pick_dir.empty() ? "Choose" : ui_str_.export_pick_dir.c_str(),
+                    ImVec2(ui_s(96.0f), 0.0f)))
+                ui_intents_.export_pick_global = true;
+        }
+        ImGui::EndChild();
+        ImGui::SameLine(0.0f, gap);
+
+        // ---- main: 视频队列 ----
+        ImGui::BeginChild("##export_queue", ImVec2(0.0f, 0.0f), false);
+        {
+            ImGui::PushFont(nullptr, kFontSizeSm);
+            ImGui::TextUnformatted(ui_str_.export_section_queue.c_str());
+            ImGui::PopFont();
+            ImGui::SameLine();
+            if (ImGui::Button(ui_str_.export_add_files.empty() ? "Add files" : ui_str_.export_add_files.c_str(),
+                    ImVec2(ui_s(96.0f), 0.0f)))
+                ui_intents_.export_add_files = true;
+            ImGui::Separator();
+
+            if (export_items_.empty()) {
+                ImGui::TextWrapped("%s", ui_str_.export_empty.c_str());
+            }
+
+            std::vector<const char*> preset_names;
+            preset_names.reserve(export_presets_.size());
+            for (const auto& p : export_presets_) preset_names.push_back(p.name.c_str());
+            const char* out_modes[] = {
+                ui_str_.export_out_auto.c_str(),
+                ui_str_.export_out_global.c_str(),
+                ui_str_.export_out_custom.c_str(),
+            };
+
+            for (auto& item : export_items_) {
+                std::string id = std::to_string(item.id);
+                ImGui::PushID(item.id);
+                ImGui::TextUnformatted(export_status_label(item.status));
+                ImGui::SameLine();
+                float avail = ImGui::GetContentRegionAvail().x;
+                const float btns_w = ui_s(4.0f * 26.0f + 3.0f * 4.0f);
+                const float name_w = std::max(ui_s(120.0f), avail - btns_w - ui_s(250.0f));
+                std::string shown = elide_text_to_width(basename_of(item.source), name_w);
+                ImGui::TextUnformatted(shown.c_str());
+                if (!item.source.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", item.source.c_str());
+
+                if (item.status == "running" || item.status == "done") {
+                    float frac = (item.progress >= 0.0f) ? item.progress : -1.0f;
+                    ImGui::ProgressBar(frac, ImVec2(-1.0f, ui_s(6.0f)), "");
+                }
+
+                int preset_idx = item.preset_idx;
+                if (preset_idx < 0 || preset_idx >= (int)preset_names.size()) preset_idx = 0;
+                ImGui::SetNextItemWidth(ui_s(140.0f));
+                if (!preset_names.empty() &&
+                    ImGui::Combo(("##preset_" + id).c_str(), &preset_idx,
+                        preset_names.data(), (int)preset_names.size())) {
+                    ui_intents_.export_item_preset_id = item.id;
+                    ui_intents_.export_item_preset_idx = preset_idx;
+                }
+                ImGui::SameLine();
+                int out_idx = (item.out_mode == "global") ? 1 : (item.out_mode == "custom") ? 2 : 0;
+                ImGui::SetNextItemWidth(ui_s(110.0f));
+                if (ImGui::Combo(("##out_" + id).c_str(), &out_idx, out_modes, 3)) {
+                    ui_intents_.export_item_out_id = item.id;
+                    ui_intents_.export_item_out_mode = out_idx;
+                    if (out_idx == 2)
+                        ui_intents_.export_pick_custom = item.id;
+                }
+                ImGui::SameLine();
+                const ImVec2 item_btn_sz(ui_s(26.0f), 0.0f);
+                if (ImGui::Button(ui_str_.export_up.c_str(), item_btn_sz)) {
+                    ui_intents_.export_move_id = item.id;
+                    ui_intents_.export_move_dir = -1;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(ui_str_.export_down.c_str(), item_btn_sz)) {
+                    ui_intents_.export_move_id = item.id;
+                    ui_intents_.export_move_dir = 1;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(ui_str_.export_remove.c_str(), item_btn_sz))
+                    ui_intents_.export_remove = item.id;
+                ImGui::SameLine();
+                if (item.status == "running" || item.status == "pending") {
+                    if (ImGui::Button(ui_str_.cancel.c_str(), item_btn_sz))
+                        ui_intents_.export_cancel = item.id;
+                }
+                if (!item.out_path.empty()) {
+                    ImGui::TextUnformatted(("  → " + item.out_path).c_str());
+                }
+                if (!item.error.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+                    ImGui::TextWrapped("%s", item.error.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+
+        if (!export_engine_ready_)
+            ImGui::TextUnformatted(ui_str_.export_not_ready.c_str());
+
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
+
+    void build_export_preset_editor()
+    {
+        if (!export_presets_open_) return;
+        ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-
-        const float rounding = ui_s(8.0f);
-        const float border_sz = 1.0f;
-        const ImU32 border_col = IM_COL32(120, 120, 120, 230);
-        const ImVec4 chrome_bg(0.14f, 0.14f, 0.16f, 1.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, rounding);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f);
-        ImGui::PushStyleColor(ImGuiCol_PopupBg, chrome_bg);
-        ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.50f));
-
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.14f, 0.14f, 0.16f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(8.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(14.0f), ui_s(12.0f)));
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoTitleBar;
-        if (!ImGui::BeginPopupModal("###sumu_export", nullptr, flags)) {
-            ImGui::PopStyleColor(2);
-            ImGui::PopStyleVar(3);
+        if (!ImGui::Begin("##sumu_export_presets", nullptr, flags)) {
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor();
             return;
         }
+        const float w = ui_s(420.0f);
+        ImGui::PushItemWidth(w);
 
-        auto draw_popup_border = [&]() {
-            ImVec2 a = ImGui::GetWindowPos();
-            ImVec2 b = ImVec2(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
-            ImGui::GetForegroundDrawList()->AddRect(
-                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
-                border_col, rounding, 0, border_sz);
-        };
+        ImGui::TextUnformatted(ui_str_.export_presets_title.c_str());
+        ImGui::Separator();
 
-        const float bar_h = top_bar_h();
-        const float pad = ui_s(12.0f);
-        const float content_w = ui_s(440.0f);
-        const float win_w = content_w + pad * 2.0f;
-        const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
-        const float icon_th = ui_s(1.5f);
-
-        ImGui::Dummy(ImVec2(win_w, bar_h));
-
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 wpos = ImGui::GetWindowPos();
-        const float strip_w = ImGui::GetWindowSize().x;
-        dl->AddRectFilled(ImVec2(wpos.x + border_sz, wpos.y + border_sz),
-            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
-            IM_COL32(36, 36, 41, 255), std::max(0.0f, rounding - border_sz),
-            ImDrawFlags_RoundCornersTop);
-        dl->AddLine(ImVec2(wpos.x + border_sz, wpos.y + bar_h),
-            ImVec2(wpos.x + strip_w - border_sz, wpos.y + bar_h),
-            IM_COL32(120, 120, 120, 120), 1.0f);
-
-        const char* title = ui_str_.export_title.empty() ? "Export" : ui_str_.export_title.c_str();
-        const float chrome_btn_w = ui_s(28.0f);
-        const float chrome_btn_h = bar_h - ui_s(4.0f);
-        {
-            float th = ImGui::GetTextLineHeight();
-            ImGui::SetCursorPosY((bar_h - th) * 0.5f);
-            ImGui::SetCursorPosX(pad);
-            ImGui::TextUnformatted(title);
-        }
-        ImGui::SetCursorPos(ImVec2(strip_w - chrome_btn_w - ui_s(4.0f), (bar_h - chrome_btn_h) * 0.5f));
-        {
-            IconButtonResult r = icon_button("##export_close", ImVec2(chrome_btn_w, chrome_btn_h));
-            if (r.clicked) ImGui::CloseCurrentPopup();
-            float cx = (r.min.x + r.max.x) * 0.5f;
-            float cy = (r.min.y + r.max.y) * 0.5f;
-            const float half = ui_s(5.0f);
-            r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
-        }
-
-        ImGui::SetCursorPosY(bar_h + pad);
-        ImGui::Indent(pad);
-        ImGui::PushItemWidth(content_w);
-
-        const float label_w = ui_s(120.0f);
-        const float field_w = content_w - label_w;
-        const float pick_w = ui_s(96.0f);
-
-        // Manual label-left / input-right rows (no table) so every row's right edge lands at
-        // pad + content_w with the same pad margin as the left indent.
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(ui_str_.export_source_label.empty() ? "Source" : ui_str_.export_source_label.c_str());
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(pad + label_w);
-        ImGui::SetNextItemWidth(field_w - pick_w - ImGui::GetStyle().ItemSpacing.x);
-        ImGui::InputText("##export_source", export_source_buf_, sizeof(export_source_buf_));
-        ImGui::SameLine();
-        if (ImGui::Button(ui_str_.export_pick.empty() ? "Browse" : ui_str_.export_pick.c_str(),
-                ImVec2(pick_w, 0.0f))) {
-            std::string f = pick_open_file();
-            if (!f.empty()) {
-                size_t n = std::min(f.size(), sizeof(export_source_buf_) - 1);
-                std::memcpy(export_source_buf_, f.c_str(), n);
-                export_source_buf_[n] = '\0';
-                std::string out = f + ".decensored.mp4"; // default output next to source
-                n = std::min(out.size(), sizeof(export_out_buf_) - 1);
-                std::memcpy(export_out_buf_, out.c_str(), n);
-                export_out_buf_[n] = '\0';
+        if (export_preset_edit_idx_ == -1) {
+            // ---- manager: preset cards (click to edit) + delete/new/close ----
+            for (int i = 0; i < (int)export_presets_.size(); ++i) {
+                const auto& p = export_presets_[i];
+                ImGui::PushID(i);
+                std::string summary = export_preset_summary(p);
+                const float del_w = ui_s(48.0f);
+                if (ImGui::Button(summary.c_str(),
+                        ImVec2(w - del_w - ImGui::GetStyle().ItemSpacing.x, 0.0f)))
+                    open_export_preset_editor(i); // card = edit its params
+                ImGui::SameLine();
+                push_secondary_button_style();
+                if (ImGui::Button(ui_str_.export_preset_delete.c_str(), ImVec2(del_w, 0.0f))) {
+                    ui_intents_.export_preset_delete = true;
+                    ui_intents_.export_preset_edit_idx = i;
+                }
+                pop_secondary_button_style();
+                ImGui::PopID();
             }
+            ImGui::Separator();
+            if (ImGui::Button(ui_str_.export_preset_new.c_str(), ImVec2(w, 0.0f)))
+                open_export_preset_editor(-2);
+            ImGui::Spacing();
+            push_secondary_button_style();
+            if (ImGui::Button(ui_str_.cancel.c_str(), ImVec2(w, 0.0f)))
+                export_presets_open_ = false;
+            pop_secondary_button_style();
+        } else {
+            // ---- editor: staged fields, seeded once per open ----
+            if (!export_preset_edit_init_) {
+                const ExportPresetView* src = nullptr;
+                if (export_preset_edit_idx_ >= 0 && export_preset_edit_idx_ < (int)export_presets_.size())
+                    src = &export_presets_[export_preset_edit_idx_];
+                if (src) {
+                    snprintf(export_preset_name_buf_, sizeof(export_preset_name_buf_), "%s", src->name.c_str());
+                    export_preset_codec_idx_ = (src->codec == "h264") ? 1 : 0;
+                    export_preset_rate_idx_ = (src->rate_mode == "vbr") ? 1 : 0;
+                    export_preset_cq_ = src->cq;
+                    snprintf(export_preset_bitrate_buf_, sizeof(export_preset_bitrate_buf_), "%s", src->bitrate.c_str());
+                    export_preset_quality_idx_ = export_quality_idx_of(src->preset);
+                    export_preset_audio_ = src->audio_copy;
+                    export_preset_subtitle_ = src->subtitle;
+                } else {
+                    export_preset_name_buf_[0] = '\0';
+                    export_preset_codec_idx_ = 0;
+                    export_preset_rate_idx_ = 0;
+                    export_preset_cq_ = 33;
+                    export_preset_bitrate_buf_[0] = '\0';
+                    export_preset_quality_idx_ = 6;
+                    export_preset_audio_ = true;
+                    export_preset_subtitle_ = true;
+                }
+                export_preset_edit_init_ = true;
+            }
+
+            ImGui::TextUnformatted(ui_str_.export_preset_name_label.c_str());
+            ImGui::InputText("##ep_name", export_preset_name_buf_, sizeof(export_preset_name_buf_));
+            const char* codec_items[] = { "HEVC", "H.264" };
+            ImGui::TextUnformatted(ui_str_.export_preset_codec_label.c_str());
+            ImGui::Combo("##ep_codec", &export_preset_codec_idx_, codec_items, 2);
+            const char* rate_items[] = { "CQ", "VBR" };
+            ImGui::TextUnformatted(ui_str_.export_preset_rate_label.c_str());
+            ImGui::Combo("##ep_rate", &export_preset_rate_idx_, rate_items, 2);
+            if (export_preset_rate_idx_ == 0) {
+                ImGui::TextUnformatted(ui_str_.export_preset_cq_label.c_str());
+                ImGui::SliderInt("##ep_cq", &export_preset_cq_, 0, 51);
+            } else {
+                ImGui::TextUnformatted(ui_str_.export_preset_bitrate_label.c_str());
+                ImGui::InputText("##ep_bitrate", export_preset_bitrate_buf_, sizeof(export_preset_bitrate_buf_));
+            }
+            const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7" };
+            ImGui::TextUnformatted(ui_str_.export_preset_quality_label.c_str());
+            ImGui::Combo("##ep_quality", &export_preset_quality_idx_, quality_items, 7);
+            ImGui::Checkbox(ui_str_.export_preset_audio_label.c_str(), &export_preset_audio_);
+            ImGui::Checkbox(ui_str_.export_preset_subtitle_label.c_str(), &export_preset_subtitle_);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            if (ImGui::Button(ui_str_.export_preset_save.c_str(), ImVec2(w, 0.0f))) {
+                ui_intents_.export_preset_save = true;
+                ui_intents_.export_preset_edit_idx = export_preset_edit_idx_;
+                ui_intents_.export_preset_name = export_preset_name_buf_;
+                ui_intents_.export_preset_codec = export_preset_codec_idx_;
+                ui_intents_.export_preset_rate = export_preset_rate_idx_;
+                ui_intents_.export_preset_cq = export_preset_cq_;
+                ui_intents_.export_preset_bitrate = export_preset_bitrate_buf_;
+                ui_intents_.export_preset_quality = export_preset_quality_idx_;
+                ui_intents_.export_preset_audio = export_preset_audio_;
+                ui_intents_.export_preset_subtitle = export_preset_subtitle_;
+                export_preset_edit_idx_ = -1;
+            }
+            ImGui::SameLine();
+            push_secondary_button_style();
+            if (ImGui::Button(ui_str_.cancel.c_str(), ImVec2(w, 0.0f)))
+                export_preset_edit_idx_ = -1;
+            pop_secondary_button_style();
         }
 
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(ui_str_.export_out_label.empty() ? "Output" : ui_str_.export_out_label.c_str());
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(pad + label_w);
-        ImGui::SetNextItemWidth(field_w);
-        ImGui::InputText("##export_out", export_out_buf_, sizeof(export_out_buf_));
-
-        ImGui::Spacing();
-        ImGui::Spacing();
-        const float btn_w = ui_s(100.0f);
-        const float btn_h = ui_s(28.0f);
-        const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
-        ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
-
-        if (ImGui::Button(ui_str_.export_start.empty() ? "Export" : ui_str_.export_start.c_str(),
-                ImVec2(btn_w, btn_h))) {
-            ui_intents_.export_start = true;
-            ui_intents_.export_source = export_source_buf_;
-            ui_intents_.export_out = export_out_buf_;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        push_secondary_button_style();
-        if (ImGui::Button(ui_str_.cancel.empty() ? "Cancel" : ui_str_.cancel.c_str(),
-                ImVec2(btn_w, btn_h)))
-            ImGui::CloseCurrentPopup();
-        pop_secondary_button_style();
-
-        ImGui::Dummy(ImVec2(content_w, pad));
         ImGui::PopItemWidth();
-        ImGui::Unindent(pad);
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+    }
 
-        draw_popup_border();
-        ImGui::EndPopup();
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(3);
+    void open_export_preset_editor(int idx)
+    {
+        export_preset_edit_idx_ = idx;
+        export_preset_edit_init_ = false; // seed buffers on the next frame
     }
 
     // Model-warmup status line (left-bottom float): built every build_ui() call (see its header
@@ -3239,6 +3696,19 @@ private:
             r.dl->AddCircle(ImVec2(cx, cy), rr, icon_col, 24, icon_th);
             r.dl->AddLine(ImVec2(cx - rr, cy), ImVec2(cx + rr, cy), icon_col, icon_th);
             r.dl->AddLine(ImVec2(cx, cy - rr), ImVec2(cx, cy + rr), icon_col, icon_th);
+        }
+        ImGui::SameLine();
+        { // Offline export (Phase 2 extension): download-into-tray glyph -> export_enter intent.
+            IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h));
+            if (r.clicked) ui_intents_.export_enter = true;
+            if (ImGui::IsItemHovered() && !ui_str_.export_video.empty())
+                ImGui::SetTooltip("%s", ui_str_.export_video.c_str());
+            float cx = (r.min.x + r.max.x) * 0.5f;
+            float cy = (r.min.y + r.max.y) * 0.5f;
+            r.dl->AddLine(ImVec2(cx, cy - ui_s(5.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - ui_s(3.0f), cy), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx + ui_s(3.0f), cy), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
+            r.dl->AddLine(ImVec2(cx - ui_s(6.0f), cy + ui_s(5.0f)), ImVec2(cx + ui_s(6.0f), cy + ui_s(5.0f)), icon_col, icon_th);
         }
         ImGui::SameLine();
         {
@@ -5275,6 +5745,42 @@ private:
         std::string export_pick;
         std::string export_start;
         std::string cancel;
+        std::string export_return;
+        std::string export_section_ai;
+        std::string export_clip_length_label;
+        std::string export_section_path;
+        std::string export_global_dir_label;
+        std::string export_pick_dir;
+        std::string export_section_queue;
+        std::string export_add_files;
+        std::string export_preset;
+        std::string export_output;
+        std::string export_out_auto;
+        std::string export_out_global;
+        std::string export_out_custom;
+        std::string export_remove;
+        std::string export_up;
+        std::string export_down;
+        std::string export_empty;
+        std::string export_not_ready;
+        std::string export_presets_title;
+        std::string export_preset_new;
+        std::string export_preset_delete;
+        std::string export_preset_name_label;
+        std::string export_preset_codec_label;
+        std::string export_preset_rate_label;
+        std::string export_preset_cq_label;
+        std::string export_preset_bitrate_label;
+        std::string export_preset_quality_label;
+        std::string export_preset_audio_label;
+        std::string export_preset_subtitle_label;
+        std::string export_preset_save;
+        std::string export_status_pending;
+        std::string export_status_running;
+        std::string export_status_done;
+        std::string export_status_failed;
+        std::string export_status_cancelled;
+        std::string export_status_interrupted;
     } ui_str_;
     // Open-URL modal (ImGui popup). Main-thread only, same discipline as ui_settings_open_.
     // Confirm writes a trimmed http(s) URL into ui_intents_.open_path (Python reuses the drop path)
@@ -5294,9 +5800,30 @@ private:
     char stream_token_buf_[256] = {};        // explicit token; empty = server generates a random one
     bool stream_running_ = false;           // Python flips this (start/stop) for the 停止/启动 toggle
     std::string stream_url_;                // access URL while running (shown as a clickable link)
-    bool export_popup_ = false;
-    char export_source_buf_[2048] = {};
-    char export_out_buf_[2048] = {};
+    // Offline-export full-screen mode (Phase 2 extension). export_mode_ is driven by Python
+    // (set_export_mode) after it tears down playback/streaming; the screen is the only UI while
+    // set. Views are re-pushed each tick by set_export_snapshot().
+    bool export_mode_ = false;
+    bool export_engine_ready_ = false;
+    bool export_running_ = false;
+    bool export_presets_open_ = false;   // preset manager/editor modal
+    int export_clip_length_ = 120;       // committed value (pushed by Python each tick)
+    int export_clip_length_edit_ = 120;  // local slider value (seeded once per entry)
+    bool export_clip_edit_init_ = false;
+    std::string export_global_dir_;
+    std::vector<ExportPresetView> export_presets_;
+    std::vector<ExportItemView> export_items_;
+    // Preset editor modal state (staged locally, seeded once per open like settings_edit_*).
+    int export_preset_edit_idx_ = -1;   // -1 closed / -2 new / >=0 edit
+    bool export_preset_edit_init_ = false;
+    char export_preset_name_buf_[256] = {};
+    int export_preset_codec_idx_ = 0;   // 0 hevc / 1 h264
+    int export_preset_rate_idx_ = 0;    // 0 cq / 1 vbr
+    int export_preset_cq_ = 33;
+    char export_preset_bitrate_buf_[32] = {};
+    int export_preset_quality_idx_ = 6; // 0..6 -> p1..p7
+    bool export_preset_audio_ = true;
+    bool export_preset_subtitle_ = true;
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.
@@ -5715,22 +6242,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_DROPFILES: {
-        // M-C2: file dropped on the window -- record its path as an open intent (drained by
-        // Python's take_ui_intents(), same channel/discipline as record_seek() etc., see
-        // UiIntents' header comment). Only the FIRST dropped file is used (DragQueryFileW index
-        // 0); multi-file drop is out of scope here.
+        // M-C2: file(s) dropped on the window. In export mode every dropped file is queued for
+        // export (multi-file); otherwise the first file is opened (multi-file open out of scope).
         HDROP hdrop = reinterpret_cast<HDROP>(wp);
         if (self) {
-            wchar_t wide_path[MAX_PATH] = {};
-            if (DragQueryFileW(hdrop, 0, wide_path, ARRAYSIZE(wide_path)) > 0) {
+            int nfiles = static_cast<int>(DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0));
+            for (int i = 0; i < nfiles; ++i) {
+                wchar_t wide_path[MAX_PATH] = {};
+                if (DragQueryFileW(hdrop, i, wide_path, ARRAYSIZE(wide_path)) <= 0) continue;
                 // Same WideCharToMultiByte(CP_UTF8) conversion as pick_open_file() -- guards
                 // against a CJK path silently mis-encoding through the process's ANSI codepage.
                 int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, nullptr, 0, nullptr, nullptr);
-                if (utf8_len > 0) {
-                    std::string utf8_path(static_cast<size_t>(utf8_len - 1), '\0');
-                    WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, utf8_path.data(), utf8_len, nullptr, nullptr);
-                    self->record_open_path(utf8_path);
-                }
+                if (utf8_len <= 0) continue;
+                std::string utf8_path(static_cast<size_t>(utf8_len - 1), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wide_path, -1, utf8_path.data(), utf8_len, nullptr, nullptr);
+                if (self->export_mode()) self->record_export_drop(utf8_path);
+                else if (i == 0) self->record_open_path(utf8_path);
             }
         }
         DragFinish(hdrop);
@@ -5757,6 +6284,13 @@ PYBIND11_MODULE(sumu_core, m)
             py::arg("running"), py::arg("url") = std::string("")) // 停止/启动 toggle + access URL
         .def("set_stream_defaults", &Player::set_stream_defaults, py::arg("port"), py::arg("root"),
             py::arg("no_token"), py::arg("token"))
+        // Offline-export full-screen mode (Phase 2 extension).
+        .def("set_export_mode", &Player::set_export_mode, py::arg("on"))
+        .def("set_export_snapshot", &Player::set_export_snapshot, py::arg("snapshot"))
+        .def("pick_save_file", &Player::pick_save_file,
+            py::arg("default_name") = std::string(""))
+        .def("close_current_session", &Player::close_current_session,
+            py::call_guard<py::gil_scoped_release>())
         // gil_scoped_release: network open/reopen can block tens of seconds; Python's main loop
         // (and async open worker) must keep pumping UI. CUDA context is rebound inside open_session.
         .def("open", &Player::open, py::arg("path"),

@@ -49,6 +49,33 @@ COLD_START_S_DEFAULT = 1.0
 STREAM_PORT_DEFAULT = 8080
 STREAM_PORT_MIN, STREAM_PORT_MAX = 1024, 65535
 
+# Offline-export defaults (Phase 2 export extension). Quality-first: clip_length is longer than
+# the live player's 30 (more temporal context for BasicVSR++ stability), bounded by the TRT
+# engine's 180-frame max. Per-frame region cap is dropped entirely (unlimited), not exposed.
+EXPORT_CLIP_LENGTH_DEFAULT = 120
+EXPORT_CLIP_LENGTH_MIN, EXPORT_CLIP_LENGTH_MAX = 30, 180
+EXPORT_PRESET_DEFAULT_INDEX = 2  # "均衡" (CQ 33) -- the user's most flexible/common default
+
+# Shipped encode presets (plain JSON-serializable dicts; webstream.encoder.EncodeOptions is the
+# runtime form). Every preset is HEVC + p7 (max quality) + audio copy + subtitle, since even the
+# slowest/best encode is far cheaper than the AI decensor pipeline.
+EXPORT_PRESET_DEFAULTS: list[dict] = [
+    {"name": "近无损", "codec": "hevc", "rate_mode": "cq", "cq": 18, "bitrate": "",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "高画质", "codec": "hevc", "rate_mode": "cq", "cq": 30, "bitrate": "",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "均衡", "codec": "hevc", "rate_mode": "cq", "cq": 33, "bitrate": "",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "压缩", "codec": "hevc", "rate_mode": "cq", "cq": 40, "bitrate": "",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "高码率 30M", "codec": "hevc", "rate_mode": "vbr", "cq": 0, "bitrate": "30M",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "中码率 6M", "codec": "hevc", "rate_mode": "vbr", "cq": 0, "bitrate": "6M",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "低码率 1.3M", "codec": "hevc", "rate_mode": "vbr", "cq": 0, "bitrate": "1250k",
+     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+]
+
 
 def default_path() -> Path:
     """%APPDATA%/sumu/settings.json on Windows; ~/.sumu/settings.json if APPDATA is unset
@@ -126,6 +153,12 @@ class Settings:
     # colour-correct + seekable + stop-on-idle). AI 去码 is the default; flip this back to True
     # (or the native UI toggle) to use the passthrough fallback.
     stream_passthrough: bool = False
+    # Offline export (Phase 2 extension): quality-first clip length + global output dir +
+    # user-editable presets + persisted queue (pending/interrupted items, no auto-resume).
+    export_clip_length: int = EXPORT_CLIP_LENGTH_DEFAULT
+    export_global_dir: str = ""
+    export_presets: list[dict] = field(default_factory=lambda: [dict(p) for p in EXPORT_PRESET_DEFAULTS])
+    export_queue: list[dict] = field(default_factory=list)
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
@@ -222,6 +255,62 @@ def clamp_stream_port(value) -> int:
     except (TypeError, ValueError):
         return STREAM_PORT_DEFAULT
     return max(STREAM_PORT_MIN, min(STREAM_PORT_MAX, v))
+
+
+def clamp_export_clip_length(value) -> int:
+    """Export AI-pipeline clip length: 30–180; non-numeric → quality-first default (120)."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return EXPORT_CLIP_LENGTH_DEFAULT
+    return max(EXPORT_CLIP_LENGTH_MIN, min(EXPORT_CLIP_LENGTH_MAX, v))
+
+
+def _coerce_export_preset(p: dict) -> dict:
+    codec = "h264" if p.get("codec") == "h264" else "hevc"
+    rate_mode = "vbr" if p.get("rate_mode") == "vbr" else "cq"
+    return {
+        "name": str(p.get("name") or "预设"),
+        "codec": codec,
+        "rate_mode": rate_mode,
+        "cq": int(p.get("cq") or 0),
+        "bitrate": str(p.get("bitrate") or "8M"),
+        "preset": str(p.get("preset") or "p7"),
+        "audio_copy": bool(p.get("audio_copy", True)),
+        "audio_bitrate": str(p.get("audio_bitrate") or "320k"),
+        "subtitle": bool(p.get("subtitle", True)),
+    }
+
+
+def clamp_export_presets(value) -> list[dict]:
+    """Coerce a persisted preset list: drop junk, fill missing fields, guarantee at least one
+    preset (the built-ins) so the export screen always has something to select."""
+    out: list[dict] = []
+    if isinstance(value, list):
+        for p in value:
+            if isinstance(p, dict):
+                out.append(_coerce_export_preset(p))
+    if not out:
+        out = [dict(p) for p in EXPORT_PRESET_DEFAULTS]
+    return out
+
+
+def clamp_export_queue(value) -> list[dict]:
+    """Coerce a persisted export queue to pending/interrupted items only (done/failed dropped)."""
+    if not isinstance(value, list):
+        return []
+    out: list[dict] = []
+    for it in value:
+        if not isinstance(it, dict) or not isinstance(it.get("source"), str) or not it["source"]:
+            continue
+        out.append({
+            "source": it["source"],
+            "out_path": it.get("out_path") if isinstance(it.get("out_path"), str) else "",
+            "out_mode": it.get("out_mode") if it.get("out_mode") in ("auto", "global", "custom") else "auto",
+            "preset_idx": int(it.get("preset_idx") or 0),
+            "status": "interrupted" if it.get("status") == "interrupted" else "pending",
+        })
+    return out
 
 
 def fps_div_for_target(source_fps: float, target_fps: int) -> int:
@@ -323,6 +412,10 @@ def load(path: Optional[str | Path] = None) -> Settings:
             stream_token=data.get("stream_token", "") if isinstance(data.get("stream_token"), str) else "",
             stream_no_token=_coerce_bool(data.get("stream_no_token"), False),
             stream_passthrough=_coerce_bool(data.get("stream_passthrough"), False),
+            export_clip_length=clamp_export_clip_length(data.get("export_clip_length", EXPORT_CLIP_LENGTH_DEFAULT)),
+            export_global_dir=data.get("export_global_dir", "") if isinstance(data.get("export_global_dir"), str) else "",
+            export_presets=clamp_export_presets(data.get("export_presets")),
+            export_queue=clamp_export_queue(data.get("export_queue")),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -354,6 +447,10 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "stream_token": settings.stream_token,
             "stream_no_token": bool(settings.stream_no_token),
             "stream_passthrough": bool(settings.stream_passthrough),
+            "export_clip_length": clamp_export_clip_length(settings.export_clip_length),
+            "export_global_dir": settings.export_global_dir,
+            "export_presets": clamp_export_presets(settings.export_presets),
+            "export_queue": clamp_export_queue(settings.export_queue),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

@@ -31,6 +31,10 @@ from sumu.pipeline import build_models, default_restoration_model_path  # noqa: 
 from sumu import settings as settings_mod  # noqa: E402 -- M-E: persisted volume/mute/recent/resume
 from sumu import i18n as i18n_mod  # noqa: E402
 
+# Offline-export quality-first pipeline: no per-frame region cap (the live player's cap is a perf
+# knob; export wants every detected mosaic restored, so use a sentinel effectively == unlimited).
+_EXPORT_MAX_REGIONS = 1024
+
 
 class _WarmupState:
     """Cross-thread handoff for the background model-warmup thread below -- guarded by `lock`
@@ -274,10 +278,12 @@ def main():
     scheduler = None
     det_model = res_model = pad_mode = None
     # Web-stream / offline-export feature state (Phase 2). transcode_engine is built lazily once
-    # the models are warm; stream_server/export_job are the live background feature sessions.
+    # the models are warm; stream_server is the live background server; export is an exclusive
+    # full-screen mode driven by a sequential ExportQueue.
     transcode_engine = None
     stream_server = None
-    export_job = None
+    export_mode = False
+    export_queue = None   # webstream.ExportQueue, built lazily once the engine is warm
 
     def _on_mode_change(passthrough):
         """Persist a web-UI 直出/AI 去码 switch (called from the server's HTTP thread; settings
@@ -312,6 +318,125 @@ def main():
             return True, None
         except Exception as e:  # noqa: BLE001 -- start failure must not kill the main loop
             return False, i18n_mod.t("stream_start_failed", error=str(e))
+
+    # ---- offline-export (Phase 2 extension) ------------------------------------------
+
+    def _export_runner(item):
+        """Run one export-queue item to MP4 with the quality-first pipeline (longer clip_length,
+        unlimited regions, HEVC/CQ/p7 + always-on quality flags). Runs on the queue worker thread."""
+        from sumu.webstream.encoder import EncodeOptions
+        presets = settings.export_presets
+        pidx = item.preset_idx if 0 <= item.preset_idx < len(presets) else 0
+        encode = EncodeOptions.from_dict(presets[pidx])
+        cfg = warm_sched_cfg_cls(
+            clip_length=settings_mod.clamp_export_clip_length(settings.export_clip_length),
+            max_regions_per_frame=_EXPORT_MAX_REGIONS,
+        )
+
+        def _cb(fnum, total):
+            item.frames = fnum + 1
+            item.total = total or 0
+
+        transcode_engine.run(item.source, item.out_path, "mp4", encode=encode,
+                             quality_first=True, config=cfg, progress_cb=_cb)
+
+    def _enter_export_mode():
+        nonlocal export_mode, opened, current_path, scheduler, stream_server
+        if export_mode:
+            return
+        # Exclusive mode: stop the web-stream server and close the playback session (position
+        # persisted) so the export owns the GPU.
+        if stream_server is not None:
+            try:
+                stream_server.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            stream_server = None
+            player.set_stream_running(False)
+        if opened:
+            try:
+                settings.set_position(current_path, player.current_frame())
+            except Exception:  # noqa: BLE001
+                pass
+            if scheduler is not None:
+                scheduler.stop()
+                scheduler = None
+            try:
+                player.close_current_session()
+            except Exception:  # noqa: BLE001
+                pass
+            opened = False
+            current_path = None
+        export_mode = True
+        player.set_export_mode(True)
+
+    def _exit_export_mode():
+        nonlocal export_mode
+        if not export_mode:
+            return
+        export_mode = False
+        player.set_export_mode(False)
+        if export_queue is not None:
+            settings.export_queue = export_queue.to_persist()
+            settings_mod.save(settings)
+
+    def _export_find_item(item_id):
+        if export_queue is None:
+            return None
+        for it in export_queue.items:
+            if it.id == item_id:
+                return it
+        return None
+
+    def _export_set_item_preset(item_id, preset_idx):
+        it = _export_find_item(item_id)
+        if it is not None and 0 <= preset_idx < len(settings.export_presets):
+            it.preset_idx = preset_idx
+
+    def _export_set_item_outmode(item_id, mode):
+        from sumu.webstream.export import default_out_path
+        it = _export_find_item(item_id)
+        if it is None:
+            return
+        it.out_mode = ("auto", "global", "custom")[max(0, min(2, mode))]
+        if it.out_mode == "global":
+            it.out_path = default_out_path(it.source, settings.export_global_dir)
+        elif it.out_mode == "auto":
+            it.out_path = default_out_path(it.source, "")
+
+    def _export_save_preset(ints):
+        codec = "h264" if ints.get("export_preset_codec") == 1 else "hevc"
+        rate = "vbr" if ints.get("export_preset_rate") == 1 else "cq"
+        q = max(0, min(6, int(ints.get("export_preset_quality") or 6)))
+        preset = {
+            "name": (ints.get("export_preset_name") or "").strip() or "预设",
+            "codec": codec,
+            "rate_mode": rate,
+            "cq": int(ints.get("export_preset_cq") or 0),
+            "bitrate": (ints.get("export_preset_bitrate") or "").strip() or "8M",
+            "preset": f"p{q + 1}",
+            "audio_copy": bool(ints.get("export_preset_audio")),
+            "audio_bitrate": "320k",
+            "subtitle": bool(ints.get("export_preset_subtitle")),
+        }
+        idx = int(ints.get("export_preset_edit_idx") or -2)
+        if 0 <= idx < len(settings.export_presets):
+            settings.export_presets[idx] = preset
+        else:
+            settings.export_presets.append(preset)
+        settings_mod.save(settings)
+
+    def _export_delete_preset(idx):
+        presets = settings.export_presets
+        if 0 <= idx < len(presets) and len(presets) > 1:
+            del presets[idx]
+            if export_queue is not None:
+                for it in export_queue.items:
+                    if it.preset_idx == idx:
+                        it.preset_idx = 0          # pointed at the deleted preset -> default
+                    elif it.preset_idx > idx:
+                        it.preset_idx -= 1         # keep pointing at the same (shifted) preset
+            settings_mod.save(settings)
 
     def apply_target_fps_for_open():
         """Map global target_fps + this file's source_fps → native fps_div (1..4)."""
@@ -511,24 +636,6 @@ def main():
                 status_text = ""
             else:
                 status_text = i18n_mod.t("warmup_status")
-
-            # Feature status (offline export) overrides the generic status when active. The
-            # web-stream server deliberately has NO status float here -- its running URL is shown
-            # (and clickable) inside the server popup instead.
-            feature_status_text = ""
-            if export_job is not None:
-                st = export_job.status()
-                if st["done"]:
-                    feature_status_text = i18n_mod.t(
-                        "export_done" if not st["error"] else "export_failed",
-                        path=st["out_path"], error=st["error"] or "")
-                    export_job = None
-                else:
-                    p = st["progress"]
-                    feature_status_text = i18n_mod.t(
-                        "export_running", progress=int(p * 100) if p is not None else "?")
-            if feature_status_text:
-                status_text = feature_status_text
 
             player.set_status_text(status_text)
 
@@ -758,6 +865,11 @@ def main():
                 # web-UI switch to AI 去码 works from here on.
                 if stream_server is not None:
                     stream_server.set_engine(transcode_engine)
+                # Build the export queue once the engine exists; restore any persisted queue.
+                if export_queue is None:
+                    from sumu.webstream import ExportQueue
+                    export_queue = ExportQueue(transcode_engine, _export_runner)
+                    export_queue.load_persisted(settings.export_queue, len(settings.export_presets))
 
             if intents["stream_stop"]:
                 if stream_server is not None:
@@ -784,17 +896,57 @@ def main():
                     if err:
                         status_text = err
 
-            if intents["export_start"]:
-                source = (intents["export_source"] or "").strip()
-                out = (intents["export_out"] or "").strip()
-                if transcode_engine is None:
-                    status_text = i18n_mod.t("warmup_status")
-                elif not source or not out:
-                    status_text = i18n_mod.t("export_failed", error="source/output")
-                else:
-                    from sumu.webstream import ExportJob
-                    export_job = ExportJob(transcode_engine, source, out)
-                    export_job.start()
+            # ---- offline-export intents (Phase 2 extension) ----
+            if intents.get("export_enter"):
+                _enter_export_mode()
+            elif intents.get("export_exit"):
+                _exit_export_mode()
+
+            if export_mode and export_queue is not None:
+                for path in (intents.get("export_drop_paths") or []):
+                    export_queue.add(path, settings_mod.EXPORT_PRESET_DEFAULT_INDEX)
+                if intents.get("export_add_files"):
+                    path = player.pick_open_file()
+                    if path:
+                        export_queue.add(path, settings_mod.EXPORT_PRESET_DEFAULT_INDEX)
+                if intents.get("export_start"):
+                    export_queue.start()
+                rid = intents.get("export_remove")
+                if isinstance(rid, int) and rid >= 0:
+                    export_queue.remove(rid)
+                cid = intents.get("export_cancel")
+                if isinstance(cid, int) and cid >= 0:
+                    export_queue.cancel(cid)
+                mid = intents.get("export_move_id")
+                if isinstance(mid, int) and mid >= 0:
+                    export_queue.move(mid, int(intents.get("export_move_dir") or 0))
+                pid = intents.get("export_item_preset_id")
+                if isinstance(pid, int) and pid >= 0:
+                    _export_set_item_preset(pid, int(intents.get("export_item_preset_idx") or 0))
+                oid = intents.get("export_item_out_id")
+                if isinstance(oid, int) and oid >= 0:
+                    _export_set_item_outmode(oid, int(intents.get("export_item_out_mode") or 0))
+                if intents.get("export_pick_global"):
+                    d = player.pick_folder()
+                    if d:
+                        settings.export_global_dir = d
+                        settings_mod.save(settings)
+                pcid = intents.get("export_pick_custom")
+                if isinstance(pcid, int) and pcid >= 0:
+                    it = _export_find_item(pcid)
+                    if it is not None:
+                        p = player.pick_save_file(os.path.basename(it.source))
+                        if p:
+                            it.out_path = p
+                            it.out_mode = "custom"
+                cl = intents.get("export_clip_length")
+                if isinstance(cl, int) and cl > 0:
+                    settings.export_clip_length = settings_mod.clamp_export_clip_length(cl)
+                    settings_mod.save(settings)
+                if intents.get("export_preset_delete"):
+                    _export_delete_preset(int(intents.get("export_preset_edit_idx") or -1))
+                elif intents.get("export_preset_save"):
+                    _export_save_preset(intents)
 
 
             # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
@@ -870,6 +1022,20 @@ def main():
                 # settings.positions still records last frame (do_reopen/finally) for a future
                 # manual "continue watching" path; is_resumable_frame stays available for that.
 
+            # Push the export screen snapshot (only while the export screen is up), and persist the
+            # queue whenever its serialized form changes (pending/interrupted items).
+            if export_mode and export_queue is not None:
+                snap = export_queue.snapshot()
+                snap["clip_length"] = settings.export_clip_length
+                snap["global_dir"] = settings.export_global_dir
+                snap["presets"] = settings.export_presets
+                snap["engine_ready"] = transcode_engine is not None
+                player.set_export_snapshot(snap)
+                persist = export_queue.to_persist()
+                if persist != settings.export_queue:
+                    settings.export_queue = persist
+                    settings_mod.save(settings)
+
             # 50Hz main loop. NOT 0.008 (125Hz): measured regression (see run_player.py:236 /
             # docs/native_core.md) -- a 125Hz loop starves the present thread, breaking present
             # cadence. Keep 0.02.
@@ -893,6 +1059,6 @@ def main():
             except Exception:  # noqa: BLE001
                 pass
             stream_server = None
-        if export_job is not None:
-            export_job.cancel()
+        if export_queue is not None:
+            export_queue.cancel_all()
         player.close()

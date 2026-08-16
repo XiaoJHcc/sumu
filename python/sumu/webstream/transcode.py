@@ -19,7 +19,7 @@ from fractions import Fraction
 import sumu_core
 
 from .decensor import DecensorProcessor
-from .encoder import NvencEncoder
+from .encoder import EncodeOptions, NvencEncoder
 
 
 class TranscodeError(RuntimeError):
@@ -55,6 +55,7 @@ class TranscodeEngine:
         return self._cancel.is_set()
 
     def run(self, source: str, out: str, mode: str, *, bitrate: str = "8M",
+            encode=None, quality_first: bool = False, config=None,
             video_meta=None, audio_source: str | None = None,
             progress_cb=None, start_seconds: float = 0.0) -> int:
         """Transcode `source` (local path or http(s) URL) to HLS (`mode="hls"`, dir `out`) or
@@ -64,17 +65,28 @@ class TranscodeEngine:
         `start_seconds` re-anchors decode at that offset (I6 reposition: HeadlessDecode
         seek_to_frame) before transcoding to EOF -- the AI streaming server uses this for seek.
 
+        `encode` is an EncodeOptions (offline export passes HEVC/CQ/p7 quality-first; None falls
+        back to the live-streaming h264 profile built from `bitrate`). `quality_first` appends the
+        always-on export quality flags (tune hq / AQ / B-frame refs / full lookahead). `config`
+        overrides the engine's scheduler config for this run (export uses a longer clip_length +
+        unlimited per-frame regions).
+
         Non-reentrant (see _run_lock): the second concurrent caller blocks here until the first
         run finishes, instead of corrupting shared model/cancel state."""
+        if encode is None:
+            encode = EncodeOptions(codec="h264", rate_mode="vbr", bitrate=bitrate,
+                                   preset="p4", audio_copy=False, subtitle=False)
         with self._run_lock:
-            return self._run_locked(source, out, mode, bitrate=bitrate,
+            return self._run_locked(source, out, mode, encode=encode,
+                                    quality_first=quality_first, config=config,
                                     video_meta=video_meta, audio_source=audio_source,
                                     progress_cb=progress_cb, start_seconds=start_seconds)
 
-    def _run_locked(self, source: str, out: str, mode: str, *, bitrate: str = "8M",
-                    video_meta=None, audio_source: str | None = None,
+    def _run_locked(self, source: str, out: str, mode: str, *, encode, quality_first: bool,
+                    config, video_meta=None, audio_source: str | None = None,
                     progress_cb=None, start_seconds: float = 0.0) -> int:
         self._cancel.clear()
+        cfg = config or self.config
         dec = sumu_core.HeadlessDecode()
         try:
             dec.open(source)
@@ -91,11 +103,11 @@ class TranscodeEngine:
                 start_frame = int(dec.seek_to_frame(int(round(start_seconds * fps))))
 
             meta = video_meta or self.video_meta or self._build_meta(source, dec)
-            proc = DecensorProcessor(self.det_model, self.res_model, self.pad_mode, meta, self.config)
-            enc = NvencEncoder(w, h, fps, mode, out, bitrate=bitrate,
+            proc = DecensorProcessor(self.det_model, self.res_model, self.pad_mode, meta, cfg)
+            enc = NvencEncoder(w, h, fps, mode, out, encode=encode, quality_first=quality_first,
                                audio_source=audio_source if audio_source is not None else source,
                                start_seconds=start_seconds,
-                               bt709=self.config.bt709, full_range=self.config.full_range)
+                               bt709=cfg.bt709, full_range=cfg.full_range)
             remaining = max(0, fc - start_frame) if fc > 0 else 0
 
             def _emit(proc, enc, remaining):
