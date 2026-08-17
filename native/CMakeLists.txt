@@ -3,7 +3,7 @@
 #
 # sumu's official native present kernel (pybind11 module `sumu_core`, class `Player`).
 # Promoted from spikes/spike2_clock_mixing (three-thread clock-driven mixing kernel with a
-# single explicit d3d_mutex_, see src/player.cpp's header comment) with a new seek=reposition
+# single explicit d3d_mutex_, see src/player.h's header comment) with a new seek=reposition
 # capability (I6). Reuses spike0's already-extracted FFmpeg dev package and spike1/2's CUDA
 # driver-API interop pattern -- does NOT re-download or duplicate FFmpeg.
 
@@ -71,14 +71,22 @@ add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}" "${LOGO_RGBA
 
 
 pybind11_add_module(sumu_core
-    src/player.cpp
+    src/player_session.cpp
+    src/player_window.cpp
+    src/player_engine.cpp
+    src/player_ui_overlays.cpp
+    src/player_ui_bars.cpp
+    src/player_ui_export.cpp
+    src/player_pybind.cpp
+    src/ui_util.cpp
+    src/ui/theme.cpp
+    src/ui/widgets.cpp
     src/decoder.cpp
     src/headless_decode.cpp
     "${IMGUI_DIR}/imgui.cpp"
     "${IMGUI_DIR}/imgui_draw.cpp"
     "${IMGUI_DIR}/imgui_tables.cpp"
     "${IMGUI_DIR}/imgui_widgets.cpp"
-    "${IMGUI_DIR}/imgui_demo.cpp"
     "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp"
     "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
 )
