@@ -125,55 +125,58 @@ class EncoderError(RuntimeError):
 
 @dataclass
 class EncodeOptions:
-    """User-facing encode knobs for the offline-export presets. codec: "hevc"|"h264";
-    rate_mode: "cq" (constant quality) | "vbr" (target bitrate + derived maxrate). Serialized as
-    plain dicts into settings.json (see settings.EXPORT_PRESET_DEFAULTS for the shipped presets)."""
+    """User-facing encode knobs for the offline-export presets. CQ / bitrate / maxrate are
+    INDEPENDENT, each gated by its *_enabled flag -- matching NVENC's VBR rate control, where
+    targetQuality (-cq), averageBitRate (-b:v) and maxBitRate (-maxrate) coexist (the user's bat
+    uses all three together). Bitrates are int kbps. Serialized as plain dicts into settings.json
+    (see settings.EXPORT_PRESET_DEFAULTS for the shipped presets)."""
 
     codec: str = "hevc"
-    rate_mode: str = "cq"
-    cq: int = 33
-    bitrate: str = "8M"           # vbr mode only
     preset: str = "p7"            # NVENC preset p1..p7 (p7 = slowest / best quality)
+    cq_enabled: bool = True
+    cq: int = 33                  # 0..51 (NVENC targetQuality)
+    bitrate_enabled: bool = False
+    bitrate: int = 0              # kbps (averageBitRate)
+    maxrate_enabled: bool = False
+    maxrate: int = 0              # kbps (maxBitRate)
     audio_copy: bool = True
-    audio_bitrate: str = "320k"   # aac mode only (audio_copy=False)
+    audio_bitrate: int = 256      # kbps (audio_copy=False only)
     subtitle: bool = True
 
     def codec_ffmpeg(self) -> str:
         return "hevc_nvenc" if self.codec == "hevc" else "h264_nvenc"
-
-    def to_dict(self) -> dict:
-        return {
-            "codec": self.codec, "rate_mode": self.rate_mode, "cq": int(self.cq),
-            "bitrate": self.bitrate, "preset": self.preset,
-            "audio_copy": bool(self.audio_copy), "audio_bitrate": self.audio_bitrate,
-            "subtitle": bool(self.subtitle),
-        }
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "EncodeOptions":
         d = d or {}
         return cls(
             codec="h264" if d.get("codec") == "h264" else "hevc",
-            rate_mode="vbr" if d.get("rate_mode") == "vbr" else "cq",
-            cq=int(d.get("cq") or 0),
-            bitrate=str(d.get("bitrate") or "8M"),
             preset=str(d.get("preset") or "p7"),
+            cq_enabled=bool(d.get("cq_enabled", True)),
+            cq=max(0, min(51, int(d.get("cq") or 0))),
+            bitrate_enabled=bool(d.get("bitrate_enabled", False)),
+            bitrate=max(0, int(d.get("bitrate") or 0)),
+            maxrate_enabled=bool(d.get("maxrate_enabled", False)),
+            maxrate=max(0, int(d.get("maxrate") or 0)),
             audio_copy=bool(d.get("audio_copy", True)),
-            audio_bitrate=str(d.get("audio_bitrate") or "320k"),
+            audio_bitrate=max(0, int(d.get("audio_bitrate") or 256)),
             subtitle=bool(d.get("subtitle", True)),
         )
 
 
-def _derive_maxrate(bitrate: str) -> str:
-    """maxrate ≈ 1.2× bitrate (VBV cap), matching the user's ffmpeg bats (e.g. 1000k→1200k,
-    30M→35M). Keeps the rate-control ceiling tight without hand-editing every preset."""
-    m = re.match(r"^(\d+(?:\.\d+)?)([kKmM]?)$", str(bitrate).strip())
+def _parse_kbps(bitrate) -> int:
+    """Parse a bitrate like "8M" / "8000k" / "1.3M" / "1300" (or a bare int kbps) → int kbps.
+    Empty / unparseable → 0 (means "no bitrate"). Used by the live-streaming fallback, whose
+    `bitrate` is a config string ("8M")."""
+    if isinstance(bitrate, int):
+        return max(0, bitrate)
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*$", str(bitrate or ""))
     if not m:
-        return str(bitrate)
-    val = float(m.group(1)) * 1.2
-    unit = m.group(2)  # preserve the caller's unit case (e.g. "30M" -> "36M")
-    s = f"{val:.1f}".rstrip("0").rstrip(".")
-    return f"{s}{unit}"
+        return 0
+    val = float(m.group(1))
+    if m.group(2).lower() == "m":
+        val *= 1000.0
+    return max(0, int(round(val)))
 
 
 class NvencEncoder:
@@ -192,11 +195,12 @@ class NvencEncoder:
                  full_range: bool = False):
         if mode not in ("hls", "mp4"):
             raise ValueError(f"bad mode {mode!r}")
-        # Default = the live-streaming profile (h264 / VBR 8M / p4 / AAC re-encode): browser HLS
+        # Default = the live-streaming profile (h264 / 8 Mbps / p4 / AAC re-encode): browser HLS
         # wants h264 + AAC, and p4 keeps encode latency low. Offline export passes a quality-first
         # EncodeOptions (HEVC / CQ / p7 / copy) + quality_first=True instead.
         enc = encode if encode is not None else EncodeOptions(
-            codec="h264", rate_mode="vbr", bitrate="8M", preset="p4",
+            codec="h264", preset="p4", cq_enabled=False,
+            bitrate_enabled=True, bitrate=8000,
             audio_copy=False, subtitle=False)
         w, h = int(width), int(height)
         gop = max(1, int(round(float(fps) * gop_seconds)))
@@ -232,23 +236,26 @@ class NvencEncoder:
             # subtitles are mapped + converted to mov_text (MP4-compatible) when enabled.
             cmd += ["-map", "1:v:0", "-map", "0:a:0?"]
             if enc.subtitle:
+                # Standard MP4 subtitle copy: text subs (srt/ass) convert to mov_text. Bitmap subs
+                # (PGS/VobSub) cannot become mov_text and make ffmpeg exit non-zero -- surfaced as
+                # the item's error, and the user turns the subtitle toggle off to retry.
                 cmd += ["-map", "0:s?"]
         else:
             cmd += ["-map", "0:v:0"]
 
-        # Video encode: codec + preset + rate control (CQ constant-quality or VBR bitrate+maxrate).
+        # Video encode: codec + preset + independent CQ/bitrate/maxrate knobs (each gated by its
+        # *_enabled flag). NVENC VBR treats -cq (targetQuality), -b:v (averageBitRate) and
+        # -maxrate (maxBitRate) as coexisting parameters, so any subset may be set together.
         cmd += ["-c:v", enc.codec_ffmpeg(), "-preset", enc.preset]
         if enc.codec == "hevc":
             # Apple/QuickTime compatibility tag (the user's bat habit; not set for H.264).
             cmd += ["-tag:v", "hvc1"]
-        if enc.rate_mode == "cq":
+        if enc.cq_enabled:
             cmd += ["-cq", str(int(enc.cq))]
-        else:
-            cmd += ["-b:v", enc.bitrate]
-            if quality_first:
-                # VBV cap only for offline export VBR; the live-streaming h264 profile stays
-                # bit-exact to its previous command (no -maxrate).
-                cmd += ["-maxrate", _derive_maxrate(enc.bitrate)]
+        if enc.bitrate_enabled and enc.bitrate > 0:
+            cmd += ["-b:v", f"{int(enc.bitrate)}k"]
+        if enc.maxrate_enabled and enc.maxrate > 0:
+            cmd += ["-maxrate", f"{int(enc.maxrate)}k"]
         if quality_first:
             # Offline-export "always-on" quality flags (deliberately NOT in the preset panel):
             # max spatial/temporal AQ, B-frame references, full lookahead, and the hq tune. Even
@@ -264,7 +271,11 @@ class NvencEncoder:
             else:
                 cmd += ["-c:a", "aac"]
                 if quality_first:
-                    cmd += ["-b:a", enc.audio_bitrate]
+                    cmd += ["-b:a", f"{int(enc.audio_bitrate)}k"]
+            # -shortest ends the output at the shorter of the video pipe and the source audio, so
+            # an audio-longer-than-video source doesn't leave a trailing audio-only tail. When
+            # subtitles are mapped it also counts the subtitle stream; a sparse/short subtitle
+            # track could truncate the tail (rare -- accepted; turn subtitles off to work around).
             cmd += ["-shortest"]
             if enc.subtitle:
                 cmd += ["-c:s", "mov_text"]

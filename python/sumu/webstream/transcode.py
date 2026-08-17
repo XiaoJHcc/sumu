@@ -19,7 +19,7 @@ from fractions import Fraction
 import sumu_core
 
 from .decensor import DecensorProcessor
-from .encoder import EncodeOptions, NvencEncoder
+from .encoder import EncodeOptions, NvencEncoder, _parse_kbps
 
 
 class TranscodeError(RuntimeError):
@@ -74,8 +74,9 @@ class TranscodeEngine:
         Non-reentrant (see _run_lock): the second concurrent caller blocks here until the first
         run finishes, instead of corrupting shared model/cancel state."""
         if encode is None:
-            encode = EncodeOptions(codec="h264", rate_mode="vbr", bitrate=bitrate,
-                                   preset="p4", audio_copy=False, subtitle=False)
+            encode = EncodeOptions(codec="h264", preset="p4", cq_enabled=False,
+                                   bitrate_enabled=True, bitrate=_parse_kbps(bitrate),
+                                   audio_copy=False, subtitle=False)
         with self._run_lock:
             return self._run_locked(source, out, mode, encode=encode,
                                     quality_first=quality_first, config=config,

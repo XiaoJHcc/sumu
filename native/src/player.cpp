@@ -444,12 +444,18 @@ struct UiIntents {
     int export_preset_edit_idx = -1;  // -1 none / -2 new / >=0 edit existing
     std::string export_preset_name;
     int export_preset_codec = 0;      // 0 hevc / 1 h264
-    int export_preset_rate = 0;       // 0 cq / 1 vbr
+    bool export_preset_cq_enabled = true;
     int export_preset_cq = 33;
-    std::string export_preset_bitrate;
+    bool export_preset_bitrate_enabled = false;
+    int export_preset_bitrate = 0;    // kbps
+    bool export_preset_maxrate_enabled = false;
+    int export_preset_maxrate = 0;    // kbps
     int export_preset_quality = 6;    // 0..6 -> p1..p7
-    bool export_preset_audio = true;
+    bool export_preset_audio_copy = true;
+    int export_preset_audio_bitrate = 256;  // kbps
     bool export_preset_subtitle = true;
+    std::string export_preset_suffix;
+    int export_set_default = -1;      // preset idx to mark as the default
     // Files dropped on the window while in export mode (multi-file drop -> queue).
     std::vector<std::string> export_drop_paths;
 };
@@ -460,12 +466,17 @@ struct UiIntents {
 struct ExportPresetView {
     std::string name;
     std::string codec;     // "hevc" | "h264"
-    std::string rate_mode; // "cq" | "vbr"
-    int cq = 0;
-    std::string bitrate;
     std::string preset;    // "p1".."p7"
+    bool cq_enabled = true;
+    int cq = 0;
+    bool bitrate_enabled = false;
+    int bitrate = 0;       // kbps
+    bool maxrate_enabled = false;
+    int maxrate = 0;       // kbps
     bool audio_copy = true;
+    int audio_bitrate = 256;  // kbps
     bool subtitle = true;
+    std::string suffix;
 };
 
 struct ExportItemView {
@@ -1454,6 +1465,7 @@ public:
         export_global_dir_ = get_str(d, "global_dir", "");
 
         export_presets_.clear();
+        export_default_preset_idx_ = get_int(d, "default_preset_idx", 0);
         if (d.contains("presets")) {
             try {
                 py::list presets = d["presets"].cast<py::list>();
@@ -1462,12 +1474,17 @@ public:
                     ExportPresetView v;
                     v.name = get_str(p, "name", "");
                     v.codec = get_str(p, "codec", "hevc");
-                    v.rate_mode = get_str(p, "rate_mode", "cq");
-                    v.cq = get_int(p, "cq", 0);
-                    v.bitrate = get_str(p, "bitrate", "");
                     v.preset = get_str(p, "preset", "p7");
+                    v.cq_enabled = get_bool(p, "cq_enabled", true);
+                    v.cq = get_int(p, "cq", 0);
+                    v.bitrate_enabled = get_bool(p, "bitrate_enabled", false);
+                    v.bitrate = get_int(p, "bitrate", 0);
+                    v.maxrate_enabled = get_bool(p, "maxrate_enabled", false);
+                    v.maxrate = get_int(p, "maxrate", 0);
                     v.audio_copy = get_bool(p, "audio_copy", true);
+                    v.audio_bitrate = get_int(p, "audio_bitrate", 256);
                     v.subtitle = get_bool(p, "subtitle", true);
+                    v.suffix = get_str(p, "suffix", "_Decensored");
                     export_presets_.push_back(std::move(v));
                 }
             } catch (const py::error_already_set&) { PyErr_Clear(); }
@@ -1647,12 +1664,8 @@ public:
         take("stream_token_label", ui_str_.stream_token_label);
         take("stream_token_hint", ui_str_.stream_token_hint);
         take("export_title", ui_str_.export_title);
-        take("export_source_label", ui_str_.export_source_label);
-        take("export_out_label", ui_str_.export_out_label);
-        take("export_pick", ui_str_.export_pick);
         take("export_start", ui_str_.export_start);
         take("cancel", ui_str_.cancel);
-        take("export_return", ui_str_.export_return);
         take("export_section_ai", ui_str_.export_section_ai);
         take("export_clip_length_label", ui_str_.export_clip_length_label);
         take("export_section_path", ui_str_.export_section_path);
@@ -1660,8 +1673,6 @@ public:
         take("export_pick_dir", ui_str_.export_pick_dir);
         take("export_section_queue", ui_str_.export_section_queue);
         take("export_add_files", ui_str_.export_add_files);
-        take("export_preset", ui_str_.export_preset);
-        take("export_output", ui_str_.export_output);
         take("export_out_auto", ui_str_.export_out_auto);
         take("export_out_global", ui_str_.export_out_global);
         take("export_out_custom", ui_str_.export_out_custom);
@@ -1675,12 +1686,16 @@ public:
         take("export_preset_delete", ui_str_.export_preset_delete);
         take("export_preset_name_label", ui_str_.export_preset_name_label);
         take("export_preset_codec_label", ui_str_.export_preset_codec_label);
-        take("export_preset_rate_label", ui_str_.export_preset_rate_label);
         take("export_preset_cq_label", ui_str_.export_preset_cq_label);
         take("export_preset_bitrate_label", ui_str_.export_preset_bitrate_label);
+        take("export_preset_maxrate_label", ui_str_.export_preset_maxrate_label);
         take("export_preset_quality_label", ui_str_.export_preset_quality_label);
         take("export_preset_audio_label", ui_str_.export_preset_audio_label);
+        take("export_preset_audio_copy", ui_str_.export_preset_audio_copy);
+        take("export_preset_audio_encode", ui_str_.export_preset_audio_encode);
         take("export_preset_subtitle_label", ui_str_.export_preset_subtitle_label);
+        take("export_preset_suffix_label", ui_str_.export_preset_suffix_label);
+        take("export_preset_default", ui_str_.export_preset_default);
         take("export_preset_save", ui_str_.export_preset_save);
         take("export_status_pending", ui_str_.export_status_pending);
         take("export_status_running", ui_str_.export_status_running);
@@ -1729,12 +1744,18 @@ public:
         d["export_preset_edit_idx"] = ui_intents_.export_preset_edit_idx;
         d["export_preset_name"] = ui_intents_.export_preset_name;
         d["export_preset_codec"] = ui_intents_.export_preset_codec;
-        d["export_preset_rate"] = ui_intents_.export_preset_rate;
+        d["export_preset_cq_enabled"] = ui_intents_.export_preset_cq_enabled;
         d["export_preset_cq"] = ui_intents_.export_preset_cq;
+        d["export_preset_bitrate_enabled"] = ui_intents_.export_preset_bitrate_enabled;
         d["export_preset_bitrate"] = ui_intents_.export_preset_bitrate;
+        d["export_preset_maxrate_enabled"] = ui_intents_.export_preset_maxrate_enabled;
+        d["export_preset_maxrate"] = ui_intents_.export_preset_maxrate;
         d["export_preset_quality"] = ui_intents_.export_preset_quality;
-        d["export_preset_audio"] = ui_intents_.export_preset_audio;
+        d["export_preset_audio_copy"] = ui_intents_.export_preset_audio_copy;
+        d["export_preset_audio_bitrate"] = ui_intents_.export_preset_audio_bitrate;
         d["export_preset_subtitle"] = ui_intents_.export_preset_subtitle;
+        d["export_preset_suffix"] = ui_intents_.export_preset_suffix;
+        d["export_set_default"] = ui_intents_.export_set_default;
         d["export_drop_paths"] = ui_intents_.export_drop_paths;
         ui_intents_ = UiIntents{}; // drain
         return d;
@@ -2497,10 +2518,14 @@ private:
     // executor (see take_ui_intents() and scripts/run_player.py).
     void build_ui()
     {
-        // Offline-export full-screen mode: the export screen owns the whole window. Its own
-        // header carries 返回 / preset / start; no normal chrome (top bar / seekbar / settings).
+        // Offline-export mode keeps the normal title bar (build_top_bar) and replaces only the
+        // client area below it with the export screen. The bar's settings button is disabled in
+        // export mode, and open/URL/web + the export toggle are disabled while an export is
+        // running (see build_top_bar) -- that gating replaces the old "返回" exit button.
         if (export_mode_) {
-            build_export_screen();
+            float top_bar_h = 0.0f;
+            build_top_bar(top_bar_h);
+            build_export_screen(top_bar_h);
             build_export_preset_editor(); // modal above the screen (when open)
             build_status_float();
             return;
@@ -3195,9 +3220,12 @@ private:
     {
         std::string s = p.name;
         s += " · ";
-        s += (p.rate_mode == "vbr") ? p.bitrate : ("CQ " + std::to_string(p.cq));
-        s += " · ";
-        s += p.preset;
+        if (p.cq_enabled) s += "CQ " + std::to_string(p.cq);
+        if (p.bitrate_enabled)
+            s += (p.cq_enabled ? " + " : "") + std::to_string(p.bitrate) + "k";
+        if (p.maxrate_enabled)
+            s += " max " + std::to_string(p.maxrate) + "k";
+        s += " · " + p.preset;
         s += p.codec == "h264" ? " · H.264" : " · HEVC";
         return s;
     }
@@ -3211,12 +3239,11 @@ private:
         return 6;
     }
 
-    void build_export_screen()
+    void build_export_screen(float top_bar_h)
     {
         ImGuiIO& io = ImGui::GetIO();
-        const float bar_h = top_bar_h();
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, std::max(0.0f, io.DisplaySize.y - top_bar_h)));
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
@@ -3225,36 +3252,20 @@ private:
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(12.0f), ui_s(10.0f)));
         ImGui::Begin("##sumu_export_screen", nullptr, flags);
 
-        const char* t_return = ui_str_.export_return.empty() ? "Back" : ui_str_.export_return.c_str();
-        const char* t_title = ui_str_.export_title.empty() ? "Export" : ui_str_.export_title.c_str();
         const char* t_presets = ui_str_.export_presets_title.empty() ? "Presets" : ui_str_.export_presets_title.c_str();
         const char* t_start = ui_str_.export_start.empty() ? "Start" : ui_str_.export_start.c_str();
 
-        // ---- header: 返回 | title | [预设设置] [开始导出] ----
+        // ---- action row (replaces the old full-window header's 返回/title): [开始导出] [预设设置]
+        // "开始导出" is greyed until the engine is warm (nothing to run yet).
         {
-            const float btn_h = ui_s(26.0f);
-            const float y = (bar_h - btn_h) * 0.5f;
-            ImGui::SetCursorPosY(y);
-            push_secondary_button_style();
-            if (ImGui::Button(t_return, ImVec2(ui_s(88.0f), btn_h)))
-                ui_intents_.export_exit = true;
-            pop_secondary_button_style();
-            ImGui::SameLine();
-            ImGui::SetCursorPosY((bar_h - ImGui::GetTextLineHeight()) * 0.5f);
-            ImGui::TextUnformatted(t_title);
-
-            const float start_w = ui_s(96.0f), preset_w = ui_s(96.0f);
-            const float spacing = ImGui::GetStyle().ItemSpacing.x;
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(io.DisplaySize.x - ui_s(12.0f) - start_w);
-            ImGui::SetCursorPosY(y);
-            if (ImGui::Button(t_start, ImVec2(start_w, btn_h)))
+            const float btn_h = ui_s(28.0f);
+            if (!export_engine_ready_) ImGui::BeginDisabled();
+            if (ImGui::Button(t_start, ImVec2(ui_s(120.0f), btn_h)))
                 ui_intents_.export_start = true;
+            if (!export_engine_ready_) ImGui::EndDisabled();
             ImGui::SameLine();
-            ImGui::SetCursorPosX(io.DisplaySize.x - ui_s(12.0f) - start_w - preset_w - spacing);
-            ImGui::SetCursorPosY(y);
             push_secondary_button_style();
-            if (ImGui::Button(t_presets, ImVec2(preset_w, btn_h)))
+            if (ImGui::Button(t_presets, ImVec2(ui_s(120.0f), btn_h)))
                 export_presets_open_ = true;
             pop_secondary_button_style();
         }
@@ -3415,21 +3426,23 @@ private:
             ImGui::PopStyleColor();
             return;
         }
-        const float w = ui_s(420.0f);
+        const float w = ui_s(460.0f);
         ImGui::PushItemWidth(w);
 
         ImGui::TextUnformatted(ui_str_.export_presets_title.c_str());
         ImGui::Separator();
 
         if (export_preset_edit_idx_ == -1) {
-            // ---- manager: preset cards (click to edit) + delete/new/close ----
+            // ---- manager: preset cards (click to edit) + delete + default radio ----
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            const float del_w = ui_s(48.0f);
+            const float def_w = ui_s(28.0f);
             for (int i = 0; i < (int)export_presets_.size(); ++i) {
                 const auto& p = export_presets_[i];
                 ImGui::PushID(i);
                 std::string summary = export_preset_summary(p);
-                const float del_w = ui_s(48.0f);
-                if (ImGui::Button(summary.c_str(),
-                        ImVec2(w - del_w - ImGui::GetStyle().ItemSpacing.x, 0.0f)))
+                const float card_w = w - del_w - def_w - spacing * 2.0f;
+                if (ImGui::Button(summary.c_str(), ImVec2(card_w, 0.0f)))
                     open_export_preset_editor(i); // card = edit its params
                 ImGui::SameLine();
                 push_secondary_button_style();
@@ -3438,6 +3451,13 @@ private:
                     ui_intents_.export_preset_edit_idx = i;
                 }
                 pop_secondary_button_style();
+                ImGui::SameLine();
+                // "default" marker: radio-like -- exactly one preset is the queue default.
+                if (ImGui::RadioButton(("##def_" + std::to_string(i)).c_str(),
+                        &export_default_preset_idx_, i))
+                    ui_intents_.export_set_default = i;
+                if (ImGui::IsItemHovered() && !ui_str_.export_preset_default.empty())
+                    ImGui::SetTooltip("%s", ui_str_.export_preset_default.c_str());
                 ImGui::PopID();
             }
             ImGui::Separator();
@@ -3457,21 +3477,31 @@ private:
                 if (src) {
                     snprintf(export_preset_name_buf_, sizeof(export_preset_name_buf_), "%s", src->name.c_str());
                     export_preset_codec_idx_ = (src->codec == "h264") ? 1 : 0;
-                    export_preset_rate_idx_ = (src->rate_mode == "vbr") ? 1 : 0;
+                    export_preset_cq_enabled_ = src->cq_enabled;
                     export_preset_cq_ = src->cq;
-                    snprintf(export_preset_bitrate_buf_, sizeof(export_preset_bitrate_buf_), "%s", src->bitrate.c_str());
+                    export_preset_bitrate_enabled_ = src->bitrate_enabled;
+                    export_preset_bitrate_ = src->bitrate;
+                    export_preset_maxrate_enabled_ = src->maxrate_enabled;
+                    export_preset_maxrate_ = src->maxrate;
                     export_preset_quality_idx_ = export_quality_idx_of(src->preset);
-                    export_preset_audio_ = src->audio_copy;
+                    export_preset_audio_copy_ = src->audio_copy;
+                    export_preset_audio_bitrate_ = src->audio_bitrate;
                     export_preset_subtitle_ = src->subtitle;
+                    snprintf(export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_), "%s", src->suffix.c_str());
                 } else {
                     export_preset_name_buf_[0] = '\0';
                     export_preset_codec_idx_ = 0;
-                    export_preset_rate_idx_ = 0;
+                    export_preset_cq_enabled_ = true;
                     export_preset_cq_ = 33;
-                    export_preset_bitrate_buf_[0] = '\0';
+                    export_preset_bitrate_enabled_ = false;
+                    export_preset_bitrate_ = 0;
+                    export_preset_maxrate_enabled_ = false;
+                    export_preset_maxrate_ = 0;
                     export_preset_quality_idx_ = 6;
-                    export_preset_audio_ = true;
+                    export_preset_audio_copy_ = true;
+                    export_preset_audio_bitrate_ = 256;
                     export_preset_subtitle_ = true;
+                    snprintf(export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_), "_Decensored");
                 }
                 export_preset_edit_init_ = true;
             }
@@ -3481,21 +3511,57 @@ private:
             const char* codec_items[] = { "HEVC", "H.264" };
             ImGui::TextUnformatted(ui_str_.export_preset_codec_label.c_str());
             ImGui::Combo("##ep_codec", &export_preset_codec_idx_, codec_items, 2);
-            const char* rate_items[] = { "CQ", "VBR" };
-            ImGui::TextUnformatted(ui_str_.export_preset_rate_label.c_str());
-            ImGui::Combo("##ep_rate", &export_preset_rate_idx_, rate_items, 2);
-            if (export_preset_rate_idx_ == 0) {
-                ImGui::TextUnformatted(ui_str_.export_preset_cq_label.c_str());
+
+            // CQ / bitrate / maxrate are INDEPENDENT, each enabled by its own checkbox.
+            ImGui::Checkbox(ui_str_.export_preset_cq_label.c_str(), &export_preset_cq_enabled_);
+            if (export_preset_cq_enabled_) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ui_s(150.0f));
                 ImGui::SliderInt("##ep_cq", &export_preset_cq_, 0, 51);
-            } else {
-                ImGui::TextUnformatted(ui_str_.export_preset_bitrate_label.c_str());
-                ImGui::InputText("##ep_bitrate", export_preset_bitrate_buf_, sizeof(export_preset_bitrate_buf_));
+                ImGui::SameLine();
+                ImGui::Text("%d", export_preset_cq_);
             }
+            ImGui::Checkbox(ui_str_.export_preset_bitrate_label.c_str(), &export_preset_bitrate_enabled_);
+            if (export_preset_bitrate_enabled_) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ui_s(90.0f));
+                ImGui::InputInt("##ep_bitrate", &export_preset_bitrate_);
+                ImGui::SameLine();
+                ImGui::TextUnformatted("kbps");
+            }
+            ImGui::Checkbox(ui_str_.export_preset_maxrate_label.c_str(), &export_preset_maxrate_enabled_);
+            if (export_preset_maxrate_enabled_) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ui_s(90.0f));
+                ImGui::InputInt("##ep_maxrate", &export_preset_maxrate_);
+                ImGui::SameLine();
+                ImGui::TextUnformatted("kbps");
+            }
+
             const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7" };
             ImGui::TextUnformatted(ui_str_.export_preset_quality_label.c_str());
             ImGui::Combo("##ep_quality", &export_preset_quality_idx_, quality_items, 7);
-            ImGui::Checkbox(ui_str_.export_preset_audio_label.c_str(), &export_preset_audio_);
+
+            const char* audio_items[] = {
+                ui_str_.export_preset_audio_copy.c_str(),
+                ui_str_.export_preset_audio_encode.c_str(),
+            };
+            ImGui::TextUnformatted(ui_str_.export_preset_audio_label.c_str());
+            int audio_mode = export_preset_audio_copy_ ? 0 : 1;
+            ImGui::SetNextItemWidth(ui_s(160.0f));
+            if (ImGui::Combo("##ep_audio", &audio_mode, audio_items, 2))
+                export_preset_audio_copy_ = (audio_mode == 0);
+            if (!export_preset_audio_copy_) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ui_s(90.0f));
+                ImGui::InputInt("##ep_audio_bitrate", &export_preset_audio_bitrate_);
+                ImGui::SameLine();
+                ImGui::TextUnformatted("kbps");
+            }
+
             ImGui::Checkbox(ui_str_.export_preset_subtitle_label.c_str(), &export_preset_subtitle_);
+            ImGui::TextUnformatted(ui_str_.export_preset_suffix_label.c_str());
+            ImGui::InputText("##ep_suffix", export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_));
 
             ImGui::Spacing();
             ImGui::Separator();
@@ -3504,12 +3570,17 @@ private:
                 ui_intents_.export_preset_edit_idx = export_preset_edit_idx_;
                 ui_intents_.export_preset_name = export_preset_name_buf_;
                 ui_intents_.export_preset_codec = export_preset_codec_idx_;
-                ui_intents_.export_preset_rate = export_preset_rate_idx_;
+                ui_intents_.export_preset_cq_enabled = export_preset_cq_enabled_;
                 ui_intents_.export_preset_cq = export_preset_cq_;
-                ui_intents_.export_preset_bitrate = export_preset_bitrate_buf_;
+                ui_intents_.export_preset_bitrate_enabled = export_preset_bitrate_enabled_;
+                ui_intents_.export_preset_bitrate = export_preset_bitrate_;
+                ui_intents_.export_preset_maxrate_enabled = export_preset_maxrate_enabled_;
+                ui_intents_.export_preset_maxrate = export_preset_maxrate_;
                 ui_intents_.export_preset_quality = export_preset_quality_idx_;
-                ui_intents_.export_preset_audio = export_preset_audio_;
+                ui_intents_.export_preset_audio_copy = export_preset_audio_copy_;
+                ui_intents_.export_preset_audio_bitrate = export_preset_audio_bitrate_;
                 ui_intents_.export_preset_subtitle = export_preset_subtitle_;
+                ui_intents_.export_preset_suffix = export_preset_suffix_buf_;
                 export_preset_edit_idx_ = -1;
             }
             ImGui::SameLine();
@@ -3575,14 +3646,16 @@ private:
         ImDrawList* dl;
     };
 
-    IconButtonResult icon_button(const char* str_id, ImVec2 size)
+    IconButtonResult icon_button(const char* str_id, ImVec2 size, bool disabled = false)
     {
         IconButtonResult r{};
+        if (disabled) ImGui::BeginDisabled();
         r.clicked = ImGui::InvisibleButton(str_id, size);
+        if (disabled) ImGui::EndDisabled();
         r.min = ImGui::GetItemRectMin();
         r.max = ImGui::GetItemRectMax();
         r.dl = ImGui::GetWindowDrawList();
-        if (ImGui::IsItemHovered())
+        if (!disabled && ImGui::IsItemHovered())
             r.dl->AddRectFilled(r.min, r.max, IM_COL32(255, 255, 255, 30), ui_s(6.0f));
         return r;
     }
@@ -3635,12 +3708,19 @@ private:
         const float btn_w = ui_s(28.0f);
         const float btn_h = bar_h - ui_s(4.0f);
         const ImU32 icon_col = IM_COL32(230, 230, 230, 255);
+        const ImU32 icon_col_dim = IM_COL32(110, 110, 110, 255);
         const float icon_th = ui_s(1.5f);
+        // Export-mode gating (Phase 2): settings is disabled while the export page is up (its own
+        // AI-pipeline section replaces the settings panel); open/URL/web + the export toggle are
+        // disabled while an export is running so the user cannot navigate away mid-export. This
+        // gating replaces the export screen's old "返回" exit button.
+        const bool settings_disabled = export_mode_;
+        const bool export_nav_disabled = export_mode_ && export_running_;
         // Vertically center every control in the bar (ImGui default is top-aligned).
         ImGui::SetCursorPosY((bar_h - btn_h) * 0.5f);
 
         { // settings toggle: hamburger icon (three horizontal bars), replaces the old text button
-            IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h));
+            IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h), settings_disabled);
             if (r.clicked) {
                 ui_settings_open_ = !ui_settings_open_;
                 if (ui_settings_open_) settings_edit_init_ = false; // resync edit buffers to latest cfg on open
@@ -3648,9 +3728,10 @@ private:
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
             const float w = ui_s(14.0f);
+            const ImU32 col = settings_disabled ? icon_col_dim : icon_col;
             for (int i = -1; i <= 1; ++i) {
                 float y = cy + i * ui_s(5.0f);
-                r.dl->AddLine(ImVec2(cx - w * 0.5f, y), ImVec2(cx + w * 0.5f, y), icon_col, icon_th);
+                r.dl->AddLine(ImVec2(cx - w * 0.5f, y), ImVec2(cx + w * 0.5f, y), col, icon_th);
             }
         }
         ImGui::SameLine();
@@ -3659,20 +3740,27 @@ private:
           // as the maximize/fullscreen icons below) -- records open_dialog, drained by Python's
           // take_ui_intents() which responds by calling the blocking pick_open_file() dialog
           // (see UiIntents' header comment; present keeps showing the current video meanwhile).
-            IconButtonResult r = icon_button("##open_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) record_open_dialog();
+            IconButtonResult r = icon_button("##open_btn", ImVec2(btn_w, btn_h), export_nav_disabled);
+            if (r.clicked) {
+                if (export_mode_) ui_intents_.export_exit = true; // open exits the export page first
+                record_open_dialog();
+            }
             if (ImGui::IsItemHovered() && !ui_str_.open_file.empty())
                 ImGui::SetTooltip("%s", ui_str_.open_file.c_str());
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(3.0f)), ImVec2(cx + ui_s(7.0f), cy + ui_s(6.0f)), icon_col, 1.0f, 0, icon_th);
-            r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(6.0f)), ImVec2(cx - ui_s(1.0f), cy - ui_s(3.0f)), icon_col, 1.0f, 0, icon_th);
+            const ImU32 col = export_nav_disabled ? icon_col_dim : icon_col;
+            r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(3.0f)), ImVec2(cx + ui_s(7.0f), cy + ui_s(6.0f)), col, 1.0f, 0, icon_th);
+            r.dl->AddRect(ImVec2(cx - ui_s(7.0f), cy - ui_s(6.0f)), ImVec2(cx - ui_s(1.0f), cy - ui_s(3.0f)), col, 1.0f, 0, icon_th);
         }
         ImGui::SameLine();
         { // Network URL open: chain-link glyph next to the folder button. Opens the ImGui
           // URL popup (build_open_url_popup); on confirm writes open_path for Python.
-            IconButtonResult r = icon_button("##open_url_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) request_open_url_popup();
+            IconButtonResult r = icon_button("##open_url_btn", ImVec2(btn_w, btn_h), export_nav_disabled);
+            if (r.clicked) {
+                if (export_mode_) ui_intents_.export_exit = true; // URL open exits the export page first
+                request_open_url_popup();
+            }
             if (ImGui::IsItemHovered() && !ui_str_.open_url.empty())
                 ImGui::SetTooltip("%s", ui_str_.open_url.c_str());
             float cx = (r.min.x + r.max.x) * 0.5f;
@@ -3681,34 +3769,44 @@ private:
             const float r_link = ui_s(4.2f);
             const float dx = ui_s(2.4f);
             const float dy = ui_s(2.0f);
-            r.dl->AddCircle(ImVec2(cx - dx, cy + dy), r_link, icon_col, 12, icon_th);
-            r.dl->AddCircle(ImVec2(cx + dx, cy - dy), r_link, icon_col, 12, icon_th);
+            const ImU32 col = export_nav_disabled ? icon_col_dim : icon_col;
+            r.dl->AddCircle(ImVec2(cx - dx, cy + dy), r_link, col, 12, icon_th);
+            r.dl->AddCircle(ImVec2(cx + dx, cy - dy), r_link, col, 12, icon_th);
         }
         ImGui::SameLine();
         { // Web-stream server: globe glyph (circle + equator + meridian), hollow-line weight.
-            IconButtonResult r = icon_button("##stream_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) request_stream_popup();
+            IconButtonResult r = icon_button("##stream_btn", ImVec2(btn_w, btn_h), export_nav_disabled);
+            if (r.clicked) {
+                if (export_mode_) ui_intents_.export_exit = true; // web server exits the export page first
+                request_stream_popup();
+            }
             if (ImGui::IsItemHovered() && !ui_str_.stream_server.empty())
                 ImGui::SetTooltip("%s", ui_str_.stream_server.c_str());
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
             const float rr = ui_s(6.0f);
-            r.dl->AddCircle(ImVec2(cx, cy), rr, icon_col, 24, icon_th);
-            r.dl->AddLine(ImVec2(cx - rr, cy), ImVec2(cx + rr, cy), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx, cy - rr), ImVec2(cx, cy + rr), icon_col, icon_th);
+            const ImU32 col = export_nav_disabled ? icon_col_dim : icon_col;
+            r.dl->AddCircle(ImVec2(cx, cy), rr, col, 24, icon_th);
+            r.dl->AddLine(ImVec2(cx - rr, cy), ImVec2(cx + rr, cy), col, icon_th);
+            r.dl->AddLine(ImVec2(cx, cy - rr), ImVec2(cx, cy + rr), col, icon_th);
         }
         ImGui::SameLine();
-        { // Offline export (Phase 2 extension): download-into-tray glyph -> export_enter intent.
-            IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h));
-            if (r.clicked) ui_intents_.export_enter = true;
+        { // Offline export (Phase 2 extension): download-into-tray glyph. Toggles the export page
+          // (enter when idle, exit when already in it); disabled while an export is running.
+            IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h), export_nav_disabled);
+            if (r.clicked) {
+                if (export_mode_) ui_intents_.export_exit = true;
+                else ui_intents_.export_enter = true;
+            }
             if (ImGui::IsItemHovered() && !ui_str_.export_video.empty())
                 ImGui::SetTooltip("%s", ui_str_.export_video.c_str());
             float cx = (r.min.x + r.max.x) * 0.5f;
             float cy = (r.min.y + r.max.y) * 0.5f;
-            r.dl->AddLine(ImVec2(cx, cy - ui_s(5.0f)), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx - ui_s(3.0f), cy), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx + ui_s(3.0f), cy), ImVec2(cx, cy + ui_s(3.0f)), icon_col, icon_th);
-            r.dl->AddLine(ImVec2(cx - ui_s(6.0f), cy + ui_s(5.0f)), ImVec2(cx + ui_s(6.0f), cy + ui_s(5.0f)), icon_col, icon_th);
+            const ImU32 col = export_nav_disabled ? icon_col_dim : icon_col;
+            r.dl->AddLine(ImVec2(cx, cy - ui_s(5.0f)), ImVec2(cx, cy + ui_s(3.0f)), col, icon_th);
+            r.dl->AddLine(ImVec2(cx - ui_s(3.0f), cy), ImVec2(cx, cy + ui_s(3.0f)), col, icon_th);
+            r.dl->AddLine(ImVec2(cx + ui_s(3.0f), cy), ImVec2(cx, cy + ui_s(3.0f)), col, icon_th);
+            r.dl->AddLine(ImVec2(cx - ui_s(6.0f), cy + ui_s(5.0f)), ImVec2(cx + ui_s(6.0f), cy + ui_s(5.0f)), col, icon_th);
         }
         ImGui::SameLine();
         {
@@ -3722,7 +3820,7 @@ private:
             const float reserve_right = (btn_w + spacing) * n_right + spacing;
             float max_title_w = ImGui::GetContentRegionAvail().x - reserve_right;
             if (max_title_w < 0.0f) max_title_w = 0.0f;
-            const std::string full_name = basename_of(video_path_);
+            const std::string full_name = export_mode_ ? ui_str_.export_title : basename_of(video_path_);
             const std::string shown = elide_text_to_width(full_name, max_title_w);
             ImGui::TextUnformatted(shown.c_str());
             if (!full_name.empty() && shown != full_name && ImGui::IsItemHovered())
@@ -5740,12 +5838,8 @@ private:
         std::string stream_token_label;
         std::string stream_token_hint;
         std::string export_title;
-        std::string export_source_label;
-        std::string export_out_label;
-        std::string export_pick;
         std::string export_start;
         std::string cancel;
-        std::string export_return;
         std::string export_section_ai;
         std::string export_clip_length_label;
         std::string export_section_path;
@@ -5753,8 +5847,6 @@ private:
         std::string export_pick_dir;
         std::string export_section_queue;
         std::string export_add_files;
-        std::string export_preset;
-        std::string export_output;
         std::string export_out_auto;
         std::string export_out_global;
         std::string export_out_custom;
@@ -5768,12 +5860,16 @@ private:
         std::string export_preset_delete;
         std::string export_preset_name_label;
         std::string export_preset_codec_label;
-        std::string export_preset_rate_label;
         std::string export_preset_cq_label;
         std::string export_preset_bitrate_label;
+        std::string export_preset_maxrate_label;
         std::string export_preset_quality_label;
         std::string export_preset_audio_label;
+        std::string export_preset_audio_copy;
+        std::string export_preset_audio_encode;
         std::string export_preset_subtitle_label;
+        std::string export_preset_suffix_label;
+        std::string export_preset_default;
         std::string export_preset_save;
         std::string export_status_pending;
         std::string export_status_running;
@@ -5811,6 +5907,7 @@ private:
     int export_clip_length_edit_ = 120;  // local slider value (seeded once per entry)
     bool export_clip_edit_init_ = false;
     std::string export_global_dir_;
+    int export_default_preset_idx_ = 0; // pushed by Python; local radio selection between ticks
     std::vector<ExportPresetView> export_presets_;
     std::vector<ExportItemView> export_items_;
     // Preset editor modal state (staged locally, seeded once per open like settings_edit_*).
@@ -5818,12 +5915,17 @@ private:
     bool export_preset_edit_init_ = false;
     char export_preset_name_buf_[256] = {};
     int export_preset_codec_idx_ = 0;   // 0 hevc / 1 h264
-    int export_preset_rate_idx_ = 0;    // 0 cq / 1 vbr
+    bool export_preset_cq_enabled_ = true;
     int export_preset_cq_ = 33;
-    char export_preset_bitrate_buf_[32] = {};
+    bool export_preset_bitrate_enabled_ = false;
+    int export_preset_bitrate_ = 0;     // kbps
+    bool export_preset_maxrate_enabled_ = false;
+    int export_preset_maxrate_ = 0;     // kbps
     int export_preset_quality_idx_ = 6; // 0..6 -> p1..p7
-    bool export_preset_audio_ = true;
+    bool export_preset_audio_copy_ = true;
+    int export_preset_audio_bitrate_ = 256;  // kbps
     bool export_preset_subtitle_ = true;
+    char export_preset_suffix_buf_[128] = {};
     bool settings_edit_init_ = false;    // one-shot: (re)seed edit buffers from ui_cfg_* the
     int settings_edit_clip_length_ = 30; // moment the settings panel is opened, so an
     int settings_edit_max_regions_ = 1;  // in-progress edit survives Python's per-tick refresh.

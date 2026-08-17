@@ -388,10 +388,21 @@ def main():
                 return it
         return None
 
+    def _export_preset_suffix(idx):
+        presets = settings.export_presets
+        if 0 <= idx < len(presets):
+            return presets[idx].get("suffix", "") or "_Decensored"
+        return "_Decensored"
+
     def _export_set_item_preset(item_id, preset_idx):
+        from sumu.webstream.export import default_out_path
         it = _export_find_item(item_id)
         if it is not None and 0 <= preset_idx < len(settings.export_presets):
             it.preset_idx = preset_idx
+            # Re-resolve auto/global output with the new preset's naming suffix.
+            if it.out_mode in ("auto", "global"):
+                gd = settings.export_global_dir if it.out_mode == "global" else ""
+                it.out_path = default_out_path(it.source, gd, _export_preset_suffix(preset_idx))
 
     def _export_set_item_outmode(item_id, mode):
         from sumu.webstream.export import default_out_path
@@ -399,25 +410,29 @@ def main():
         if it is None:
             return
         it.out_mode = ("auto", "global", "custom")[max(0, min(2, mode))]
+        suffix = _export_preset_suffix(it.preset_idx)
         if it.out_mode == "global":
-            it.out_path = default_out_path(it.source, settings.export_global_dir)
+            it.out_path = default_out_path(it.source, settings.export_global_dir, suffix)
         elif it.out_mode == "auto":
-            it.out_path = default_out_path(it.source, "")
+            it.out_path = default_out_path(it.source, "", suffix)
 
     def _export_save_preset(ints):
         codec = "h264" if ints.get("export_preset_codec") == 1 else "hevc"
-        rate = "vbr" if ints.get("export_preset_rate") == 1 else "cq"
         q = max(0, min(6, int(ints.get("export_preset_quality") or 6)))
         preset = {
             "name": (ints.get("export_preset_name") or "").strip() or "预设",
             "codec": codec,
-            "rate_mode": rate,
-            "cq": int(ints.get("export_preset_cq") or 0),
-            "bitrate": (ints.get("export_preset_bitrate") or "").strip() or "8M",
             "preset": f"p{q + 1}",
-            "audio_copy": bool(ints.get("export_preset_audio")),
-            "audio_bitrate": "320k",
+            "cq_enabled": bool(ints.get("export_preset_cq_enabled")),
+            "cq": max(0, min(51, int(ints.get("export_preset_cq") or 0))),
+            "bitrate_enabled": bool(ints.get("export_preset_bitrate_enabled")),
+            "bitrate": max(0, int(ints.get("export_preset_bitrate") or 0)),
+            "maxrate_enabled": bool(ints.get("export_preset_maxrate_enabled")),
+            "maxrate": max(0, int(ints.get("export_preset_maxrate") or 0)),
+            "audio_copy": bool(ints.get("export_preset_audio_copy")),
+            "audio_bitrate": max(0, int(ints.get("export_preset_audio_bitrate") or 256)),
             "subtitle": bool(ints.get("export_preset_subtitle")),
+            "suffix": (ints.get("export_preset_suffix") or "").strip() or "_Decensored",
         }
         idx = int(ints.get("export_preset_edit_idx") or -2)
         if 0 <= idx < len(settings.export_presets):
@@ -426,6 +441,11 @@ def main():
             settings.export_presets.append(preset)
         settings_mod.save(settings)
 
+    def _export_set_default_preset(idx):
+        if 0 <= idx < len(settings.export_presets):
+            settings.export_default_preset_idx = idx
+            settings_mod.save(settings)
+
     def _export_delete_preset(idx):
         presets = settings.export_presets
         if 0 <= idx < len(presets) and len(presets) > 1:
@@ -433,9 +453,14 @@ def main():
             if export_queue is not None:
                 for it in export_queue.items:
                     if it.preset_idx == idx:
-                        it.preset_idx = 0          # pointed at the deleted preset -> default
+                        it.preset_idx = 0          # pointed at the deleted preset -> 0
                     elif it.preset_idx > idx:
                         it.preset_idx -= 1         # keep pointing at the same (shifted) preset
+            # Keep the "default" marker pointing at a valid preset.
+            if settings.export_default_preset_idx == idx:
+                settings.export_default_preset_idx = 0
+            elif settings.export_default_preset_idx > idx:
+                settings.export_default_preset_idx -= 1
             settings_mod.save(settings)
 
     def apply_target_fps_for_open():
@@ -718,6 +743,15 @@ def main():
 
             intents = player.take_ui_intents()
 
+            # Offline-export mode enter/exit runs FIRST, before open/URL/stream intents: the native
+            # title bar sets export_exit together with open/URL/web clicks (in export mode), so the
+            # page must close before the open/stream action lands. Entering tears down playback +
+            # streaming so the export owns the GPU (exclusive mode).
+            if intents.get("export_enter"):
+                _enter_export_mode()
+            elif intents.get("export_exit"):
+                _exit_export_mode()
+
             # First-screen "compile acceleration engines" button (or "retry" after a failure).
             # The prompt now shows from frame 1 (before warmup finishes), so a click can land
             # before the models are loaded -- but the compile needs the loaded eager restorer
@@ -897,18 +931,18 @@ def main():
                         status_text = err
 
             # ---- offline-export intents (Phase 2 extension) ----
-            if intents.get("export_enter"):
-                _enter_export_mode()
-            elif intents.get("export_exit"):
-                _exit_export_mode()
-
             if export_mode and export_queue is not None:
+                presets = settings.export_presets
+                def_idx = settings.export_default_preset_idx
+                if not (0 <= def_idx < len(presets)):
+                    def_idx = 0
+                def_suffix = presets[def_idx].get("suffix", "") if presets else ""
                 for path in (intents.get("export_drop_paths") or []):
-                    export_queue.add(path, settings_mod.EXPORT_PRESET_DEFAULT_INDEX)
+                    export_queue.add(path, def_idx, suffix=def_suffix)
                 if intents.get("export_add_files"):
                     path = player.pick_open_file()
                     if path:
-                        export_queue.add(path, settings_mod.EXPORT_PRESET_DEFAULT_INDEX)
+                        export_queue.add(path, def_idx, suffix=def_suffix)
                 if intents.get("export_start"):
                     export_queue.start()
                 rid = intents.get("export_remove")
@@ -947,6 +981,9 @@ def main():
                     _export_delete_preset(int(intents.get("export_preset_edit_idx") or -1))
                 elif intents.get("export_preset_save"):
                     _export_save_preset(intents)
+                sd = intents.get("export_set_default")
+                if isinstance(sd, int) and sd >= 0:
+                    _export_set_default_preset(sd)
 
 
             # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
@@ -1029,6 +1066,7 @@ def main():
                 snap["clip_length"] = settings.export_clip_length
                 snap["global_dir"] = settings.export_global_dir
                 snap["presets"] = settings.export_presets
+                snap["default_preset_idx"] = settings.export_default_preset_idx
                 snap["engine_ready"] = transcode_engine is not None
                 player.set_export_snapshot(snap)
                 persist = export_queue.to_persist()

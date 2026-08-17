@@ -54,26 +54,20 @@ STREAM_PORT_MIN, STREAM_PORT_MAX = 1024, 65535
 # engine's 180-frame max. Per-frame region cap is dropped entirely (unlimited), not exposed.
 EXPORT_CLIP_LENGTH_DEFAULT = 120
 EXPORT_CLIP_LENGTH_MIN, EXPORT_CLIP_LENGTH_MAX = 30, 180
-EXPORT_PRESET_DEFAULT_INDEX = 2  # "均衡" (CQ 33) -- the user's most flexible/common default
+EXPORT_DEFAULT_PRESET_INDEX = 0  # fallback index of the "default" preset (single shipped preset)
 
 # Shipped encode presets (plain JSON-serializable dicts; webstream.encoder.EncodeOptions is the
-# runtime form). Every preset is HEVC + p7 (max quality) + audio copy + subtitle, since even the
-# slowest/best encode is far cheaper than the AI decensor pipeline.
+# runtime form). One quality-first "自动" preset: HEVC + CQ 33 + audio copy + subtitle, no
+# bitrate/maxrate constraint (quality-driven, bounded only by CQ). CQ / bitrate / maxrate are
+# INDEPENDENT knobs (each gated by its *_enabled flag), matching NVENC's VBR rate control where
+# targetQuality, averageBitRate and maxBitRate coexist. Bitrates are int kbps.
 EXPORT_PRESET_DEFAULTS: list[dict] = [
-    {"name": "近无损", "codec": "hevc", "rate_mode": "cq", "cq": 18, "bitrate": "",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
-    {"name": "高画质", "codec": "hevc", "rate_mode": "cq", "cq": 30, "bitrate": "",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
-    {"name": "均衡", "codec": "hevc", "rate_mode": "cq", "cq": 33, "bitrate": "",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
-    {"name": "压缩", "codec": "hevc", "rate_mode": "cq", "cq": 40, "bitrate": "",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
-    {"name": "高码率 30M", "codec": "hevc", "rate_mode": "vbr", "cq": 0, "bitrate": "30M",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
-    {"name": "中码率 6M", "codec": "hevc", "rate_mode": "vbr", "cq": 0, "bitrate": "6M",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
-    {"name": "低码率 1.3M", "codec": "hevc", "rate_mode": "vbr", "cq": 0, "bitrate": "1250k",
-     "preset": "p7", "audio_copy": True, "audio_bitrate": "320k", "subtitle": True},
+    {"name": "自动", "codec": "hevc", "preset": "p7",
+     "cq_enabled": True, "cq": 33,
+     "bitrate_enabled": False, "bitrate": 0,
+     "maxrate_enabled": False, "maxrate": 0,
+     "audio_copy": True, "audio_bitrate": 256,
+     "subtitle": True, "suffix": "_Decensored"},
 ]
 
 
@@ -158,6 +152,7 @@ class Settings:
     export_clip_length: int = EXPORT_CLIP_LENGTH_DEFAULT
     export_global_dir: str = ""
     export_presets: list[dict] = field(default_factory=lambda: [dict(p) for p in EXPORT_PRESET_DEFAULTS])
+    export_default_preset_idx: int = EXPORT_DEFAULT_PRESET_INDEX
     export_queue: list[dict] = field(default_factory=list)
 
     def push_recent(self, path: str) -> None:
@@ -266,19 +261,30 @@ def clamp_export_clip_length(value) -> int:
     return max(EXPORT_CLIP_LENGTH_MIN, min(EXPORT_CLIP_LENGTH_MAX, v))
 
 
+def _clamp_kbps(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, default)
+
+
 def _coerce_export_preset(p: dict) -> dict:
     codec = "h264" if p.get("codec") == "h264" else "hevc"
-    rate_mode = "vbr" if p.get("rate_mode") == "vbr" else "cq"
+    cq = _clamp_kbps(p.get("cq"), 33)
     return {
         "name": str(p.get("name") or "预设"),
         "codec": codec,
-        "rate_mode": rate_mode,
-        "cq": int(p.get("cq") or 0),
-        "bitrate": str(p.get("bitrate") or "8M"),
         "preset": str(p.get("preset") or "p7"),
+        "cq_enabled": bool(p.get("cq_enabled", True)),
+        "cq": max(0, min(51, cq)),
+        "bitrate_enabled": bool(p.get("bitrate_enabled", False)),
+        "bitrate": _clamp_kbps(p.get("bitrate")),
+        "maxrate_enabled": bool(p.get("maxrate_enabled", False)),
+        "maxrate": _clamp_kbps(p.get("maxrate")),
         "audio_copy": bool(p.get("audio_copy", True)),
-        "audio_bitrate": str(p.get("audio_bitrate") or "320k"),
+        "audio_bitrate": _clamp_kbps(p.get("audio_bitrate"), 256),
         "subtitle": bool(p.get("subtitle", True)),
+        "suffix": str(p.get("suffix") or "_Decensored"),
     }
 
 
@@ -293,6 +299,15 @@ def clamp_export_presets(value) -> list[dict]:
     if not out:
         out = [dict(p) for p in EXPORT_PRESET_DEFAULTS]
     return out
+
+
+def clamp_export_default_idx(value, preset_count: int) -> int:
+    """Clamp the persisted default-preset index into the current preset list."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(v, max(0, preset_count - 1)))
 
 
 def clamp_export_queue(value) -> list[dict]:
@@ -395,6 +410,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
         data = json.loads(raw)
         if not isinstance(data, dict):
             return Settings()
+        presets = clamp_export_presets(data.get("export_presets"))
         return Settings(
             volume=_clamp_volume(data.get("volume", 1.0)),
             muted=_coerce_bool(data.get("muted"), False),
@@ -414,7 +430,9 @@ def load(path: Optional[str | Path] = None) -> Settings:
             stream_passthrough=_coerce_bool(data.get("stream_passthrough"), False),
             export_clip_length=clamp_export_clip_length(data.get("export_clip_length", EXPORT_CLIP_LENGTH_DEFAULT)),
             export_global_dir=data.get("export_global_dir", "") if isinstance(data.get("export_global_dir"), str) else "",
-            export_presets=clamp_export_presets(data.get("export_presets")),
+            export_presets=presets,
+            export_default_preset_idx=clamp_export_default_idx(
+                data.get("export_default_preset_idx"), len(presets)),
             export_queue=clamp_export_queue(data.get("export_queue")),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
@@ -450,6 +468,8 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "export_clip_length": clamp_export_clip_length(settings.export_clip_length),
             "export_global_dir": settings.export_global_dir,
             "export_presets": clamp_export_presets(settings.export_presets),
+            "export_default_preset_idx": clamp_export_default_idx(
+                settings.export_default_preset_idx, len(settings.export_presets)),
             "export_queue": clamp_export_queue(settings.export_queue),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))

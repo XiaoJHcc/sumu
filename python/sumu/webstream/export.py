@@ -17,12 +17,13 @@ import os
 import threading
 from urllib.parse import urlparse
 
-_OUT_SUFFIX = "-Decensored"  # output naming: <stem>-Decensored.mp4 (user's preference)
+_DEFAULT_SUFFIX = "_Decensored"  # per-preset output naming: <stem><suffix>.mp4 (preset overrides)
 
 
-def default_out_path(source: str, global_dir: str = "") -> str:
-    """Resolve an output path: `<stem>-Decensored.mp4`. Local files go next to the source (or
-    under `global_dir` when given); http(s) sources fall back to the cwd (no meaningful dir)."""
+def default_out_path(source: str, global_dir: str = "", suffix: str = "") -> str:
+    """Resolve an output path: `<stem><suffix>.mp4` (suffix defaults to `_Decensored`, but the
+    active preset supplies its own). Local files go next to the source (or under `global_dir` when
+    given); http(s) sources fall back to the cwd (no meaningful dir)."""
     if source.startswith("http://") or source.startswith("https://"):
         name = os.path.basename(urlparse(source).path) or "output.mp4"
         base = os.getcwd()
@@ -30,7 +31,7 @@ def default_out_path(source: str, global_dir: str = "") -> str:
         name = os.path.basename(source) or "output.mp4"
         base = global_dir or os.path.dirname(os.path.abspath(source)) or os.getcwd()
     stem, _ext = os.path.splitext(name)
-    return os.path.join(base, f"{stem}{_OUT_SUFFIX}.mp4")
+    return os.path.join(base, f"{stem}{suffix or _DEFAULT_SUFFIX}.mp4")
 
 
 class ExportQueueItem:
@@ -86,8 +87,8 @@ class ExportQueue:
     # ---- structure (main thread) -------------------------------------------------------
 
     def add(self, source: str, preset_idx: int, out_mode: str = "auto",
-            custom_out: str = "", global_dir: str = "") -> int:
-        out_path = self._resolve_out(source, out_mode, custom_out, global_dir)
+            custom_out: str = "", global_dir: str = "", suffix: str = "") -> int:
+        out_path = self._resolve_out(source, out_mode, custom_out, global_dir, suffix)
         item = ExportQueueItem(self._next_id, source, out_path, out_mode, preset_idx)
         self._next_id += 1
         with self._lock:
@@ -240,9 +241,10 @@ class ExportQueue:
         return None
 
     @staticmethod
-    def _resolve_out(source: str, out_mode: str, custom_out: str, global_dir: str) -> str:
+    def _resolve_out(source: str, out_mode: str, custom_out: str, global_dir: str,
+                     suffix: str) -> str:
         if out_mode == "custom":
-            return custom_out or default_out_path(source, "")
+            return custom_out or default_out_path(source, "", suffix)
         if out_mode == "global":
-            return default_out_path(source, global_dir)
-        return default_out_path(source, "")
+            return default_out_path(source, global_dir, suffix)
+        return default_out_path(source, "", suffix)
