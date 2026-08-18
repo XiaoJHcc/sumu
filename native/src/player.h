@@ -219,8 +219,8 @@ struct UiIntents {
     int export_pick_custom = -1;      // item id to pick a custom output path for
     int export_remove = -1;           // item id to remove
     int export_cancel = -1;           // item id to cancel
-    int export_move_id = -1;          // item id to reorder
-    int export_move_dir = 0;          // -1 up / +1 down
+    int export_move_id = -1;          // item id being drag-reordered
+    int export_move_to = -2;          // drop target: insert before this item id (-1 = queue end)
     int export_item_preset_id = -1;   // item id whose preset dropdown changed
     int export_item_preset_idx = -1;  // new preset index
     int export_item_out_id = -1;      // item id whose output-mode dropdown changed
@@ -553,6 +553,12 @@ private:
 
     void build_export_preset_editor();
 
+    // Sub-builders of build_export_screen (player_ui_export.cpp).
+    void build_export_preset_card(int i, float width);
+    void build_export_item_card(ExportItemView& item, float width,
+                                const std::vector<const char*>& preset_names,
+                                const char* const out_modes[]);
+
     void open_export_preset_editor(int idx);
 
     void build_status_float();
@@ -818,7 +824,7 @@ private:
     bool export_mode_ = false;
     bool export_engine_ready_ = false;
     bool export_running_ = false;
-    bool export_presets_open_ = false;   // preset manager/editor modal
+    bool export_presets_open_ = false;   // one-shot trigger: arms OpenPopup for the preset modal
     int export_clip_length_ = 120;       // committed value (pushed by Python each tick)
     int export_clip_length_edit_ = 120;  // local slider value (seeded once per entry)
     bool export_clip_edit_init_ = false;
@@ -826,6 +832,8 @@ private:
     int export_default_preset_idx_ = 0; // pushed by Python; local radio selection between ticks
     std::vector<ExportPresetView> export_presets_;
     std::vector<ExportItemView> export_items_;
+    int export_drag_id_ = -1;           // queue item being drag-reordered (gap-based D&D)
+    int export_drag_slot_ = -1;         // open gap position (index among non-dragged items)
     // Preset editor modal state (staged locally, seeded once per open like settings_edit_*).
     int export_preset_edit_idx_ = -1;   // -1 closed / -2 new / >=0 edit
     bool export_preset_edit_init_ = false;

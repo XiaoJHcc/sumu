@@ -118,20 +118,18 @@ class ExportQueue:
             elif item.status == "pending":
                 item.status = "cancelled"
 
-    def move(self, item_id: int, delta: int) -> None:
-        """Move a pending item up (-1) / down (+1) within the list."""
-        if delta not in (-1, 1):
-            return
+    def move_to(self, item_id: int, target_id: int) -> None:
+        """Drag-reorder a pending item: insert it before target_id (-1 == queue end)."""
         with self._lock:
             idx = next((i for i, it in enumerate(self.items) if it.id == item_id), None)
-            if idx is None:
+            if idx is None or self.items[idx].status != "pending":
                 return
-            j = idx + delta
-            if j < 0 or j >= len(self.items):
+            item = self.items.pop(idx)
+            t = next((i for i, it in enumerate(self.items) if it.id == target_id), None)
+            if target_id < 0 or t is None:
+                self.items.append(item)
                 return
-            if self.items[idx].status != "pending" or self.items[j].status != "pending":
-                return
-            self.items[idx], self.items[j] = self.items[j], self.items[idx]
+            self.items.insert(t, item)
 
     def start(self) -> None:
         """Begin processing pending items sequentially (no-op if already running)."""
@@ -145,7 +143,8 @@ class ExportQueue:
         """Stop the running item (engine cancel) and skip every pending item."""
         with self._lock:
             self._cancel_requested = True
-            self.engine.cancel()
+            if self.engine is not None:  # None until model warmup wires the engine in
+                self.engine.cancel()
             for item in self.items:
                 if item.status == "pending":
                     item.status = "cancelled"

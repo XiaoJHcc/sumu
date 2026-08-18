@@ -300,9 +300,10 @@ void Player::build_open_url_popup(){
         ImGui::CloseCurrentPopup();
     }
 
-    const float pad = ui_s(12.0f); // == BeginModal's body indent (kModalBodyPadBase)
-    const float content_w = ui_s(440.0f);
-    ImGui::PushItemWidth(content_w);
+    // BeginModal pins the window width and insets the body by kPaddingContainer on all
+    // four sides, and presets the item width to the full content column.
+    const float pad = ui_s(ui::theme::kPaddingContainer);
+    const float content_w = ui_s(ui::theme::kModalContentW);
 
     auto trim_url = [](const char* raw) -> std::string {
         std::string s(raw ? raw : "");
@@ -344,9 +345,11 @@ void Player::build_open_url_popup(){
 
     if (!ui_str_.open_url_hint.empty()) {
         ImGui::PushFont(nullptr, kFontSizeSm); // secondary copy (hint)
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
         ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + content_w);
         ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
         ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
         ImGui::PopFont();
         ImGui::Spacing();
     }
@@ -355,10 +358,8 @@ void Player::build_open_url_popup(){
         ImGui::SetKeyboardFocusHere();
         open_url_focus_ = false;
     }
-    // Bare ImGui::InputText kept: EnterReturnsTrue (Enter submits) has no ui::TextInput
-    // parameter, and dropping it would change the submit behavior.
-    bool enter = ImGui::InputText("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
-        ImGuiInputTextFlags_EnterReturnsTrue);
+    bool enter = ui::TextInput("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
+        nullptr, 0.0f, ImGuiInputTextFlags_EnterReturnsTrue);
     if (open_url_show_error_ && !ui_str_.open_url_invalid.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
         ImGui::TextUnformatted(ui_str_.open_url_invalid.c_str());
@@ -411,7 +412,6 @@ void Player::build_open_url_popup(){
     // Esc is handled by ui::BeginModal (it closes the popup and clears `open`; the flags
     // are reset at the top of this body when that happens).
 
-    ImGui::PopItemWidth();
     ui::EndModal();
 }
 
@@ -430,12 +430,14 @@ void Player::build_stream_popup(){
         + "###sumu_stream";
     if (!ui::BeginModal(modal_title.c_str(), &open)) return;
 
-    const float pad = ui_s(12.0f); // == BeginModal's body indent (kModalBodyPadBase)
-    const float content_w = ui_s(440.0f);
-    ImGui::PushItemWidth(content_w);
+    // BeginModal pins the window width and insets the body by kPaddingContainer on all
+    // four sides, and presets the item width to the full content column.
+    const float pad = ui_s(ui::theme::kPaddingContainer);
+    const float content_w = ui_s(ui::theme::kModalContentW);
 
-    const float label_w = ui_s(120.0f);
-    const float field_w = content_w - label_w;
+    const float label_w = ui_s(88.0f);
+    // InlineLabel leaves the cursor past the label column + ItemInnerSpacing.
+    const float field_w = content_w - label_w - ImGui::GetStyle().ItemInnerSpacing.x;
     const float pick_w = ui_s(96.0f);
 
     if (stream_running_) {
@@ -445,20 +447,14 @@ void Player::build_stream_popup(){
         if (!stream_url_.empty())
             ImGui::TextLinkOpenURL(stream_url_.c_str(), stream_url_.c_str());
     } else {
-        // Form rows: left label + right input, laid out manually (not a table) so every row's
-        // right edge lands at pad + content_w with the same pad margin as the left indent.
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(ui_str_.stream_port_label.empty() ? "Port" : ui_str_.stream_port_label.c_str());
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(pad + label_w);
+        // Form rows: InlineLabel (standard font, fixed column) + control filling the rest,
+        // so every row's right edge lands at the same content-column edge.
+        ui::InlineLabel(ui_str_.stream_port_label.empty() ? "Port" : ui_str_.stream_port_label.c_str(), label_w);
         ui::IntInput("##stream_port", &stream_port_edit_, field_w);
         if (stream_port_edit_ < 1) stream_port_edit_ = 1;
         if (stream_port_edit_ > 65535) stream_port_edit_ = 65535;
 
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(ui_str_.stream_root_label.empty() ? "Root" : ui_str_.stream_root_label.c_str());
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(pad + label_w);
+        ui::InlineLabel(ui_str_.stream_root_label.empty() ? "Root" : ui_str_.stream_root_label.c_str(), label_w);
         ui::TextInput("##stream_root", stream_root_buf_, sizeof(stream_root_buf_), nullptr,
             field_w - pick_w - ImGui::GetStyle().ItemSpacing.x);
         ImGui::SameLine();
@@ -475,16 +471,10 @@ void Player::build_stream_popup(){
         // Token row: a "无 token" checkbox (unchecked = use a token for auth). While checked
         // the token input is hidden; while unchecked, an empty input means "generate a random
         // token each start".
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(ui_str_.stream_no_token.empty() ? "No token" : ui_str_.stream_no_token.c_str());
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(pad + label_w);
+        ui::InlineLabel(ui_str_.stream_no_token.empty() ? "No token" : ui_str_.stream_no_token.c_str(), label_w);
         ui::Checkbox("##stream_no_token", &stream_no_token_edit_);
         if (!stream_no_token_edit_) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(ui_str_.stream_token_label.empty() ? "Token" : ui_str_.stream_token_label.c_str());
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(pad + label_w);
+            ui::InlineLabel(ui_str_.stream_token_label.empty() ? "Token" : ui_str_.stream_token_label.c_str(), label_w);
             ui::TextInput("##stream_token", stream_token_buf_, sizeof(stream_token_buf_),
                 ui_str_.stream_token_hint.empty() ? "" : ui_str_.stream_token_hint.c_str(),
                 field_w);
@@ -520,7 +510,6 @@ void Player::build_stream_popup(){
             ui::ButtonVariant::Secondary, ui::ControlSize::Regular, btn_w))
         ImGui::CloseCurrentPopup();
 
-    ImGui::PopItemWidth();
     ui::EndModal();
 }
 

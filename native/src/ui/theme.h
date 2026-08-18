@@ -90,12 +90,43 @@ inline ImU32 media_track_u32() { return to_u32(kMediaTrack); }
 // ---- metrics (96-DPI bases) ---------------------------------------------------------------
 
 inline constexpr float kRadiusControl = 6.0f; // buttons, inputs, combos, popups, children
-inline constexpr float kRadiusWindow = 8.0f;  // windows / modals
+inline constexpr float kRadiusWindow = 8.0f;  // windows / modals / cards
+inline constexpr float kRadiusCheckbox = 4.0f;
+
+// Guaranteed minimum inner padding of every container (cards, modals, panels): the distance
+// between a container's edge and any control inside it (window↔slider, modal↔input, ...).
+inline constexpr float kPaddingContainer = 12.0f;
 
 inline constexpr float kSpaceS = 4.0f;
 inline constexpr float kSpaceM = 8.0f;
 inline constexpr float kSpaceL = 12.0f;
 inline constexpr float kSpaceXL = 16.0f;
+
+// Single-line control standard (inputs, combos, buttons): 32px = 18px font + 2*7px
+// FramePadding.y (set in apply_theme). All three read the same height/rounding/colors.
+inline constexpr float kControlHeight = 32.0f;
+// Compact numeric column used inside mixed rows and next to sliders.
+inline constexpr float kNumericInputW = 72.0f;
+
+// macOS slider: thin gray track, accent fill, large round knob.
+inline constexpr float kSliderTrackH = 4.0f;
+inline constexpr float kSliderKnobR = 9.0f; // radius; diameter 18px ≈ label cap height
+
+// macOS checkbox: small rounded square about as tall as the label text.
+inline constexpr float kCheckboxSize = 16.0f;
+
+// Combo dropdown arrow (small filled triangle at the frame's right edge).
+inline constexpr float kComboArrowW = 9.0f;
+inline constexpr float kComboArrowH = 5.0f;
+
+// Standard modal content-column width (window width = this + 2 * kPaddingContainer).
+// The preset editor and other wide forms may opt into kModalContentWLg.
+inline constexpr float kModalContentW = 440.0f;
+inline constexpr float kModalContentWLg = 480.0f;
+// Modal title-strip height, identical for every ui::BeginModal (title text + close X).
+// Matches the main window's top bar (Player::kTopBarHBase = 32) so every title strip
+// in the app shares one height standard.
+inline constexpr float kModalTitleH = 32.0f;
 
 // Secondary-copy font size (unscaled base @ 96 DPI) -- mirrors Player::kFontSizeSm.
 // Duplicated here so this layer stays player.h-free; pass to PushFont(nullptr, size),

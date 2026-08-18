@@ -1,9 +1,13 @@
 # sumu UI 设计规范（`native/src/ui/`）
 
-本文档描述阶段二建立的 ImGui 设计系统：色板/尺寸层 `ui/theme.h`、控件层
-`ui/widgets.h`，以及各页面（player_ui_*.cpp）的使用约定。目标是 **macOS 风格的深色
-极简** 观感：低亮度中性底色、细发丝描边（hairline）、统一的 6/8px 圆角语言、单一强调色
-（macOS dark system blue），控件本身不携带任何调用点的样式代码。
+本文档描述 ImGui 设计系统：色板/尺寸层 `ui/theme.h`、控件层 `ui/widgets.h`，以及各
+页面（player_ui_*.cpp）的使用约定。目标是 **macOS 风格的深色极简** 观感：低亮度
+中性底色、细发丝描边（hairline）、统一的 6/8px 圆角语言、单一强调色（macOS dark
+system blue），控件本身不携带任何调用点的样式代码。
+
+**核心原则：彻底重绘，不打样式补丁。** 所有表单型控件（输入框/下拉/勾选框/拉条/
+按钮）的观感与行为由 widgets 层自绘实现并统一度量；页面代码只组合控件，不出现任何
+裸 `ImGui::Slider*/Checkbox/Combo/InputInt` 或就地色值。
 
 ## 文件布局（阶段一拆分回顾）
 
@@ -18,7 +22,7 @@ native/src/
   player_engine.cpp      解码/调度/缩略图 scrub 等引擎侧逻辑
   player_ui_overlays.cpp build_ui() 调度 + 首屏提示/打开 URL/Web 串流弹窗/状态浮窗
   player_ui_bars.cpp     顶栏/底栏（手绘 seekbar、音量条、图标）+ 设置面板
-  player_ui_export.cpp   离线导出页 + 预设编辑器
+  player_ui_export.cpp   离线导出页（四段卡片式布局）+ 预设管理器/编辑器
   player_pybind.cpp      pybind11 模块定义
   ui_util.h/.cpp         纯函数工具（basename、elide、mmss、seekbar 映射），可单测
   ui/theme.h/.cpp        设计系统色板 + 尺寸层（namespace ui::theme）
@@ -33,19 +37,19 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 | 常量 | 值 | 用途 |
 |---|---|---|
 | `kWindowBg` | #1E1E20 | 主窗口背景 |
-| `kPanelBg` | #262628 | 卡片/弹窗/面板/顶栏底色，比窗口背景亮一档 |
-| `kBorder` | 白 @ 12% | 发丝描边（分隔线、Secondary 按钮描边） |
+| `kPanelBg` | #262628 | 卡片/弹窗/面板底色，比窗口背景亮一档；**所有容器背景统一用它**（设置面板等浮窗也已改为实心 `kPanelBg`，不再半透明） |
+| `kBorder` | 白 @ 12% | 发丝描边（卡片描边、Secondary 按钮描边、下拉弹窗描边） |
 | `kBorderStrong` | 白 @ 22% | 浮层 chrome 描边（modal/loading 卡片外框） |
-| `kText` / `kTextSecondary` / `kTextDim` | 白 @ 88% / 55% / 32% | 正文 / 次级说明 / 弱化 |
-| `kAccent` / `kAccentHover` / `kAccentActive` | #0A84FF / hover / active | 唯一强调色（Primary 按钮、CheckMark、链接、进度条填充） |
+| `kText` / `kTextSecondary` / `kTextDim` | 白 @ 88% / 55% / 32% | 正文 / 次级说明（hint、拉条端文字、摘要） / 弱化 |
+| `kAccent` / `kAccentHover` / `kAccentActive` | #0A84FF / hover / active | 唯一强调色（Primary 按钮、勾选框勾选态、拉条填充、Combo 选中勾、链接） |
 | `kError` / `kWarning` / `kSuccess` | #FF453A / #FFD60A / #32D74B | 错误 / 警告 / 成功文本与状态 |
-| `kControlBg` | 白 @ 7% | 输入框/Combo/Checkbox 的 FrameBg |
-| `kTrackBg` | 白 @ 10% | 滑杆轨道 |
+| `kControlBg` | 白 @ 7% | 输入框/Combo/未勾选 Checkbox 的填充，**比卡片背景浅一档** |
+| `kTrackBg` | 白 @ 10% | 拉条轨道 |
 | `kButtonBg` | 白 @ 8%（hover 12% / active 16%） | Secondary（中性）按钮填充 |
-| `kHoverFill` | 白 @ 12% | 手绘命中区（图标按钮）的 hover 浅底 |
-| `kIconColor` / `kIconColorDim` | (230,230,230) / (110,110,110) | 手绘 chrome 图标 glyph 色 / 禁用态；seekbar/音量旋钮同用 `kIconColor` |
+| `kHoverFill` | 白 @ 12% | 手绘命中区（图标按钮、Combo 下拉行）的 hover 浅底 |
+| `kIconColor` / `kIconColorDim` | (230,230,230) / (110,110,110) | 手绘 chrome 图标 glyph 色 / 弱化态；seekbar/音量旋钮同用 `kIconColor` |
 | `kMediaFill` / `kMediaTrack` | (200,200,60) / (90,90,90) | 手绘媒体条（seekbar/音量）的已播放填充 / 轨道，既定观感，值冻结 |
-| `kOverlayBgAlpha` | 0.55（float） | 半透明浮窗（状态浮窗/底栏/设置面板）喂给 `SetNextWindowBgAlpha` |
+| `kOverlayBgAlpha` | 0.55（float） | 仅剩状态浮窗使用的半透明 alpha |
 
 `apply_theme(ImGuiStyle&)` 在 `Player::ui_init()` 中替代 `StyleColorsDark()`，且在
 `ui_style_base_` 快照**之前**调用，保证 `apply_ui_dpi()` 的 `ScaleAllSizes` 重建总是从
@@ -53,25 +57,88 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 
 ## 尺寸刻度（96 DPI 基准，ScaleAllSizes 统一放大）
 
-- 圆角：`kRadiusControl = 6`（按钮/输入框/Combo/小浮窗）、`kRadiusWindow = 8`（窗口/modal）
-- 间距：`kSpaceS/M/L/XL = 4/8/12/16`
-- 次级字号：`kFontSizeSm = 16`（配合 `PushFont(nullptr, kFontSizeSm)`；不要用它乘
-  `GetFontSize()`，会重复应用 FontScaleDpi）
-- 标准控件高 28px（FramePadding (10,5) + 18px 基础字体）
+### 容器
+
+- **`kPaddingContainer = 12`：所有卡片/弹窗/面板必须保证的最小内边距**（四边）。
+  控件永远不得贴容器边缘（旧 URL 弹窗输入框右侧贴边即反例，已由 BeginModal 的钉宽
+  机制根治）。
+- **卡片** = `ui::BeginCard`：`kPanelBg` 底 + `kRadiusWindow` 圆角 + 1px `kBorder` 描边 +
+  四边 12px padding。
+- 弹窗 = `ui::BeginModal`：宽度钉死为 `内容宽 + 2×12`，内容列右缘距窗口右缘恒为
+  12px。标准内容宽 `kModalContentW = 440`；宽表单（预设编辑器）用
+  `kModalContentWLg = 480`。**新弹窗一律从这两个宽度里选。** 标题条高度统一为
+  `kModalTitleH = 32`（与主窗口顶栏 `kTopBarHBase` 同高，全 App 一种标题条；内容区
+  右缘由 WindowPadding 机制内缩，任何"填满剩余宽"的控件都不可能贴边）。
+
+### 单行控件（输入框 / 下拉 / 按钮共用）
+
+- **`kControlHeight = 32`**（FramePadding (10,7) + 18px 基础字体），圆角
+  `kRadiusControl = 6`，填充 `kControlBg`，无边框（Secondary 按钮例外：自绘 hairline
+  描边）。按钮与输入框同高——比旧版 28px 更高。
+- 窗口圆角 `kRadiusWindow = 8`。
+- 数值输入小列宽 `kNumericInputW = 72`（拉条旁的数字框、混排行输入框）。
+
+### 拉条（macOS 风格）
+
+- 轨道 `kSliderTrackH = 4`（细），填充 `kAccent`（拉出蓝），拉杆为
+  `kSliderKnobR = 9` 的大圆形浅色钮（带 1px 暗描边）。
+- 默认形态 = **数字输入框 + 纯拉条** 的组合行；需要指明两端方向的拉条（CQ）用
+  `SliderIntEnds`，左右两端为**小字号文字**（不用图标）。
+
+### 勾选框
+
+- `kCheckboxSize = 16`、圆角 `kRadiusCheckbox = 4`，约与 label 文字同高。
+- 勾选态：`kAccent` 底 + 白色对勾；未勾选：`kControlBg` 底 + hairline 描边。
+
+### 下拉菜单
+
+- 关闭态与输入框完全一致，仅右侧一个小三角（`kComboArrowW/H = 9×5`）。
+- 弹出层 = `kPanelBg` 圆角面板 + hairline 描边，逐行卡片：正常态与面板同色（**无
+  填充**），仅 hover 行亮起 `kHoverFill`；当前项行首有强调色小勾。
+
+### 间距与字号
+
+- 间距：`kSpaceS/M/L/XL = 4/8/12/16`。
+- 字号：标准 = `kFontSizeBase = 18`（小节标题、行内 label、控件文字）；小型 =
+  `kFontSizeSm = 16`（行前 label、hint、摘要、拉条端文字）。配合
+  `PushFont(nullptr, size)`；不要乘 `GetFontSize()`（会重复应用 FontScaleDpi）。
+- 目前字体只载入了常规字重，小节标题靠"标准字号 + 全不透明白 + 间距层级"区分，
+  **不使用分割线**。如未来需要加粗，需额外加载粗体字重。
 
 ### DPI 规则
 
 - **控件几何走 ImGui style 推导**（GetFrameHeight/CalcTextSize/style vars），
-  `apply_ui_dpi()` 已用 `ScaleAllSizes` + `FontScaleDpi` 缩放，控件层自己**不乘** DPI
-  因子。
+  `apply_ui_dpi()` 已用 `ScaleAllSizes` + `FontScaleDpi` 缩放，控件层自己**不乘**
+  DPI 因子。
 - **布局定宽走 `Player::ui_s()`**（96 DPI 基准 × 缩放），经由各控件尾部的 `width`
-  参数传入（`0` = 内容自适应 / 保持调用方的 item width）。
-- widgets 层内部需要缩放时用 `ui_scale() = GetFrameHeight() / 28` 作代理。
+  参数传入（`0` = 填满剩余内容宽 / 保持调用方的 item width）。
+- widgets 层内部需要固定像素度量时用 `ui_scale() = GetFrameHeight() / 32` 作代理。
+
+## 标签三分法
+
+| 种类 | 控件 | 字号 | 用法 |
+|---|---|---|---|
+| 小节标题 | `ui::SectionHeader(text)` | 标准 18，`kText` | 卡片/面板内的小节名（如"设置"、AI 管线设置）。上间距 12、下间距 8，**无分割线**。 |
+| 行前 label | `ui::LineLabel(text)` | 小型 16 | 较长 label，独占一行位于控件上方（缓冲窗口（帧）、粘贴 https 直链）。**上间距宽（12）、下间距窄**。 |
+| 行内 label | `ui::InlineLabel(text, width = 0)` | 标准 18 | 短 label，与控件同行（名称、编码格式）。`width > 0` 时占固定列宽（文字垂直居中、裁切），用于多行对齐。**以 SameLine 收尾**（职责是引出后续控件）。 |
+| 单位文本 | `ui::UnitText(text)` | 标准 18，次级色 | 行尾的单位（kbps 等），垂直居中，**不拖 SameLine**——行终结符。 |
+
+**行契约（防止整行被顶出可视区的链式泄漏）**：一行内除 `InlineLabel` 外，任何控件
+/辅助文本都不得以挂起的 SameLine 收尾；行间的新行由下一行的第一个控件自然开始。
+混合行的垂直居中一律用"占位 Dummy + 文本居中绘制"或 `SetCursorPosY` 原位下移，
+**禁止用 Dummy 做行内垂直偏移**（Dummy 会结束 SameLine 行，把后续控件换行顶出
+卡片）。定高卡片子窗口一律带 `NoScrollbar | NoScrollWithMouse`：内容必须恰好容纳，
+溢出宁可裁切也不得长出卡内滚动条。
+
+`SectionHeader`/`LineLabel` 位于容器顶部时自动跳过上方间距（卡片 padding 已提供
+内边距）。小节标题要与按钮共行时（如"视频队列 + 添加文件"），用定宽
+`InlineLabel` + 尾随按钮实现，不要再手写 PushFont。
 
 ## 控件 API（namespace ui，`ui/widgets.h`）
 
 所有控件**自行完成全部 PushStyleColor/Var + Pop**，调用点零样式代码。`width` 参数一律
-是"调用方已 ui_s 过的像素宽"，`0` 表示不动 item width。
+是"调用方已 ui_s 过的像素宽"，`0` 表示填满剩余内容宽。所有控件遵循 `label##id`
+约定：可见部分非空时作为**行内 label 画在控件左侧**。
 
 ```cpp
 enum class ButtonVariant { Primary, Secondary, Danger };
@@ -79,76 +146,131 @@ enum class ControlSize { Regular, Small };
 ```
 
 - `bool Button(label, variant = Secondary, size = Regular, width = 0)`
-  按钮层级：Primary = 强调色填充（**每个视图至多一个**，默认动作）；Secondary = 中性
-  填充 + hairline 描边；Danger = 破坏性操作（删除/移除），安静底色 + `kError` 文字。
-  `Small` 用于紧凑行（如导出队列的每行小按钮）。
-  ```cpp
-  if (ui::Button("开始导出", ui::ButtonVariant::Primary, ui::ControlSize::Regular, ui_s(120.0f)))
-      ui_intents_.export_start = true;
-  ```
-- `bool TextInput(label, buf, cap, hint = nullptr, width = 0)` /
-  `bool IntInput(label, int*, width = 0)` /
-  `bool Combo(label, items, count, int* idx, width = 0)`
-  标签前置的输入/下拉包装（`label##id` 约定）。注意 `TextInput` 暂无 flags 参数——
-  需要 `EnterReturnsTrue` 之类行为时保留裸 `ImGui::InputText` 并注释原因（现有唯一
-  一例：open-URL 弹窗的 URL 输入框）。
+  Primary = 强调色填充（**每个视图至多一个**，默认动作）；Secondary = 中性填充 +
+  hairline 描边；Danger = 破坏性操作，安静底色 + `kError` 文字。`Small` 用于紧凑行
+  （导出队列的每行小按钮）。
+- `bool TextInput(label, buf, cap, hint = nullptr, width = 0, flags = 0)`
+  输入框。`flags` 直传 ImGui（`EnterReturnsTrue`、`ReadOnly` 等）。
+- `bool IntInput(label, int*, width = 0)`
+  数值输入框，**无 +/- 步进按钮**（全站统一去掉）。
+- `bool Combo(label, items, count, int* idx, width = 0)`
+  自绘下拉（见"下拉菜单"一节）。
 - `bool Checkbox(label, bool*)` / `bool Radio(label, bool active)`
-  Radio 是 bool 形式；替代旧 `RadioButton(int*)` 时需在返回 true 的分支里自己做立即
-  赋值（见 player_ui_export.cpp 默认预设标记）。
-- `bool SliderInt(label, int*, min, max, width = 0)` /
-  `bool SliderFloat(label, float*, min, max, fmt = "%.2f", width = 0)`
-- `bool OptionalSlider(check_label, bool* enabled, slider_label, int* v, min, max)`
-  "启用 checkbox + 滑杆"耦合（导出预设 CQ 的模式）：未勾选时滑杆灰显
-  （BeginDisabled），当前值回显在滑杆后。任一控件变化都返回 true。**注意**它只适合
-  有明确区间的值；无界数值（如码率 kbps）仍用 Checkbox + IntInput，不要为它发明区间。
-- `void SectionHeader(text)`
-  小节标题：小字号 + 次级色，上方 12px 间距、下方 4px + 1px 发丝分隔线。替代
-  `PushFont(kFontSizeSm)+TextUnformatted+Separator` 模式。它画整行宽的分隔线，**不能
-  与 SameLine 的按钮共行**——那种行（如导出队列标题 + "添加文件"按钮）保持手写。
-- `void ProgressBar(frac, width = 0, height = 0)`
-  `frac ∈ [0,1]`，`-1` = 不定态动画；`width=0` 填满内容区，`height=0` 用标准框高。
-- `void Spinner(id)`
-  旋转弧线加载指示（提取自打开 URL 的加载卡片），半径由框高推导。
+  自绘 macOS 勾选框（见"勾选框"一节）。
+- `bool SliderInt(label, int*, min, max, width = 0, bool* committed = nullptr)` /
+  `bool SliderFloat(label, float*, min, max, fmt = "%.2f", width = 0, committed = nullptr)` /
+  `bool SliderIntEnds(label, int*, min, max, left_text, right_text, width = 0, committed = nullptr)`
+  自绘 macOS 拉条：数字框 + 细轨道 + 大圆钮。`SliderIntEnds` 两端带小字（仅用于
+  CQ 这类方向易混淆的拉条）。返回值 = 值本帧变化；**`committed` 在编辑结束的那一帧
+  置 true**（拖动松手 / 数字框失焦或回车），替代旧的 `IsItemDeactivatedAfterEdit()`
+  ——后者无法覆盖组合控件。提交语义一律用：
+  ```cpp
+  bool committed = false;
+  ui::SliderInt("##lead", &edit_, 1, 180, 0.0f, &committed);
+  if (committed && edit_ != cfg_) ui_intents_.lead = edit_;
+  ```
+- `void ProgressBar(frac, width = 0, height = 0)`：`frac ∈ [0,1]`，`-1` = 不定态。
+- `void Spinner(id)`：旋转弧线加载指示。
 - `IconButtonResult IconButton(str_id, size, disabled = false)`
-  手绘 glyph 图标按钮的自绘命中区（顶/底栏图标）；返回点击结果 + 屏幕矩形 +
-  draw list，调用方在其上居中画 glyph，hover 浅底自动绘制。`Player::icon_button()`
-  是同签名委托。
+  手绘 glyph 图标按钮命中区；返回点击结果 + 屏幕矩形 + draw list，调用方居中画
+  glyph（文件夹、垃圾桶等），hover 浅底自动绘制。`Player::icon_button()` 是同签名委托。
+
+### BeginCard / EndCard（卡片容器）
+
+```cpp
+if (ui::BeginCard("##card_id")) {   // kPanelBg + 8px 圆角 + hairline 描边 + 12px 四边 padding
+    ui::SectionHeader("小节");
+    // ...
+}
+ui::EndCard();
+```
+
+`height = 0` 时高度自适应内容。卡片之间用
+`Dummy(0, ui_s(kSpaceL) - ItemSpacing.y)` 保持 12px 节奏。
+
+> **裸 `BeginChild` 的 padding 陷阱**：ImGui 对无边框子窗口强制把 `WindowPadding`
+> 归零（见 imgui.cpp `Begin`：`ChildWindow && !AlwaysUseWindowPadding &&
+> WindowBorderSize == 0` → padding = 0），之前 push 的 padding 会被静默丢弃，内容
+> 直接贴到子窗口顶角。凡是为裸 `BeginChild` push 了非零 WindowPadding 的地方，必须
+> 传 `ImGuiChildFlags_AlwaysUseWindowPadding`（预设行卡、队列项卡即此模式）。
+> `BeginCard` 因带 `Borders` 不受影响；普通窗口/弹窗也不受影响。
 
 ### BeginModal / EndModal（统一模态框 chrome）
 
-替代各弹窗重复的自绘标题条 + 关闭 X + 边框。调用方仍持有 `OpenPopup("###id")`
-（sticky popup 流程不变）：
+标准两段式：标题条（标题文本 + 关闭 X）+ 内容区。宽度钉死、高度自适应，四边
+12px 内边距由机制保证。调用方仍持有 `OpenPopup("###id")`（sticky popup 流程）：
 
 ```cpp
 if (want_open) { ImGui::OpenPopup("###my_popup"); want_open = false; }
 bool open = true;
 const std::string title = display_title + "###my_popup"; // ### 后的是 ID，不显示
-if (ui::BeginModal(title.c_str(), &open, ImVec2(w_base, 0))) {
-    // ...body（自动缩进到标题条下方，左 pad = 12px@96DPI）...
+if (ui::BeginModal(title.c_str(), &open)) {   // 默认内容宽 kModalContentW = 440
+    // ...body（item width 已预设为整个内容列）...
     ui::EndModal();
 }
 ```
 
-特性：每帧居中（AlwaysAutoResize 需要一帧稳定内容尺寸）；`kPanelBg` 底、
-`kRadiusWindow` 圆角、自绘 1px `kBorderStrong` 边框；标题条含标题文本与
-hover 变强调色的关闭 X；Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false
-（需要清理表单错误标志时在 `BeginModal` 返回后检查 `!open`）。`size_base` 是 96-DPI
-基准整体尺寸，`x==0` 保持自动宽度。已有用例：`build_open_url_popup`（含 chromeless
-加载卡片的特例）、`build_stream_popup`。
+Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表单错误标志时在
+`BeginModal` 返回后检查 `!open`）。已有用例：open-URL（含 chromeless 加载卡片特例）、
+Web 串流、预设管理器/编辑器。
+
+## 页面布局约定
+
+### 导出页（`build_export_screen`）
+
+左右分栏（左列定宽 320px，右列填满剩余宽；两列各自滚动，外窗不滚动）：
+
+- **左列**，三张卡片 + 无卡操作区：
+  1. **AI 管线设置** —— SectionHeader + LineLabel + SliderInt（片段长度）。
+  2. **导出路径** —— 行内 label"全局输出目录" + 只读输入框（空时 hint "-"）+ 文件夹
+     图标按钮同行。
+  3. **导出预设**（一级卡片，高度 = 左列剩余空间，使左列整体永不滚动）—— 预设列表为
+     卡片行（卡内：默认勾选框 / 名称+摘要点击进编辑 / 末尾垃圾桶 icon，全部以整行高
+     为命中区垂直居中），列表区滚动，底部固定全宽"新建预设"按钮。**管理不再是弹窗**；
+     只有预设编辑器仍是 `BeginModal`（内容宽 480）。
+  4. 无卡：**[开始导出]** Primary 全列宽，引擎未就绪时灰显并附小字说明。
+- **右列**：**视频队列**整列高卡片。标题 + 右侧"添加文件"共行；每个队列项一张卡：
+  - 第 0 栏：拖拽 grip（六点 icon）——拖拽排序（`export_move_id` + `export_move_to`
+    intent，Python `ExportQueue.move_to()`；落到某卡 = 插到它前面，落到底部拖放条 =
+    移到队尾，拖动悬停的卡显示 accent 描边）。**已废弃上移/下移按钮。**
+  - 第 1 栏：状态（小字次级色）/ 文件名（elide，hover 出全路径 tooltip）/ 导出路径
+    （小字次级色，"→ "前缀）；进行中卡片底部加 4px 细进度条。
+  - 第 2 栏：预设下拉 + 输出方式下拉（定宽 150px，堆叠）。
+  - 第 3 栏：删除灰叉 icon（`kIconColorDim`，hover 变 `kError`），垂直居中。
+    **已废弃每项的取消按钮。**
+
+### 预设编辑器（`build_export_preset_editor`）
+
+- 标准 `BeginModal`（内容宽 480），标题条 + 内容两段式，无内部分割线。
+  `open_export_preset_editor(idx)` 通过 `export_presets_open_` 单次触发 OpenPopup；
+  保存/取消/X/Esc 都会关闭弹窗并把 `export_preset_edit_idx_` 归 -1。
+- 编辑器：短 label 行（名称/编码格式/速度/音频/后缀）用定宽列 `InlineLabel` + 控件填满
+  剩余宽。混排行（CQ/码率/最大码率）顺序固定为 **勾选框 → 行内 label → 数字输入框 →
+  拉条/单位**，三行的勾选框列、label 列（80px）、输入框列（72px）严格对齐；未勾选时
+  该行的输入/拉条 BeginDisabled 灰显。CQ 拉条两端文字"高质量 / 小体积"（低数值 = 高
+  质量，易混淆）。保存/取消为等宽半行按钮（修复旧版宽度溢出）。
 
 ## Dos / Don'ts（新增 UI 时）
 
 - **Do**：一切颜色取 `ui::theme::*` 常量；新颜色先入 theme.h，用语义化命名并注明
   用途，再在页面使用。
-- **Do**：一切标准控件走 `ui::` 包装（Button/TextInput/Combo/...）；主操作 Primary、
-  破坏性 Danger、其余 Secondary。
-- **Do**：模态弹窗走 `ui::BeginModal/EndModal`；小节标题走 `ui::SectionHeader`。
+- **Do**：一切标准控件走 `ui::` 包装；主操作 Primary、破坏性 Danger、其余 Secondary。
+- **Do**：容器走 `ui::BeginCard` / `ui::BeginModal`；标题/标签用三分法控件；宽度从
+  `kModalContentW` / `kModalContentWLg` 中选。
 - **Do**：布局定宽用 `ui_s()` 后传给控件的 `width`；控件内部几何不乘 DPI。
+- **Do**：拉条提交用 `committed` 出参；下拉/勾选变更即时提交（它们没有拖拽态）。
 - **Don't**：禁止在页面代码写就地 `IM_COL32(...)` / `ImVec4` 色值字面量，禁止就地
-  `PushStyleColor` 配色（窗口级的 bg/rounding/padding 覆盖除外，且色值必须来自
-  theme）。
+  `PushStyleColor` 配色（文字语义色如 `kError`/`kTextSecondary` 的 PushFont/Pop 组合
+  除外）；禁止裸 `ImGui::Slider*/Checkbox/Combo/InputInt`；禁止 `ImGui::Separator()`
+  （间距用 Dummy/间距刻度表达）。
 - **Don't**：不改行为——intents 记录、校验、字段读写、可见性条件保持原样；设计系统
   只负责"调用哪个函数、用哪个颜色"。
 - **例外（现存且合理）**：顶/底栏的手绘图标、seekbar/音量条、缩略图卡片是既定手绘
-  媒体观感，保留 ImDrawList 画法；open-URL 的 URL 输入框保留裸
-  `ImGui::InputText`（`EnterReturnsTrue` 无包装参数）。
+  媒体观感，保留 ImDrawList 画法；音量条的静音斜杠等一次性色值维持原样。
+
+## 布局验证
+
+改了导出页/预设编辑器布局后，跑 `scripts/shot_export_ui.py` 实证：它开一个无视频、
+无 AI 引擎的裸 Player 窗口，注入合成快照（6 预设 + 3 种状态的队列项），先截导出页
+全图，再自动点击首个预设行截编辑器弹窗（`native/trace/export_ui_shot*.png`）。肉眼
+检查：滚动条条数、垂直居中、label 列对齐、四边 12px 边距。

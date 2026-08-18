@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
 
+#include <cstdlib>
+
 // ---- error helpers -----------------------------------------------------------------------
 void check_hr(HRESULT hr, const char* what)
 {
@@ -852,6 +854,10 @@ void Player::set_stream_defaults(int port, const std::string& root, bool no_toke
 void Player::set_export_mode(bool on){
     export_mode_ = on;
     if (on) export_clip_edit_init_ = false; // re-seed the clip slider on entry
+    // Never carry a drag across screen transitions (a stale id would commit a phantom
+    // move on the first frame back).
+    export_drag_id_ = -1;
+    export_drag_slot_ = -1;
 }
 
 // Python pushes the export screen's state every tick (clip_length, global_dir, presets[],
@@ -962,6 +968,13 @@ void Player::notify_open_url_finished(bool ok){
 // and by fit_viewport()/resize_window_for_video(). Called from ui_init() and WM_DPICHANGED
 // (public so WndProc can route the message here, same as on_resize/ui_tick).
 void Player::apply_ui_dpi(float scale){
+    // Debug/verification hook: SUMU_UI_SCALE=1.5 forces a monitor scale so high-DPI layout
+    // bugs are reproducible on a 96-DPI display (scripts/shot_export_ui.py uses this).
+    static const float forced = [](){
+        const char* e = getenv("SUMU_UI_SCALE");
+        return e ? (float)atof(e) : 0.0f;
+    }();
+    if (forced > 0.0f) scale = forced;
     if (scale < 0.5f) scale = 0.5f;
     if (scale > 4.0f) scale = 4.0f;
     if (std::fabs(scale - ui_dpi_scale_) < 0.001f && ui_ready_) return;
@@ -1133,7 +1146,7 @@ py::dict Player::take_ui_intents(){
     d["export_remove"] = ui_intents_.export_remove;
     d["export_cancel"] = ui_intents_.export_cancel;
     d["export_move_id"] = ui_intents_.export_move_id;
-    d["export_move_dir"] = ui_intents_.export_move_dir;
+    d["export_move_to"] = ui_intents_.export_move_to;
     d["export_item_preset_id"] = ui_intents_.export_item_preset_id;
     d["export_item_preset_idx"] = ui_intents_.export_item_preset_idx;
     d["export_item_out_id"] = ui_intents_.export_item_out_id;

@@ -11,9 +11,10 @@ constexpr ImVec4 white(float a) { return ImVec4(1.0f, 1.0f, 1.0f, a); }
 
 void apply_theme(ImGuiStyle& style){
     // ---- metrics (96-DPI bases; ScaleAllSizes applies the monitor scale) ----
-    // FramePadding (10,5) + 18px base font -> 28px standard control height.
-    style.WindowPadding = ImVec2(kSpaceL, 10.0f);
-    style.FramePadding = ImVec2(10.0f, 5.0f);
+    // FramePadding (10,7) + 18px base font -> 32px standard control height (kControlHeight),
+    // shared by every single-line control: inputs, combos, buttons.
+    style.WindowPadding = ImVec2(kPaddingContainer, 10.0f);
+    style.FramePadding = ImVec2(10.0f, 7.0f);
     style.ItemSpacing = ImVec2(kSpaceM, 6.0f);
     style.ItemInnerSpacing = ImVec2(6.0f, kSpaceS);
     style.WindowRounding = kRadiusWindow;

@@ -283,7 +283,7 @@ def main():
     transcode_engine = None
     stream_server = None
     export_mode = False
-    export_queue = None   # webstream.ExportQueue, built lazily once the engine is warm
+    export_queue = None   # webstream.ExportQueue, built up front; engine wired in once warm
 
     def _on_mode_change(passthrough):
         """Persist a web-UI 直出/AI 去码 switch (called from the server's HTTP thread; settings
@@ -886,6 +886,13 @@ def main():
 
 
             # ---- web-stream / offline-export intents (Phase 2) ----
+            # Build the export queue up front so the export screen shows presets/queue during
+            # model warmup -- the engine is wired in below once warm and is used only to
+            # run/cancel exports, never for display.
+            if export_queue is None:
+                from sumu.webstream import ExportQueue
+                export_queue = ExportQueue(None, _export_runner)
+                export_queue.load_persisted(settings.export_queue, len(settings.export_presets))
             # Lazily build the shared TranscodeEngine once models are warm (heavy, GPU-bound).
             if transcode_engine is None and warm_ready and warm_models is not None:
                 det_model, res_model, pad_mode = warm_models
@@ -899,11 +906,8 @@ def main():
                 # web-UI switch to AI 去码 works from here on.
                 if stream_server is not None:
                     stream_server.set_engine(transcode_engine)
-                # Build the export queue once the engine exists; restore any persisted queue.
-                if export_queue is None:
-                    from sumu.webstream import ExportQueue
-                    export_queue = ExportQueue(transcode_engine, _export_runner)
-                    export_queue.load_persisted(settings.export_queue, len(settings.export_presets))
+                # Queue was built up front (see above); just wire in the warm engine.
+                export_queue.engine = transcode_engine
 
             if intents["stream_stop"]:
                 if stream_server is not None:
@@ -952,8 +956,9 @@ def main():
                 if isinstance(cid, int) and cid >= 0:
                     export_queue.cancel(cid)
                 mid = intents.get("export_move_id")
-                if isinstance(mid, int) and mid >= 0:
-                    export_queue.move(mid, int(intents.get("export_move_dir") or 0))
+                mtgt = intents.get("export_move_to")
+                if isinstance(mid, int) and mid >= 0 and isinstance(mtgt, int) and mtgt >= -1:
+                    export_queue.move_to(mid, mtgt)
                 pid = intents.get("export_item_preset_id")
                 if isinstance(pid, int) and pid >= 0:
                     _export_set_item_preset(pid, int(intents.get("export_item_preset_idx") or 0))

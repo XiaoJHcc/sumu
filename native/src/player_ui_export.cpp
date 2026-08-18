@@ -1,7 +1,77 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
+//
+// Export screen + export preset editor.
+//
+// Layout contract (docs/ui_design.md): the export screen is a two-column layout --
+// left column cards [AI 管线设置] [导出路径] [导出预设] + a cardless full-width
+// [开始导出] action; the right column is one full-height [视频队列] card. Queue items
+// are cards themselves: col1 = status/filename/output path, col2 = preset + output-mode
+// combos, col3 = a gray delete X (red on hover). Reordering is manual gap-based drag:
+// hold the card's left strip and the list opens an empty slot under the cursor; release
+// drops the item into it. The preset manager is the first-class 导出预设 card; only
+// the preset EDITOR remains a ui::BeginModal.
 #include "player.h"
 #include "ui_util.h"
+
+#include <algorithm>
+
+namespace {
+
+// Card outer height for one queue item: content block (text lines / combo pair / 72px
+// minimum) + 2*pad. Shared by the item renderer and the drag-slot math so both agree.
+float export_item_card_h(const ExportItemView& item, float s){
+    const float sp_y = ImGui::GetStyle().ItemSpacing.y;
+    const float frame_h = ImGui::GetFrameHeight();
+    const float base_lh = ImGui::GetTextLineHeight();
+    ImGui::PushFont(nullptr, Player::kFontSizeSm);
+    const float sm_lh = ImGui::GetTextLineHeight();
+    ImGui::PopFont();
+    const bool has_progress = (item.status == "running" || item.status == "done");
+    float col1 = sm_lh + sp_y + base_lh + sp_y + sm_lh;
+    if (has_progress) col1 += sp_y + 6.0f * s;
+    if (!item.error.empty()) col1 += sp_y + base_lh;
+    const float ch = std::max(std::max(2.0f * frame_h + sp_y, 72.0f * s), col1);
+    return ch + 2.0f * 10.0f * s;
+}
+
+// Small hand-drawn folder glyph for the "choose directory" icon button (path card).
+void draw_folder_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
+    dl->AddRectFilled(ImVec2(c.x - 7.0f * s, c.y - 3.0f * s), ImVec2(c.x + 7.0f * s, c.y + 5.5f * s),
+        col, 1.5f * s);
+    dl->AddRectFilled(ImVec2(c.x - 7.0f * s, c.y - 5.5f * s), ImVec2(c.x - 1.0f * s, c.y - 2.0f * s),
+        col, 1.0f * s);
+}
+
+// Small hand-drawn trash glyph for the preset card's delete icon button.
+void draw_trash_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
+    const float th = std::max(1.0f, 1.3f * s);
+    dl->AddLine(ImVec2(c.x - 5.0f * s, c.y - 3.5f * s), ImVec2(c.x + 5.0f * s, c.y - 3.5f * s), col, th);
+    dl->AddLine(ImVec2(c.x - 2.0f * s, c.y - 5.5f * s), ImVec2(c.x + 2.0f * s, c.y - 5.5f * s), col, th);
+    dl->AddRect(ImVec2(c.x - 4.0f * s, c.y - 2.5f * s), ImVec2(c.x + 4.0f * s, c.y + 5.5f * s),
+        col, 1.0f * s, 0, th);
+    dl->AddLine(ImVec2(c.x - 1.5f * s, c.y - 0.5f * s), ImVec2(c.x - 1.5f * s, c.y + 3.5f * s), col, th);
+    dl->AddLine(ImVec2(c.x + 1.5f * s, c.y - 0.5f * s), ImVec2(c.x + 1.5f * s, c.y + 3.5f * s), col, th);
+}
+
+// Gray X (queue-item delete); the caller flips the color to kError on hover.
+void draw_x_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
+    const float th = std::max(1.0f, 1.3f * s);
+    const float half = 4.0f * s;
+    dl->AddLine(ImVec2(c.x - half, c.y - half), ImVec2(c.x + half, c.y + half), col, th);
+    dl->AddLine(ImVec2(c.x - half, c.y + half), ImVec2(c.x + half, c.y - half), col, th);
+}
+
+// Drag grip: two columns of three dots.
+void draw_grip_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
+    const float r = 1.3f * s;
+    const float dx = 2.5f * s, dy = 4.0f * s;
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; j += 2)
+            dl->AddCircleFilled(ImVec2(c.x + j * dx, c.y + i * dy), r, col);
+}
+
+} // namespace
 
 const char* Player::export_status_label(const std::string& s) const{
     if (s == "running") return ui_str_.export_status_running.c_str();
@@ -33,78 +103,392 @@ int Player::export_quality_idx_of(const std::string& preset){
     return 6;
 }
 
+// One preset row card (shared by the 导出预设 card's scrolling list): default checkbox,
+// click-to-edit name + summary, trash icon at the right edge.
+void Player::build_export_preset_card(int i, float width){
+    const auto& p = export_presets_[i];
+    ImGui::PushID(i);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusControl));
+    // Compact uniform inset: the row is a list entry, not a form card.
+    const float pad = ui_s(6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
+    const float row_h = ImGui::GetFrameHeight() + 2.0f * pad;
+    // NoScrollbar: the row fits exactly; rounding overflow must clip, never scroll.
+    // AlwaysUseWindowPadding is MANDATORY: ImGui zeroes a borderless child window's
+    // padding otherwise (imgui.cpp Begin), silently discarding the push above.
+    ImGui::BeginChild("##preset_card", ImVec2(width, row_h), ImGuiChildFlags_AlwaysUseWindowPadding,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+
+    // Default marker: exactly one preset is the queue default. Checkbox is the standard
+    // control; clicking the already-default card's box is a no-op.
+    bool is_def = (export_default_preset_idx_ == i);
+    if (ui::Checkbox("##def", &is_def) && is_def) {
+        export_default_preset_idx_ = i;
+        ui_intents_.export_set_default = i;
+    }
+    if (ImGui::IsItemHovered() && !ui_str_.export_preset_default.empty())
+        ImGui::SetTooltip("%s", ui_str_.export_preset_default.c_str());
+    ImGui::SameLine();
+
+    // Name + summary text column, plain drawing: the WHOLE card is the click-to-edit
+    // target (see below), so there is no inner hover rect for the text to sit in.
+    const float icon_sz = ImGui::GetFrameHeight(); // full-row-height square delete
+    const float text_w = std::max(ui_s(40.0f),
+        ImGui::GetContentRegionAvail().x - icon_sz - gap);
+    ImGui::Dummy(ImVec2(text_w, ImGui::GetFrameHeight())); // reserve the column, advance the line
+    {
+        const ImVec2 tmin = ImGui::GetItemRectMin();
+        const ImVec2 tmax = ImGui::GetItemRectMax();
+        // Elide the WHOLE summary to the text width first -- hard clipping cut glyphs in
+        // half; the name keeps the primary color, the "· CQ … · p7 · HEVC" tail secondary.
+        std::string summary = sumu_ui::elide_text_to_width(export_preset_summary(p), text_w);
+        const bool name_intact = summary.size() >= p.name.size() &&
+            summary.compare(0, p.name.size(), p.name) == 0;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float th = ImGui::GetTextLineHeight();
+        const float ty = tmin.y + (tmax.y - tmin.y - th) * 0.5f;
+        dl->PushClipRect(tmin, tmax, true);
+        if (name_intact) {
+            const float name_w = ImGui::CalcTextSize(p.name.c_str()).x;
+            dl->AddText(ImVec2(tmin.x, ty), ui::theme::text_u32(), p.name.c_str());
+            if (summary.size() > p.name.size())
+                dl->AddText(ImVec2(tmin.x + name_w, ty),
+                    ui::theme::text_secondary_u32(), summary.c_str() + p.name.size());
+        } else {
+            dl->AddText(ImVec2(tmin.x, ty), ui::theme::text_u32(), summary.c_str());
+        }
+        dl->PopClipRect();
+    }
+
+    // Trash: full-row-height square at the right edge; glyph turns red on hover.
+    ImGui::SameLine(0.0f, gap);
+    ui::IconButtonResult dr = ui::IconButton("##del", ImVec2(icon_sz, icon_sz));
+    {
+        const ImU32 col = ImGui::IsItemHovered()
+            ? ui::theme::error_u32() : ui::theme::icon_color_dim_u32();
+        draw_trash_glyph(dr.dl,
+            ImVec2((dr.min.x + dr.max.x) * 0.5f, (dr.min.y + dr.max.y) * 0.5f),
+            ui_s(1.0f), col);
+    }
+    if (dr.clicked) {
+        ui_intents_.export_preset_delete = true;
+        ui_intents_.export_preset_edit_idx = i;
+    }
+
+    // Whole card = click-to-edit target: hot only when no sub-widget (checkbox/trash)
+    // claims the mouse. The highlight is drawn INSIDE the child (on top of its bg);
+    // the parent draw list would render UNDER the child and be invisible.
+    const bool card_hot = ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered();
+    if (card_hot) {
+        const ImVec2 cmin = ImGui::GetWindowPos();
+        const ImVec2 cmax(cmin.x + ImGui::GetWindowSize().x, cmin.y + ImGui::GetWindowSize().y);
+        ImGui::GetWindowDrawList()->AddRectFilled(cmin, cmax,
+            ui::theme::hover_fill_u32(), ui_s(ui::theme::kRadiusControl));
+    }
+
+    ImGui::EndChild();
+
+    if (card_hot && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        open_export_preset_editor(i);
+
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    ImGui::PopID();
+}
+
+// One queue-item card: [drag strip+grip | status/filename/path (+progress) | preset+out
+// combos | X]. Flat layout inside the card child: the old nested col1/col2 child windows
+// inherited the card's pushed ChildBg (double-painted inner panels) and their clip rects
+// caused phantom margins / clipped combos, so everything is placed absolutely instead.
+void Player::build_export_item_card(ExportItemView& item, float width,
+                                    const std::vector<const char*>& preset_names,
+                                    const char* const out_modes[]){
+    ImGui::PushID(item.id);
+
+    const float s = ui_s(1.0f);
+    const float pad = ui_s(10.0f);
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float frame_h = ImGui::GetFrameHeight();
+    const float sp_y = ImGui::GetStyle().ItemSpacing.y;
+
+    const float card_h = export_item_card_h(item, s);
+    const float ch = card_h - 2.0f * pad;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusControl));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
+    // NoScrollbar: a fixed-size card must clip, never grow its own scrollbar.
+    // AlwaysUseWindowPadding: without it ImGui forces a borderless child's padding to 0,
+    // which used to pin every column to the card's top-left corner.
+    const ImGuiWindowFlags card_wflags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    ImGui::BeginChild("##item_card", ImVec2(width, card_h), ImGuiChildFlags_AlwaysUseWindowPadding, card_wflags);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const float inner_w = width - 2.0f * pad;
+    const float grip_w = ui_s(14.0f);
+    const float col2_w = ui_s(150.0f);
+    const float col3_w = ui_s(24.0f);
+    const float col1_w = std::max(ui_s(60.0f),
+        inner_w - grip_w - col2_w - col3_w - 3.0f * gap);
+
+    // Absolute column placement. SameLine chains at child boundaries have repeatedly
+    // produced wrapped/misaligned columns here, so every column is pinned with
+    // SetCursorScreenPos relative to the card's content origin instead.
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float col1_x = origin.x + grip_w + gap;
+    const float col2_x = col1_x + col1_w + gap;
+    const float col3_x = col2_x + col2_w + gap;
+    const float mid_y = origin.y + ch * 0.5f;
+
+    // ---- col 0: drag strip. Everything left of the text (card edge .. col1) initiates
+    // the drag; plain InvisibleButton, no hover fill by design. Pending items only.
+    {
+        ImGui::SetCursorScreenPos(ImVec2(origin.x - pad, origin.y));
+        ImGui::InvisibleButton("##grip", ImVec2(pad + grip_w + gap, ch));
+        if (item.status == "pending" && ImGui::IsItemActivated())
+            export_drag_id_ = item.id;
+        draw_grip_glyph(dl, ImVec2(origin.x + grip_w * 0.5f, mid_y), s,
+            export_drag_id_ == item.id ? ui::theme::accent_u32() : ui::theme::icon_color_dim_u32());
+    }
+
+    // ---- col 1: status / filename / output path (+ progress while running) ----
+    // Lines absolutely placed; the whole block is vertically centered on the card.
+    {
+        const float base_lh = ImGui::GetTextLineHeight();
+        ImGui::PushFont(nullptr, kFontSizeSm);
+        const float sm_lh = ImGui::GetTextLineHeight();
+        ImGui::PopFont();
+        const bool has_progress = (item.status == "running" || item.status == "done");
+        float content_h = sm_lh + sp_y + base_lh + sp_y + sm_lh;
+        if (has_progress) content_h += sp_y + ui_s(6.0f);
+        if (!item.error.empty()) content_h += sp_y + base_lh;
+        float ty = origin.y + std::max(0.0f, (ch - content_h) * 0.5f);
+
+        ImGui::SetCursorScreenPos(ImVec2(col1_x, ty));
+        ImGui::PushFont(nullptr, kFontSizeSm);
+        // 完成 status goes green, matching the progress bar.
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            item.status == "done" ? ui::theme::kSuccess : ui::theme::kTextSecondary);
+        ImGui::TextUnformatted(export_status_label(item.status));
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+
+        ty += sm_lh + sp_y;
+        ImGui::SetCursorScreenPos(ImVec2(col1_x, ty));
+        std::string shown = sumu_ui::elide_text_to_width(
+            sumu_ui::basename_of(item.source), col1_w);
+        ImGui::TextUnformatted(shown.c_str());
+        if (!item.source.empty() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", item.source.c_str());
+
+        ty += base_lh + sp_y;
+        ImGui::SetCursorScreenPos(ImVec2(col1_x, ty));
+        ImGui::PushFont(nullptr, kFontSizeSm);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
+        if (!item.out_path.empty()) {
+            std::string out = sumu_ui::elide_text_to_width("→ " + item.out_path, col1_w);
+            ImGui::TextUnformatted(out.c_str());
+        } else {
+            ImGui::TextUnformatted("-");
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+
+        if (has_progress) {
+            ty += sm_lh + sp_y;
+            ImGui::SetCursorScreenPos(ImVec2(col1_x, ty));
+            float frac = (item.progress >= 0.0f) ? item.progress : -1.0f;
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ui::theme::kSuccess);
+            ui::ProgressBar(frac, col1_w, ui_s(6.0f));
+            ImGui::PopStyleColor();
+        }
+        if (!item.error.empty()) {
+            ty += (has_progress ? ui_s(6.0f) : sm_lh) + sp_y;
+            ImGui::SetCursorScreenPos(ImVec2(col1_x, ty));
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
+            ImGui::TextUnformatted(item.error.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    // ---- col 2: preset + output-mode combos (the pair centered as one block) ----
+    {
+        const float pair_h = 2.0f * frame_h + sp_y;
+        const float top = origin.y + std::max(0.0f, (ch - pair_h) * 0.5f);
+        int preset_idx = item.preset_idx;
+        if (preset_idx < 0 || preset_idx >= (int)preset_names.size()) preset_idx = 0;
+        ImGui::SetCursorScreenPos(ImVec2(col2_x, top));
+        if (!preset_names.empty() &&
+            ui::Combo("##preset", preset_names.data(), (int)preset_names.size(), &preset_idx, col2_w)) {
+            ui_intents_.export_item_preset_id = item.id;
+            ui_intents_.export_item_preset_idx = preset_idx;
+        }
+        int out_idx = (item.out_mode == "global") ? 1 : (item.out_mode == "custom") ? 2 : 0;
+        ImGui::SetCursorScreenPos(ImVec2(col2_x, top + frame_h + sp_y));
+        if (ui::Combo("##out", out_modes, 3, &out_idx, col2_w)) {
+            ui_intents_.export_item_out_id = item.id;
+            ui_intents_.export_item_out_mode = out_idx;
+            if (out_idx == 2)
+                ui_intents_.export_pick_custom = item.id;
+        }
+    }
+
+    // ---- col 3: delete, gray X, red on hover, vertically centered on the card ----
+    ImGui::SetCursorScreenPos(ImVec2(col3_x, mid_y - col3_w * 0.5f));
+    {
+        ui::IconButtonResult dr = ui::IconButton("##del", ImVec2(col3_w, col3_w));
+        const ImU32 col = ImGui::IsItemHovered()
+            ? ui::theme::error_u32() : ui::theme::icon_color_dim_u32();
+        draw_x_glyph(dl, ImVec2((dr.min.x + dr.max.x) * 0.5f, (dr.min.y + dr.max.y) * 0.5f),
+            s, col);
+        if (dr.clicked)
+            ui_intents_.export_remove = item.id;
+        if (!ui_str_.export_remove.empty() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", ui_str_.export_remove.c_str());
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    ImGui::PopID();
+}
+
 void Player::build_export_screen(float top_bar_h){
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, std::max(0.0f, io.DisplaySize.y - top_bar_h)));
+    // Two columns scroll independently; the outer window itself never scrolls.
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoBringToFrontOnFocus;
-    // Background/padding come straight from the theme (kWindowBg / WindowPadding = (12,10)
-    // @ 96 DPI, already DPI-scaled) -- no per-call-site styling here.
     ImGui::Begin("##sumu_export_screen", nullptr, flags);
 
-    const char* t_presets = ui_str_.export_presets_title.empty() ? "Presets" : ui_str_.export_presets_title.c_str();
     const char* t_start = ui_str_.export_start.empty() ? "Start" : ui_str_.export_start.c_str();
+    // Vertical rhythm between stacked cards: the real gap is spacing + filler + spacing
+    // (ItemSpacing.y applies on BOTH sides of the Dummy), so the filler is what's left
+    // after two spacings. Getting this wrong by one spacing overflows the column and
+    // spawns a stray column-level scrollbar.
+    const float card_gap = std::max(0.0f,
+        ui_s(ui::theme::kSpaceL) - 2.0f * ImGui::GetStyle().ItemSpacing.y);
 
-    // ---- action row (replaces the old full-window header's 返回/title): [开始导出] [预设设置]
-    // "开始导出" is greyed until the engine is warm (nothing to run yet).
+    const float left_w = ui_s(320.0f);
+    const float col_gap = ui_s(ui::theme::kSpaceL);
+
+    // ================= left column: AI 管线设置 / 导出路径 / 导出预设 ==================
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild("##export_left", ImVec2(left_w, 0.0f), ImGuiChildFlags_None);
     {
-        if (!export_engine_ready_) ImGui::BeginDisabled();
-        if (ui::Button(t_start, ui::ButtonVariant::Primary, ui::ControlSize::Regular, ui_s(120.0f)))
-            ui_intents_.export_start = true;
-        if (!export_engine_ready_) ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ui::Button(t_presets, ui::ButtonVariant::Secondary, ui::ControlSize::Regular, ui_s(120.0f)))
-            export_presets_open_ = true;
-    }
-    ImGui::Separator();
-
-    const float left_w = ui_s(280.0f);
-    const float gap = ui_s(16.0f);
-
-    // ---- left column: AI 管线设置 + 导出路径 ----
-    ImGui::BeginChild("##export_left", ImVec2(left_w, 0.0f), false);
-    {
-        ui::SectionHeader(ui_str_.export_section_ai.c_str());
-        ImGui::TextUnformatted(ui_str_.export_clip_length_label.c_str());
-        if (!export_clip_edit_init_) {
-            export_clip_length_edit_ = export_clip_length_;
-            export_clip_edit_init_ = true;
+        // ---- card: AI 管线设置 ----
+        if (ui::BeginCard("##export_card_ai")) {
+            ui::SectionHeader(ui_str_.export_section_ai.c_str());
+            ui::LineLabel(ui_str_.export_clip_length_label.c_str());
+            if (!export_clip_edit_init_) {
+                export_clip_length_edit_ = export_clip_length_;
+                export_clip_edit_init_ = true;
+            }
+            bool committed = false;
+            ui::SliderInt("##export_clip_length", &export_clip_length_edit_, 30, 180, 0.0f, &committed);
+            if (committed && export_clip_length_edit_ != export_clip_length_)
+                ui_intents_.export_clip_length = export_clip_length_edit_;
         }
-        ui::SliderInt("##export_clip_length", &export_clip_length_edit_, 30, 180,
-            left_w - ui_s(24.0f));
-        if (ImGui::IsItemDeactivatedAfterEdit() &&
-            export_clip_length_edit_ != export_clip_length_)
-            ui_intents_.export_clip_length = export_clip_length_edit_;
+        ui::EndCard();
+        ImGui::Dummy(ImVec2(0.0f, card_gap));
 
-        ui::SectionHeader(ui_str_.export_section_path.c_str());
-        ImGui::TextUnformatted(ui_str_.export_global_dir_label.c_str());
-        ImGui::TextWrapped("%s", export_global_dir_.empty() ? "-" : export_global_dir_.c_str());
-        if (ui::Button(ui_str_.export_pick_dir.empty() ? "Choose" : ui_str_.export_pick_dir.c_str(),
-                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, ui_s(96.0f)))
-            ui_intents_.export_pick_global = true;
+        // ---- card: 导出路径 ----
+        if (ui::BeginCard("##export_card_path")) {
+            ui::SectionHeader(ui_str_.export_section_path.c_str());
+            // Row: 全局输出目录 inline label + read-only path input + folder icon button.
+            ui::InlineLabel(ui_str_.export_global_dir_label.c_str());
+            const float icon_sz = ImGui::GetFrameHeight();
+            const float gap = ImGui::GetStyle().ItemSpacing.x;
+            const float input_w = std::max(ui_s(40.0f),
+                ImGui::GetContentRegionAvail().x - icon_sz - gap);
+            // Read-only view of the configured directory; hint shows when unset.
+            char empty_buf[1] = { '\0' };
+            char* dir_buf = export_global_dir_.empty()
+                ? empty_buf : const_cast<char*>(export_global_dir_.c_str());
+            ui::TextInput("##export_global_dir", dir_buf,
+                export_global_dir_.empty() ? 1 : export_global_dir_.size() + 1,
+                "-", input_w, ImGuiInputTextFlags_ReadOnly);
+            ImGui::SameLine();
+            ui::IconButtonResult r = ui::IconButton("##export_pick_dir", ImVec2(icon_sz, icon_sz));
+            draw_folder_glyph(r.dl, ImVec2((r.min.x + r.max.x) * 0.5f, (r.min.y + r.max.y) * 0.5f),
+                ui_s(1.0f), ui::theme::icon_color_u32());
+            if (r.clicked)
+                ui_intents_.export_pick_global = true;
+        }
+        ui::EndCard();
+        ImGui::Dummy(ImVec2(0.0f, card_gap));
+
+        // ---- card: 导出预设 (manager as a first-class card; editor stays a modal) ----
+        // Height = whatever the column has left, so the left column itself never
+        // scrolls (only this card's preset list does).
+        const float presets_h = std::max(ui_s(120.0f),
+            floorf(ImGui::GetContentRegionAvail().y) - 1.0f);
+        if (ui::BeginCard("##export_card_presets", presets_h)) {
+            ui::SectionHeader(ui_str_.export_presets_title.empty()
+                ? "Presets" : ui_str_.export_presets_title.c_str());
+            // Scrolling list above a pinned full-width "new preset" button. The list
+            // height is exactly what remains below it minus the button row and the one
+            // ItemSpacing between them (-1px guards fractional-DPI rounding from
+            // spilling into a card-level scrollbar).
+            const float btn_h = ImGui::GetFrameHeight();
+            const float list_h = std::max(ImGui::GetFrameHeight(),
+                floorf(ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y
+                    - btn_h) - 1.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+            ImGui::BeginChild("##preset_list", ImVec2(0.0f, list_h), ImGuiChildFlags_None);
+            const float list_w = ImGui::GetContentRegionAvail().x;
+            for (int i = 0; i < (int)export_presets_.size(); ++i) {
+                if (i > 0) ImGui::Dummy(ImVec2(0.0f, ui_s(2.0f)));
+                build_export_preset_card(i, list_w);
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            if (ui::Button(ui_str_.export_preset_new.c_str(), ui::ButtonVariant::Secondary,
+                    ui::ControlSize::Regular, -1.0f))
+                open_export_preset_editor(-2);
+        }
+        ui::EndCard();
     }
     ImGui::EndChild();
-    ImGui::SameLine(0.0f, gap);
+    ImGui::PopStyleVar(); // WindowPadding(0,0)
+    ImGui::SameLine(0.0f, col_gap);
 
-    // ---- main: 视频队列 ----
-    ImGui::BeginChild("##export_queue", ImVec2(0.0f, 0.0f), false);
-    {
-        // Small-font label + SameLine "add files" button (ui::SectionHeader draws a
-        // full-width rule, which cannot share a line with the button -- label kept manual).
-        ImGui::PushFont(nullptr, kFontSizeSm);
-        ImGui::TextUnformatted(ui_str_.export_section_queue.c_str());
-        ImGui::PopFont();
-        ImGui::SameLine();
+    // ============== right column: 视频队列 card + 开始导出 button below it ==============
+    // Own BeginChild, symmetric with the left column: after a child ends, ImGui returns
+    // the cursor X to the LINE start (not the child's X), so laying the button out in
+    // the parent window would teleport it back under the left column. Inside this child
+    // the cursor math stays local and the button fills the column width.
+    // The queue card leaves room for the button row: real gap is spacing + filler +
+    // spacing (same card_gap bookkeeping as the left column).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild("##export_right", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+    const float start_btn_h = ImGui::GetFrameHeight();
+    const float not_ready_h = export_engine_ready_ ? 0.0f
+        : (ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y);
+    const float queue_h = std::max(ui_s(120.0f),
+        floorf(ImGui::GetContentRegionAvail().y - ui_s(ui::theme::kSpaceL) - start_btn_h - not_ready_h) - 1.0f);
+    if (ui::BeginCard("##export_card_queue", queue_h)) {
+        // Header row: section title left (vertically centered on the button-height row),
+        // "add files" button pinned to the right edge.
+        const float row_w = ImGui::GetContentRegionAvail().x;
+        const float add_w = ui_s(96.0f);
+        ui::InlineLabel(ui_str_.export_section_queue.c_str(),
+            std::max(0.0f, row_w - add_w - ImGui::GetStyle().ItemInnerSpacing.x));
         if (ui::Button(ui_str_.export_add_files.empty() ? "Add files" : ui_str_.export_add_files.c_str(),
-                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, ui_s(96.0f)))
+                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, add_w))
             ui_intents_.export_add_files = true;
-        ImGui::Separator();
 
         if (export_items_.empty()) {
+            ImGui::Dummy(ImVec2(0.0f, ui_s(4.0f)));
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
             ImGui::TextWrapped("%s", ui_str_.export_empty.c_str());
+            ImGui::PopStyleColor();
         }
 
         std::vector<const char*> preset_names;
@@ -116,267 +500,295 @@ void Player::build_export_screen(float top_bar_h){
             ui_str_.export_out_custom.c_str(),
         };
 
-        for (auto& item : export_items_) {
-            std::string id = std::to_string(item.id);
-            ImGui::PushID(item.id);
-            ImGui::TextUnformatted(export_status_label(item.status));
-            ImGui::SameLine();
-            float avail = ImGui::GetContentRegionAvail().x;
-            const float btns_w = ui_s(4.0f * 26.0f + 3.0f * 4.0f);
-            const float name_w = std::max(ui_s(120.0f), avail - btns_w - ui_s(250.0f));
-            std::string shown = sumu_ui::elide_text_to_width(sumu_ui::basename_of(item.source), name_w);
-            ImGui::TextUnformatted(shown.c_str());
-            if (!item.source.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", item.source.c_str());
+        const float list_w = ImGui::GetContentRegionAvail().x;
 
-            if (item.status == "running" || item.status == "done") {
-                float frac = (item.progress >= 0.0f) ? item.progress : -1.0f;
-                ui::ProgressBar(frac, 0.0f, ui_s(6.0f));
+        // ---- manual gap-based drag-reorder ----
+        // export_drag_id_ is armed by the item card's left drag strip; export_drag_slot_
+        // tracks the open gap's position. Slot math runs against the RENDERED geometry
+        // (gap provisionally inserted at the previous slot), so hovering the gap itself
+        // is stable instead of oscillating. Release drops the item into the slot.
+        const ExportItemView* dragged = nullptr;
+        if (export_drag_id_ >= 0) {
+            for (const auto& it : export_items_)
+                if (it.id == export_drag_id_) { dragged = &it; break; }
+            if (!dragged) { export_drag_id_ = -1; export_drag_slot_ = -1; } // vanished -> cancel
+        }
+        if (export_drag_id_ >= 0) {
+            const float s1 = ui_s(1.0f);
+            const float pitch_gap = card_gap + 2.0f * ImGui::GetStyle().ItemSpacing.y;
+            const float drag_card_h = export_item_card_h(*dragged, s1);
+            if (export_drag_slot_ < 0) {
+                // initial slot = the dragged card's own index (gap opens where it was)
+                export_drag_slot_ = 0;
+                for (const auto& it : export_items_) {
+                    if (it.id == export_drag_id_) break;
+                    ++export_drag_slot_;
+                }
             }
+            const float mouse_y = io.MousePos.y;
+            float y = ImGui::GetCursorScreenPos().y;
+            int slot = 0, r = 0;
+            for (const auto& it : export_items_) {
+                if (it.id == export_drag_id_) continue;
+                if (r == export_drag_slot_) y += drag_card_h + pitch_gap; // the open gap
+                const float h = export_item_card_h(it, s1);
+                if (mouse_y > y + h * 0.5f) slot = r + 1;
+                y += h + pitch_gap;
+                ++r;
+            }
+            export_drag_slot_ = slot;
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ImGui::SetTooltip("%s", sumu_ui::basename_of(dragged->source).c_str());
+            } else {
+                // Drop: map the slot to "insert before this item id" (-1 = queue end).
+                int target = -1; r = 0;
+                for (const auto& it : export_items_) {
+                    if (it.id == export_drag_id_) continue;
+                    if (r++ == export_drag_slot_) { target = it.id; break; }
+                }
+                // No-op if the card lands back where it already sits.
+                bool noop = false;
+                for (size_t k = 0; k + 1 < export_items_.size(); ++k)
+                    if (export_items_[k].id == export_drag_id_ &&
+                        export_items_[k + 1].id == target) { noop = true; break; }
+                if (!noop && !(target == -1 && export_items_.back().id == export_drag_id_)) {
+                    ui_intents_.export_move_id = export_drag_id_;
+                    ui_intents_.export_move_to = target;
+                    // Apply the reorder locally right away: the authoritative snapshot
+                    // arrives a frame or two later, and without this the card flashes
+                    // back at its old position in between.
+                    size_t from = 0;
+                    while (from < export_items_.size() && export_items_[from].id != export_drag_id_)
+                        ++from;
+                    if (from < export_items_.size()) {
+                        ExportItemView moved = std::move(export_items_[from]);
+                        export_items_.erase(export_items_.begin() + from);
+                        size_t to = export_items_.size();
+                        for (size_t k = 0; k < export_items_.size(); ++k)
+                            if (export_items_[k].id == target) { to = k; break; }
+                        export_items_.insert(export_items_.begin() + to, std::move(moved));
+                    }
+                }
+                export_drag_id_ = -1;
+                export_drag_slot_ = -1;
+            }
+        }
 
-            int preset_idx = item.preset_idx;
-            if (preset_idx < 0 || preset_idx >= (int)preset_names.size()) preset_idx = 0;
-            if (!preset_names.empty() &&
-                ui::Combo(("##preset_" + id).c_str(), preset_names.data(),
-                    (int)preset_names.size(), &preset_idx, ui_s(140.0f))) {
-                ui_intents_.export_item_preset_id = item.id;
-                ui_intents_.export_item_preset_idx = preset_idx;
-            }
-            ImGui::SameLine();
-            int out_idx = (item.out_mode == "global") ? 1 : (item.out_mode == "custom") ? 2 : 0;
-            if (ui::Combo(("##out_" + id).c_str(), out_modes, 3, &out_idx, ui_s(110.0f))) {
-                ui_intents_.export_item_out_id = item.id;
-                ui_intents_.export_item_out_mode = out_idx;
-                if (out_idx == 2)
-                    ui_intents_.export_pick_custom = item.id;
-            }
-            ImGui::SameLine();
-            const float item_btn_w = ui_s(26.0f);
-            if (ui::Button(ui_str_.export_up.c_str(), ui::ButtonVariant::Secondary,
-                    ui::ControlSize::Small, item_btn_w)) {
-                ui_intents_.export_move_id = item.id;
-                ui_intents_.export_move_dir = -1;
-            }
-            ImGui::SameLine();
-            if (ui::Button(ui_str_.export_down.c_str(), ui::ButtonVariant::Secondary,
-                    ui::ControlSize::Small, item_btn_w)) {
-                ui_intents_.export_move_id = item.id;
-                ui_intents_.export_move_dir = 1;
-            }
-            ImGui::SameLine();
-            if (ui::Button(ui_str_.export_remove.c_str(), ui::ButtonVariant::Danger,
-                    ui::ControlSize::Small, item_btn_w))
-                ui_intents_.export_remove = item.id;
-            ImGui::SameLine();
-            if (item.status == "running" || item.status == "pending") {
-                if (ui::Button(ui_str_.cancel.c_str(), ui::ButtonVariant::Secondary,
-                        ui::ControlSize::Small, item_btn_w))
-                    ui_intents_.export_cancel = item.id;
-            }
-            if (!item.out_path.empty()) {
-                ImGui::TextUnformatted(("  → " + item.out_path).c_str());
-            }
-            if (!item.error.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
-                ImGui::TextWrapped("%s", item.error.c_str());
-                ImGui::PopStyleColor();
-            }
-            ImGui::Separator();
-            ImGui::PopID();
+        int rendered = 0;
+        bool first_block = true;
+        auto block_gap = [&](){
+            if (!first_block) ImGui::Dummy(ImVec2(0.0f, card_gap));
+            first_block = false;
+        };
+        auto render_slot = [&](){
+            block_gap();
+            ImGui::Dummy(ImVec2(list_w, export_item_card_h(*dragged, ui_s(1.0f))));
+            // accent outline marks the open slot the dragged card will drop into
+            ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                ui::theme::accent_u32(), ui_s(ui::theme::kRadiusControl), 0, 1.5f * ui_s(1.0f));
+        };
+        for (size_t ii = 0; ii < export_items_.size(); ++ii) {
+            ExportItemView& item = export_items_[ii];
+            if (export_drag_id_ >= 0 && item.id == export_drag_id_) continue; // hidden mid-drag
+            if (rendered == export_drag_slot_ && export_drag_id_ >= 0) render_slot();
+            block_gap();
+            build_export_item_card(item, list_w, preset_names, out_modes);
+            ++rendered;
+        }
+        // slot past the last card = drop at the queue end (replaces the old trailing strip)
+        if (export_drag_id_ >= 0 && rendered == export_drag_slot_) render_slot();
+    }
+    ui::EndCard();
+    ImGui::Dummy(ImVec2(0.0f, card_gap));
+
+    // ---- cardless action: 开始导出 (full queue-column width, under the queue card) ----
+    {
+        if (!export_engine_ready_) ImGui::BeginDisabled();
+        if (ui::Button(t_start, ui::ButtonVariant::Primary, ui::ControlSize::Regular, -1.0f))
+            ui_intents_.export_start = true;
+        if (!export_engine_ready_) ImGui::EndDisabled();
+        if (!export_engine_ready_) {
+            ImGui::PushFont(nullptr, kFontSizeSm);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
+            ImGui::TextUnformatted(ui_str_.export_not_ready.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
         }
     }
     ImGui::EndChild();
-
-    if (!export_engine_ready_)
-        ImGui::TextUnformatted(ui_str_.export_not_ready.c_str());
+    ImGui::PopStyleVar(); // WindowPadding(0,0)
 
     ImGui::End();
 }
 
+// The preset EDITOR modal (the manager lives in the export screen's 导出预设 card now).
+// export_preset_edit_idx_ != -1 means "open": open_export_preset_editor() arms the
+// one-shot OpenPopup via export_presets_open_.
 void Player::build_export_preset_editor(){
-    if (!export_presets_open_) return;
-    ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    // Non-modal plain window (not OpenPopup-driven), so ui::BeginModal does not apply; the
-    // theme supplies WindowBg/rounding (kRadiusWindow == the old ui_s(8)). Only the roomier
-    // padding stays local.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(14.0f), ui_s(12.0f)));
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoTitleBar;
-    if (!ImGui::Begin("##sumu_export_presets", nullptr, flags)) {
-        ImGui::PopStyleVar();
+    if (export_presets_open_) {
+        ImGui::OpenPopup("###sumu_export_preset_edit");
+        export_presets_open_ = false;
+    }
+    if (export_preset_edit_idx_ == -1) return;
+    bool open = true;
+    const std::string modal_title =
+        (ui_str_.export_presets_title.empty() ? std::string("Presets") : ui_str_.export_presets_title)
+        + "###sumu_export_preset_edit";
+    // Closed via X/Esc (or never opened): drop back to the manager state.
+    if (!ui::BeginModal(modal_title.c_str(), &open, ui::theme::kModalContentWLg)) {
+        export_preset_edit_idx_ = -1;
         return;
     }
-    const float w = ui_s(460.0f);
-    ImGui::PushItemWidth(w);
 
-    ImGui::TextUnformatted(ui_str_.export_presets_title.c_str());
-    ImGui::Separator();
+    const float content_w = ui_s(ui::theme::kModalContentWLg);
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float inner = ImGui::GetStyle().ItemInnerSpacing.x;
 
-    if (export_preset_edit_idx_ == -1) {
-        // ---- manager: preset cards (click to edit) + delete + default radio ----
-        const float spacing = ImGui::GetStyle().ItemSpacing.x;
-        const float del_w = ui_s(48.0f);
-        const float def_w = ui_s(28.0f);
-        for (int i = 0; i < (int)export_presets_.size(); ++i) {
-            const auto& p = export_presets_[i];
-            ImGui::PushID(i);
-            std::string summary = export_preset_summary(p);
-            const float card_w = w - del_w - def_w - spacing * 2.0f;
-            if (ui::Button(summary.c_str(), ui::ButtonVariant::Secondary,
-                    ui::ControlSize::Regular, card_w))
-                open_export_preset_editor(i); // card = edit its params
-            ImGui::SameLine();
-            if (ui::Button(ui_str_.export_preset_delete.c_str(), ui::ButtonVariant::Danger,
-                    ui::ControlSize::Regular, del_w)) {
-                ui_intents_.export_preset_delete = true;
-                ui_intents_.export_preset_edit_idx = i;
-            }
-            ImGui::SameLine();
-            // "default" marker: radio-like -- exactly one preset is the queue default.
-            // ui::Radio is the bool form; mirror the old RadioButton(int*) immediate write
-            // so the marker moves this frame, then record the intent.
-            if (ui::Radio(("##def_" + std::to_string(i)).c_str(),
-                    export_default_preset_idx_ == i)) {
-                export_default_preset_idx_ = i;
-                ui_intents_.export_set_default = i;
-            }
-            if (ImGui::IsItemHovered() && !ui_str_.export_preset_default.empty())
-                ImGui::SetTooltip("%s", ui_str_.export_preset_default.c_str());
-            ImGui::PopID();
+    // ---- staged fields, seeded once per open ----
+    if (!export_preset_edit_init_) {
+        const ExportPresetView* src = nullptr;
+        if (export_preset_edit_idx_ >= 0 && export_preset_edit_idx_ < (int)export_presets_.size())
+            src = &export_presets_[export_preset_edit_idx_];
+        if (src) {
+            snprintf(export_preset_name_buf_, sizeof(export_preset_name_buf_), "%s", src->name.c_str());
+            export_preset_codec_idx_ = (src->codec == "h264") ? 1 : 0;
+            export_preset_cq_enabled_ = src->cq_enabled;
+            export_preset_cq_ = src->cq;
+            export_preset_bitrate_enabled_ = src->bitrate_enabled;
+            export_preset_bitrate_ = src->bitrate;
+            export_preset_maxrate_enabled_ = src->maxrate_enabled;
+            export_preset_maxrate_ = src->maxrate;
+            export_preset_quality_idx_ = export_quality_idx_of(src->preset);
+            export_preset_audio_copy_ = src->audio_copy;
+            export_preset_audio_bitrate_ = src->audio_bitrate;
+            export_preset_subtitle_ = src->subtitle;
+            snprintf(export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_), "%s", src->suffix.c_str());
+        } else {
+            export_preset_name_buf_[0] = '\0';
+            export_preset_codec_idx_ = 0;
+            export_preset_cq_enabled_ = true;
+            export_preset_cq_ = 33;
+            export_preset_bitrate_enabled_ = false;
+            export_preset_bitrate_ = 0;
+            export_preset_maxrate_enabled_ = false;
+            export_preset_maxrate_ = 0;
+            export_preset_quality_idx_ = 6;
+            export_preset_audio_copy_ = true;
+            export_preset_audio_bitrate_ = 256;
+            export_preset_subtitle_ = true;
+            snprintf(export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_), "_Decensored");
         }
-        ImGui::Separator();
-        if (ui::Button(ui_str_.export_preset_new.c_str(), ui::ButtonVariant::Secondary,
-                ui::ControlSize::Regular, w))
-            open_export_preset_editor(-2);
-        ImGui::Spacing();
-        if (ui::Button(ui_str_.cancel.c_str(), ui::ButtonVariant::Secondary,
-                ui::ControlSize::Regular, w))
-            export_presets_open_ = false;
-    } else {
-        // ---- editor: staged fields, seeded once per open ----
-        if (!export_preset_edit_init_) {
-            const ExportPresetView* src = nullptr;
-            if (export_preset_edit_idx_ >= 0 && export_preset_edit_idx_ < (int)export_presets_.size())
-                src = &export_presets_[export_preset_edit_idx_];
-            if (src) {
-                snprintf(export_preset_name_buf_, sizeof(export_preset_name_buf_), "%s", src->name.c_str());
-                export_preset_codec_idx_ = (src->codec == "h264") ? 1 : 0;
-                export_preset_cq_enabled_ = src->cq_enabled;
-                export_preset_cq_ = src->cq;
-                export_preset_bitrate_enabled_ = src->bitrate_enabled;
-                export_preset_bitrate_ = src->bitrate;
-                export_preset_maxrate_enabled_ = src->maxrate_enabled;
-                export_preset_maxrate_ = src->maxrate;
-                export_preset_quality_idx_ = export_quality_idx_of(src->preset);
-                export_preset_audio_copy_ = src->audio_copy;
-                export_preset_audio_bitrate_ = src->audio_bitrate;
-                export_preset_subtitle_ = src->subtitle;
-                snprintf(export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_), "%s", src->suffix.c_str());
-            } else {
-                export_preset_name_buf_[0] = '\0';
-                export_preset_codec_idx_ = 0;
-                export_preset_cq_enabled_ = true;
-                export_preset_cq_ = 33;
-                export_preset_bitrate_enabled_ = false;
-                export_preset_bitrate_ = 0;
-                export_preset_maxrate_enabled_ = false;
-                export_preset_maxrate_ = 0;
-                export_preset_quality_idx_ = 6;
-                export_preset_audio_copy_ = true;
-                export_preset_audio_bitrate_ = 256;
-                export_preset_subtitle_ = true;
-                snprintf(export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_), "_Decensored");
-            }
-            export_preset_edit_init_ = true;
-        }
-
-        ImGui::TextUnformatted(ui_str_.export_preset_name_label.c_str());
-        ui::TextInput("##ep_name", export_preset_name_buf_, sizeof(export_preset_name_buf_));
-        const char* codec_items[] = { "HEVC", "H.264" };
-        ImGui::TextUnformatted(ui_str_.export_preset_codec_label.c_str());
-        ui::Combo("##ep_codec", codec_items, 2, &export_preset_codec_idx_);
-
-        // CQ / bitrate / maxrate are INDEPENDENT, each enabled by its own checkbox.
-        // CQ uses ui::OptionalSlider (checkbox + greyed-while-disabled slider + value echo).
-        // Bitrate/maxrate stay Checkbox + IntInput: they are unbounded numeric fields, and
-        // squeezing them into OptionalSlider would clamp values to an invented slider range.
-        ui::OptionalSlider(ui_str_.export_preset_cq_label.c_str(), &export_preset_cq_enabled_,
-            "##ep_cq", &export_preset_cq_, 0, 51);
-        ui::Checkbox(ui_str_.export_preset_bitrate_label.c_str(), &export_preset_bitrate_enabled_);
-        if (export_preset_bitrate_enabled_) {
-            ImGui::SameLine();
-            ui::IntInput("##ep_bitrate", &export_preset_bitrate_, ui_s(90.0f));
-            ImGui::SameLine();
-            ImGui::TextUnformatted("kbps");
-        }
-        ui::Checkbox(ui_str_.export_preset_maxrate_label.c_str(), &export_preset_maxrate_enabled_);
-        if (export_preset_maxrate_enabled_) {
-            ImGui::SameLine();
-            ui::IntInput("##ep_maxrate", &export_preset_maxrate_, ui_s(90.0f));
-            ImGui::SameLine();
-            ImGui::TextUnformatted("kbps");
-        }
-
-        const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7" };
-        ImGui::TextUnformatted(ui_str_.export_preset_quality_label.c_str());
-        ui::Combo("##ep_quality", quality_items, 7, &export_preset_quality_idx_);
-
-        const char* audio_items[] = {
-            ui_str_.export_preset_audio_copy.c_str(),
-            ui_str_.export_preset_audio_encode.c_str(),
-        };
-        ImGui::TextUnformatted(ui_str_.export_preset_audio_label.c_str());
-        int audio_mode = export_preset_audio_copy_ ? 0 : 1;
-        if (ui::Combo("##ep_audio", audio_items, 2, &audio_mode, ui_s(160.0f)))
-            export_preset_audio_copy_ = (audio_mode == 0);
-        if (!export_preset_audio_copy_) {
-            ImGui::SameLine();
-            ui::IntInput("##ep_audio_bitrate", &export_preset_audio_bitrate_, ui_s(90.0f));
-            ImGui::SameLine();
-            ImGui::TextUnformatted("kbps");
-        }
-
-        ui::Checkbox(ui_str_.export_preset_subtitle_label.c_str(), &export_preset_subtitle_);
-        ImGui::TextUnformatted(ui_str_.export_preset_suffix_label.c_str());
-        ui::TextInput("##ep_suffix", export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_));
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        if (ui::Button(ui_str_.export_preset_save.c_str(), ui::ButtonVariant::Primary,
-                ui::ControlSize::Regular, w)) {
-            ui_intents_.export_preset_save = true;
-            ui_intents_.export_preset_edit_idx = export_preset_edit_idx_;
-            ui_intents_.export_preset_name = export_preset_name_buf_;
-            ui_intents_.export_preset_codec = export_preset_codec_idx_;
-            ui_intents_.export_preset_cq_enabled = export_preset_cq_enabled_;
-            ui_intents_.export_preset_cq = export_preset_cq_;
-            ui_intents_.export_preset_bitrate_enabled = export_preset_bitrate_enabled_;
-            ui_intents_.export_preset_bitrate = export_preset_bitrate_;
-            ui_intents_.export_preset_maxrate_enabled = export_preset_maxrate_enabled_;
-            ui_intents_.export_preset_maxrate = export_preset_maxrate_;
-            ui_intents_.export_preset_quality = export_preset_quality_idx_;
-            ui_intents_.export_preset_audio_copy = export_preset_audio_copy_;
-            ui_intents_.export_preset_audio_bitrate = export_preset_audio_bitrate_;
-            ui_intents_.export_preset_subtitle = export_preset_subtitle_;
-            ui_intents_.export_preset_suffix = export_preset_suffix_buf_;
-            export_preset_edit_idx_ = -1;
-        }
-        ImGui::SameLine();
-        if (ui::Button(ui_str_.cancel.c_str(), ui::ButtonVariant::Secondary,
-                ui::ControlSize::Regular, w))
-            export_preset_edit_idx_ = -1;
+        export_preset_edit_init_ = true;
     }
 
-    ImGui::PopItemWidth();
-    ImGui::End();
-    ImGui::PopStyleVar();
+    // Two row shapes share ONE label column: plain rows (名称/编码格式/质量/音频/后缀)
+    // draw a text label of `label_w`; checkbox rows (CQ/码率/最大码率) draw
+    // [checkbox box][ItemSpacing][label of mix_label_w]. Making label_w exactly equal
+    // to box + spacing + mix_label_w puts every row's control at the same x.
+    const float mix_label_w = ui_s(80.0f);
+    const float label_w = ui_s(ui::theme::kCheckboxSize) + ImGui::GetStyle().ItemSpacing.x
+        + mix_label_w;
+    const float num_w = ui_s(ui::theme::kNumericInputW);
+    const float field_w = content_w - label_w - inner;
+
+    ui::InlineLabel(ui_str_.export_preset_name_label.c_str(), label_w);
+    ui::TextInput("##ep_name", export_preset_name_buf_, sizeof(export_preset_name_buf_),
+        nullptr, field_w);
+
+    const char* codec_items[] = { "HEVC", "H.264" };
+    ui::InlineLabel(ui_str_.export_preset_codec_label.c_str(), label_w);
+    ui::Combo("##ep_codec", codec_items, 2, &export_preset_codec_idx_, field_w);
+
+    // CQ / bitrate / maxrate are INDEPENDENT, each enabled by its own checkbox.
+    // Mixed-row order: checkbox, inline label, number input, slider / unit.
+    // CQ's direction is counter-intuitive (LOW number == HIGH quality), so its slider
+    // carries end texts (macOS volume-slider icon positions, text instead of icons).
+    ui::Checkbox("##ep_cq_en", &export_preset_cq_enabled_);
+    ImGui::SameLine();
+    ui::InlineLabel(ui_str_.export_preset_cq_label.c_str(), mix_label_w);
+    if (!export_preset_cq_enabled_) ImGui::BeginDisabled();
+    ui::SliderIntEnds("##ep_cq", &export_preset_cq_, 0, 51,
+        u8"高质量", u8"小体积");
+    if (!export_preset_cq_enabled_) ImGui::EndDisabled();
+
+    ui::Checkbox("##ep_br_en", &export_preset_bitrate_enabled_);
+    ImGui::SameLine();
+    ui::InlineLabel(ui_str_.export_preset_bitrate_label.c_str(), mix_label_w);
+    if (!export_preset_bitrate_enabled_) ImGui::BeginDisabled();
+    ui::IntInput("##ep_bitrate", &export_preset_bitrate_, num_w);
+    ImGui::SameLine();
+    ui::UnitText("kbps");
+    if (!export_preset_bitrate_enabled_) ImGui::EndDisabled();
+
+    ui::Checkbox("##ep_mr_en", &export_preset_maxrate_enabled_);
+    ImGui::SameLine();
+    ui::InlineLabel(ui_str_.export_preset_maxrate_label.c_str(), mix_label_w);
+    if (!export_preset_maxrate_enabled_) ImGui::BeginDisabled();
+    ui::IntInput("##ep_maxrate", &export_preset_maxrate_, num_w);
+    ImGui::SameLine();
+    ui::UnitText("kbps");
+    if (!export_preset_maxrate_enabled_) ImGui::EndDisabled();
+
+    const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7" };
+    ui::InlineLabel(ui_str_.export_preset_quality_label.c_str(), label_w);
+    ui::Combo("##ep_quality", quality_items, 7, &export_preset_quality_idx_, field_w);
+
+    const char* audio_items[] = {
+        ui_str_.export_preset_audio_copy.c_str(),
+        ui_str_.export_preset_audio_encode.c_str(),
+    };
+    ui::InlineLabel(ui_str_.export_preset_audio_label.c_str(), label_w);
+    int audio_mode = export_preset_audio_copy_ ? 0 : 1;
+    if (ui::Combo("##ep_audio", audio_items, 2, &audio_mode, ui_s(160.0f)))
+        export_preset_audio_copy_ = (audio_mode == 0);
+    if (!export_preset_audio_copy_) {
+        ImGui::SameLine();
+        ui::IntInput("##ep_audio_bitrate", &export_preset_audio_bitrate_, num_w);
+        ImGui::SameLine();
+        ui::UnitText("kbps");
+    }
+
+    ui::Checkbox(ui_str_.export_preset_subtitle_label.c_str(), &export_preset_subtitle_);
+
+    ui::InlineLabel(ui_str_.export_preset_suffix_label.c_str(), label_w);
+    ui::TextInput("##ep_suffix", export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_),
+        nullptr, field_w);
+
+    // Footer: save/cancel share the row as two equal halves.
+    ImGui::Dummy(ImVec2(0.0f, ui_s(4.0f)));
+    const float half = (content_w - gap) * 0.5f;
+    if (ui::Button(ui_str_.export_preset_save.c_str(), ui::ButtonVariant::Primary,
+            ui::ControlSize::Regular, half)) {
+        ui_intents_.export_preset_save = true;
+        ui_intents_.export_preset_edit_idx = export_preset_edit_idx_;
+        ui_intents_.export_preset_name = export_preset_name_buf_;
+        ui_intents_.export_preset_codec = export_preset_codec_idx_;
+        ui_intents_.export_preset_cq_enabled = export_preset_cq_enabled_;
+        ui_intents_.export_preset_cq = export_preset_cq_;
+        ui_intents_.export_preset_bitrate_enabled = export_preset_bitrate_enabled_;
+        ui_intents_.export_preset_bitrate = export_preset_bitrate_;
+        ui_intents_.export_preset_maxrate_enabled = export_preset_maxrate_enabled_;
+        ui_intents_.export_preset_maxrate = export_preset_maxrate_;
+        ui_intents_.export_preset_quality = export_preset_quality_idx_;
+        ui_intents_.export_preset_audio_copy = export_preset_audio_copy_;
+        ui_intents_.export_preset_audio_bitrate = export_preset_audio_bitrate_;
+        ui_intents_.export_preset_subtitle = export_preset_subtitle_;
+        ui_intents_.export_preset_suffix = export_preset_suffix_buf_;
+        export_preset_edit_idx_ = -1;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ui::Button(ui_str_.cancel.c_str(), ui::ButtonVariant::Secondary,
+            ui::ControlSize::Regular, half)) {
+        export_preset_edit_idx_ = -1;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ui::EndModal();
 }
 
 void Player::open_export_preset_editor(int idx){
     export_preset_edit_idx_ = idx;
     export_preset_edit_init_ = false; // seed buffers on the next frame
+    export_presets_open_ = true;      // arms the editor modal's one-shot OpenPopup
 }
-

@@ -325,7 +325,7 @@ void Player::build_bottom_bar(){
     // being overdrawn.
     const float vol_icon_w = ui_s(28.0f);
     const float vol_slider_w = ui_s(70.0f);
-    const float right_pad = ui_s(8.0f); // keep volume slider off the window edge
+    const float right_pad = ui_s(ui::theme::kPaddingContainer); // standard container inset
     float vol_ctrl_w = has_audio()
         ? (ImGui::GetStyle().ItemSpacing.x + vol_icon_w + ImGui::GetStyle().ItemSpacing.x + vol_slider_w + right_pad)
         : right_pad;
@@ -460,8 +460,8 @@ void Player::build_bottom_bar(){
 
 void Player::build_settings_panel(float top_bar_h){
     ImGuiIO& io = ImGui::GetIO();
-    // ~2/3 of the previous 300px panel; labels still fit with PushItemWidth(-1).
-    const float panel_w = ui_s(200.0f);
+    // Wider than the old 200px: rows are now [number box][slider track] compounds.
+    const float panel_w = ui_s(260.0f);
     ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
     // Auto-height to content (AlwaysAutoResize) so the panel does not cover the bottom bar.
     // Cap max height so a tiny window still scrolls rather than overflowing the client.
@@ -471,12 +471,11 @@ void Player::build_settings_panel(float top_bar_h){
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_AlwaysAutoResize;
-    // Match build_status_float(): translucent so the video shows through.
-    ImGui::SetNextWindowBgAlpha(ui::theme::kOverlayBgAlpha);
-    // Content inset so labels/sliders aren't flush against the panel edge;
-    // same 6px corner language as the status float / compile card.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(12.0f), ui_s(12.0f)));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(ui::theme::kRadiusControl));
+    // Unified solid panel background (was a translucent overlay showing the video through).
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
+    // kPaddingContainer inset so labels/sliders aren't flush against the panel edge.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(ui::theme::kPaddingContainer), ui_s(ui::theme::kPaddingContainer)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(ui::theme::kRadiusWindow));
     ImGui::Begin("##sumu_settings", nullptr, flags);
 
     // Staged locally in settings_edit_*_, seeded from the Python-refreshed ui_cfg_*
@@ -496,28 +495,9 @@ void Player::build_settings_panel(float top_bar_h){
         settings_edit_init_ = true;
     }
 
-    // Label left, widget full remaining width (ImGui default is label-on-right, which
-    // squeezes long CJK labels out of a narrow panel).
-    ImGui::PushItemWidth(-1.0f);
+    // Title: plain standard-font text (no divider rules anywhere in the new design).
+    ImGui::TextUnformatted(ui_str_.settings_title.c_str());
 
-    // Title: top pad = WindowPadding.y; bottom to separator slightly tighter.
-    {
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-        ImGui::TextUnformatted(ui_str_.settings_title.c_str());
-        ImGui::Dummy(ImVec2(0.0f, ui_s(8.0f)));
-        ImGui::Separator();
-        ImGui::PopStyleVar();
-    }
-    // Label vertical margins: top half of former field_gap, bottom fixed 1.
-    const float field_gap = ui_s(6.0f);
-    auto settings_label = [&](const char* label) {
-        ImGui::Dummy(ImVec2(0.0f, field_gap * 0.5f));
-        ImGui::PushFont(nullptr, kFontSizeSm);
-        ImGui::TextUnformatted(label);
-        ImGui::PopFont();
-        ImGui::Dummy(ImVec2(0.0f, ui_s(1.0f)));
-    };
     // Tooltips at kFontSizeSm (SetTooltip has no font arg -- BeginTooltip + PushFont).
     auto settings_tooltip = [&](const char* text) {
         if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) || !text || !text[0]) return;
@@ -529,35 +509,34 @@ void Player::build_settings_panel(float top_bar_h){
         ImGui::PopFont();
         ImGui::EndTooltip();
     };
-    settings_label(ui_str_.lead_label.c_str());
-    ui::SliderInt("##lead", &settings_edit_lead_, 1, 180);
-    if (ImGui::IsItemDeactivatedAfterEdit() &&
-        settings_edit_lead_ != ui_cfg_lead_)
+    // ui::SliderInt/Float are compound rows ([number box][track]); `committed` replaces
+    // the old IsItemDeactivatedAfterEdit() check, which cannot span a compound widget.
+    bool committed = false;
+    ui::LineLabel(ui_str_.lead_label.c_str());
+    ui::SliderInt("##lead", &settings_edit_lead_, 1, 180, 0.0f, &committed);
+    if (committed && settings_edit_lead_ != ui_cfg_lead_)
         ui_intents_.lead = settings_edit_lead_;
     settings_tooltip(ui_str_.lead_tooltip.c_str());
-    settings_label(ui_str_.clip_length_label.c_str());
-    ui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180);
-    if (ImGui::IsItemDeactivatedAfterEdit() &&
-        settings_edit_clip_length_ != ui_cfg_clip_length_)
+    ui::LineLabel(ui_str_.clip_length_label.c_str());
+    ui::SliderInt("##clip_length", &settings_edit_clip_length_, 1, 180, 0.0f, &committed);
+    if (committed && settings_edit_clip_length_ != ui_cfg_clip_length_)
         ui_intents_.clip_length = settings_edit_clip_length_;
     settings_tooltip(ui_str_.clip_length_tooltip.c_str());
-    settings_label(ui_str_.max_regions_label.c_str());
-    ui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8);
-    if (ImGui::IsItemDeactivatedAfterEdit() &&
-        settings_edit_max_regions_ != ui_cfg_max_regions_)
+    ui::LineLabel(ui_str_.max_regions_label.c_str());
+    ui::SliderInt("##max_regions", &settings_edit_max_regions_, 1, 8, 0.0f, &committed);
+    if (committed && settings_edit_max_regions_ != ui_cfg_max_regions_)
         ui_intents_.max_regions = settings_edit_max_regions_;
     settings_tooltip(ui_str_.max_regions_tooltip.c_str());
-    settings_label(ui_str_.cold_start_label.c_str());
-    ui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f");
-    if (ImGui::IsItemDeactivatedAfterEdit() &&
-        settings_edit_cold_start_s_ != ui_cfg_cold_start_s_)
+    ui::LineLabel(ui_str_.cold_start_label.c_str());
+    ui::SliderFloat("##cold_start_s", &settings_edit_cold_start_s_, 0.0f, 3.0f, "%.1f", 0.0f, &committed);
+    if (committed && settings_edit_cold_start_s_ != ui_cfg_cold_start_s_)
         ui_intents_.cold_start_s = settings_edit_cold_start_s_;
     settings_tooltip(ui_str_.cold_start_tooltip.c_str());
     {
         const char* target_fps_items[] = {
             ui_str_.target_fps_original.c_str(), "30", "60"
         };
-        settings_label(ui_str_.target_fps_label.c_str());
+        ui::LineLabel(ui_str_.target_fps_label.c_str());
         if (ui::Combo("##target_fps", target_fps_items, 3, &settings_edit_target_fps_idx_)) {
             // Combo is click-select (no drag) -- commit on the selection change itself.
             static const int kTargetFpsByIdx[] = { 0, 30, 60 };
@@ -577,27 +556,21 @@ void Player::build_settings_panel(float top_bar_h){
     // if (ImGui::Checkbox(u8"去码", &local_ai))
     //     ai_enabled_.store(local_ai, std::memory_order_relaxed);
 
-    // Separator: pad above (from combo), tighter pad below (to AI line).
-    {
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-        ImGui::Dummy(ImVec2(0.0f, ui_s(8.0f)));
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0.0f, ui_s(6.0f)));
-        ImGui::PopStyleVar();
-    }
     // Net BasicVSR restore throughput from Python Scheduler (restore_clip wall time only;
     // excludes frontier-gate sleeps). Pushed each tick via set_ui_config; <0 means no
     // restore has finished yet (or no scheduler).
+    ImGui::Dummy(ImVec2(0.0f, ui_s(ui::theme::kSpaceL)));
     ImGui::PushFont(nullptr, kFontSizeSm);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
     if (ui_cfg_ai_restore_fps_ >= 0.0f)
         ImGui::Text(ui_str_.ai_speed.c_str(), ui_cfg_ai_restore_fps_);
     else
         ImGui::TextUnformatted(ui_str_.ai_speed_unknown.c_str());
+    ImGui::PopStyleColor();
     ImGui::PopFont();
 
-    ImGui::PopItemWidth();
     ImGui::End();
     ImGui::PopStyleVar(2); // WindowRounding + WindowPadding
+    ImGui::PopStyleColor(); // WindowBg
 }
 
