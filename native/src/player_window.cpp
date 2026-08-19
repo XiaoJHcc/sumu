@@ -297,6 +297,7 @@ void Player::ui_init(){
     ImGui_ImplDX11_Init(device_.Get(), context_.Get());
     ImGui_ImplDX11_CreateDeviceObjects();
     create_logo_texture(); // first-screen logo SRV; must follow device objects
+    ui::icons::init(device_.Get()); // lucide atlas SRV for IconButton glyphs; same lifetime
     // Capture the post-apply_theme metrics once so every apply_ui_dpi() call can
     // rebuild from a clean base (ScaleAllSizes is lossy -- see its ImGui docs). Must run
     // AFTER apply_theme and BEFORE the first apply_ui_dpi below.
@@ -342,6 +343,7 @@ void Player::ui_shutdown(){
     ui_ready_ = false;
     logo_srv_.Reset();
     logo_tex_.Reset();
+    ui::icons::shutdown();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

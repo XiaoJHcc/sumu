@@ -21,7 +21,7 @@ inline constexpr ImVec4 kWindowBg{ 30.0f / 255.0f, 30.0f / 255.0f, 32.0f / 255.0
 inline constexpr ImVec4 kPanelBg{ 38.0f / 255.0f, 38.0f / 255.0f, 40.0f / 255.0f, 1.0f };
 // Hairline strokes: white at 12% alpha.
 inline constexpr ImVec4 kBorder{ 1.0f, 1.0f, 1.0f, 0.12f };
-// Stronger stroke for floating chrome (modal/popup/card outlines): white at 22%
+// Stronger stroke for floating chrome (modal/popup/floating-panel outlines): white at 22%
 // (== the previous IM_COL32(120,120,120,230)-ish popup border language).
 inline constexpr ImVec4 kBorderStrong{ 1.0f, 1.0f, 1.0f, 0.22f };
 
@@ -29,17 +29,21 @@ inline constexpr ImVec4 kText{ 1.0f, 1.0f, 1.0f, 0.88f };
 inline constexpr ImVec4 kTextSecondary{ 1.0f, 1.0f, 1.0f, 0.55f };
 inline constexpr ImVec4 kTextDim{ 1.0f, 1.0f, 1.0f, 0.32f };
 
-// macOS dark system blue (#0A84FF) with hover/active steps.
-inline constexpr ImVec4 kAccent{ 10.0f / 255.0f, 132.0f / 255.0f, 1.0f, 1.0f };
-inline constexpr ImVec4 kAccentHover{ 46.0f / 255.0f, 151.0f / 255.0f, 1.0f, 1.0f };
-inline constexpr ImVec4 kAccentActive{ 10.0f / 255.0f, 116.0f / 255.0f, 232.0f / 255.0f, 1.0f };
+// Soft accent blue (#6FA8F7) with hover/active steps. Used for the Primary button chip,
+// checkbox on-state, slider fill, combo check, links -- the single accent everywhere.
+inline constexpr ImVec4 kAccent{ 111.0f / 255.0f, 168.0f / 255.0f, 247.0f / 255.0f, 1.0f };
+inline constexpr ImVec4 kAccentHover{ 137.0f / 255.0f, 187.0f / 255.0f, 249.0f / 255.0f, 1.0f };
+inline constexpr ImVec4 kAccentActive{ 93.0f / 255.0f, 150.0f / 255.0f, 230.0f / 255.0f, 1.0f };
 
-inline constexpr ImVec4 kError{ 1.0f, 69.0f / 255.0f, 58.0f / 255.0f, 1.0f };    // #FF453A
+inline constexpr ImVec4 kError{ 230.0f / 255.0f, 80.0f / 255.0f, 80.0f / 255.0f, 1.0f }; // #E65050
 inline constexpr ImVec4 kWarning{ 1.0f, 214.0f / 255.0f, 10.0f / 255.0f, 1.0f }; // #FFD60A
 inline constexpr ImVec4 kSuccess{ 50.0f / 255.0f, 215.0f / 255.0f, 75.0f / 255.0f, 1.0f }; // #32D74B
 
 // Input / combo / checkbox frame background: white 7%.
 inline constexpr ImVec4 kControlBg{ 1.0f, 1.0f, 1.0f, 0.07f };
+// Nested list-row card fill (rows inside a kPanelBg card -- export preset rows, queue
+// item cards): white 5%, one faint step above the parent card.
+inline constexpr ImVec4 kRowCardBg{ 1.0f, 1.0f, 1.0f, 0.05f };
 // Slider track: white 10%.
 inline constexpr ImVec4 kTrackBg{ 1.0f, 1.0f, 1.0f, 0.10f };
 // Neutral (secondary) button fill: white 8% (hover 12% / active 16% -- see widgets).
@@ -62,6 +66,11 @@ inline constexpr ImVec4 kMediaTrack{ 90.0f / 255.0f, 90.0f / 255.0f, 90.0f / 255
 // Alpha for translucent overlay windows (status float / bottom bar / settings panel)
 // fed to ImGui::SetNextWindowBgAlpha so the video shows through.
 inline constexpr float kOverlayBgAlpha = 0.55f;
+
+// Modal backdrop dim: pure black at 50%. apply_theme() installs it as
+// ImGuiCol_ModalWindowDimBg / NavWindowingDimBg; ui::BeginModal re-pushes the same value
+// around its popup so a dim changed at runtime cannot leak between modals.
+inline constexpr ImVec4 kDimBg{ 0.0f, 0.0f, 0.0f, 0.50f };
 
 // ImU32 forms for ImDrawList calls.
 inline ImU32 to_u32(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
@@ -97,6 +106,9 @@ inline constexpr float kRadiusCheckbox = 4.0f;
 // between a container's edge and any control inside it (window↔slider, modal↔input, ...).
 inline constexpr float kPaddingContainer = 12.0f;
 
+// kSpaceXS is the title-bar beat: 36px bar / 32px buttons -> a uniform 2px inset on all
+// four sides (button gap, bar edge padding, vertical centering all read this).
+inline constexpr float kSpaceXS = 2.0f;
 inline constexpr float kSpaceS = 4.0f;
 inline constexpr float kSpaceM = 8.0f;
 inline constexpr float kSpaceL = 12.0f;
@@ -104,6 +116,11 @@ inline constexpr float kSpaceXL = 16.0f;
 
 // Single-line control standard (inputs, combos, buttons): 32px = 18px font + 2*7px
 // FramePadding.y (set in apply_theme). All three read the same height/rounding/colors.
+// This is ALSO the icon-button standard: every icon button (title bar, bottom bar, modal
+// close, export page) is a kControlHeight square -- in chrome code use ui_s(kControlHeight)
+// (title-bar btn_h derives from the 36px bar minus 2*kSpaceXS, which is the same 32px);
+// inside rows GetFrameHeight() is the same value and keeps the button matched to its row.
+// The glyph inside is 7/16 of the edge (ui::IconButton), 14px at 96 DPI.
 inline constexpr float kControlHeight = 32.0f;
 // Compact numeric column used inside mixed rows and next to sliders.
 inline constexpr float kNumericInputW = 72.0f;
@@ -124,9 +141,9 @@ inline constexpr float kComboArrowH = 5.0f;
 inline constexpr float kModalContentW = 440.0f;
 inline constexpr float kModalContentWLg = 480.0f;
 // Modal title-strip height, identical for every ui::BeginModal (title text + close X).
-// Matches the main window's top bar (Player::kTopBarHBase = 32) so every title strip
+// Matches the main window's top bar (Player::kTopBarHBase = 36) so every title strip
 // in the app shares one height standard.
-inline constexpr float kModalTitleH = 32.0f;
+inline constexpr float kModalTitleH = 36.0f;
 
 // Secondary-copy font size (unscaled base @ 96 DPI) -- mirrors Player::kFontSizeSm.
 // Duplicated here so this layer stays player.h-free; pass to PushFont(nullptr, size),

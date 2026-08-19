@@ -32,34 +32,7 @@ float export_item_card_h(const ExportItemView& item, float s){
     if (has_progress) col1 += sp_y + 6.0f * s;
     if (!item.error.empty()) col1 += sp_y + base_lh;
     const float ch = std::max(std::max(2.0f * frame_h + sp_y, 72.0f * s), col1);
-    return ch + 2.0f * 10.0f * s;
-}
-
-// Small hand-drawn folder glyph for the "choose directory" icon button (path card).
-void draw_folder_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
-    dl->AddRectFilled(ImVec2(c.x - 7.0f * s, c.y - 3.0f * s), ImVec2(c.x + 7.0f * s, c.y + 5.5f * s),
-        col, 1.5f * s);
-    dl->AddRectFilled(ImVec2(c.x - 7.0f * s, c.y - 5.5f * s), ImVec2(c.x - 1.0f * s, c.y - 2.0f * s),
-        col, 1.0f * s);
-}
-
-// Small hand-drawn trash glyph for the preset card's delete icon button.
-void draw_trash_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
-    const float th = std::max(1.0f, 1.3f * s);
-    dl->AddLine(ImVec2(c.x - 5.0f * s, c.y - 3.5f * s), ImVec2(c.x + 5.0f * s, c.y - 3.5f * s), col, th);
-    dl->AddLine(ImVec2(c.x - 2.0f * s, c.y - 5.5f * s), ImVec2(c.x + 2.0f * s, c.y - 5.5f * s), col, th);
-    dl->AddRect(ImVec2(c.x - 4.0f * s, c.y - 2.5f * s), ImVec2(c.x + 4.0f * s, c.y + 5.5f * s),
-        col, 1.0f * s, 0, th);
-    dl->AddLine(ImVec2(c.x - 1.5f * s, c.y - 0.5f * s), ImVec2(c.x - 1.5f * s, c.y + 3.5f * s), col, th);
-    dl->AddLine(ImVec2(c.x + 1.5f * s, c.y - 0.5f * s), ImVec2(c.x + 1.5f * s, c.y + 3.5f * s), col, th);
-}
-
-// Gray X (queue-item delete); the caller flips the color to kError on hover.
-void draw_x_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
-    const float th = std::max(1.0f, 1.3f * s);
-    const float half = 4.0f * s;
-    dl->AddLine(ImVec2(c.x - half, c.y - half), ImVec2(c.x + half, c.y + half), col, th);
-    dl->AddLine(ImVec2(c.x - half, c.y + half), ImVec2(c.x + half, c.y - half), col, th);
+    return ch + 2.0f * ui::theme::kPaddingContainer * s;
 }
 
 // Drag grip: two columns of three dots.
@@ -108,10 +81,10 @@ int Player::export_quality_idx_of(const std::string& preset){
 void Player::build_export_preset_card(int i, float width){
     const auto& p = export_presets_[i];
     ImGui::PushID(i);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::kRowCardBg);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusControl));
     // Compact uniform inset: the row is a list entry, not a form card.
-    const float pad = ui_s(6.0f);
+    const float pad = ui_s(ui::theme::kSpaceM);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
     const float row_h = ImGui::GetFrameHeight() + 2.0f * pad;
     // NoScrollbar: the row fits exactly; rounding overflow must clip, never scroll.
@@ -166,13 +139,8 @@ void Player::build_export_preset_card(int i, float width){
     // Trash: full-row-height square at the right edge; glyph turns red on hover.
     ImGui::SameLine(0.0f, gap);
     ui::IconButtonResult dr = ui::IconButton("##del", ImVec2(icon_sz, icon_sz));
-    {
-        const ImU32 col = ImGui::IsItemHovered()
-            ? ui::theme::error_u32() : ui::theme::icon_color_dim_u32();
-        draw_trash_glyph(dr.dl,
-            ImVec2((dr.min.x + dr.max.x) * 0.5f, (dr.min.y + dr.max.y) * 0.5f),
-            ui_s(1.0f), col);
-    }
+    ui::DrawIconButtonGlyph(dr, ui::AppIcon::Trash, ImGui::IsItemHovered()
+        ? ui::theme::error_u32() : ui::theme::icon_color_dim_u32());
     if (dr.clicked) {
         ui_intents_.export_preset_delete = true;
         ui_intents_.export_preset_edit_idx = i;
@@ -209,7 +177,7 @@ void Player::build_export_item_card(ExportItemView& item, float width,
     ImGui::PushID(item.id);
 
     const float s = ui_s(1.0f);
-    const float pad = ui_s(10.0f);
+    const float pad = ui_s(ui::theme::kPaddingContainer);
     const float gap = ImGui::GetStyle().ItemSpacing.x;
     const float frame_h = ImGui::GetFrameHeight();
     const float sp_y = ImGui::GetStyle().ItemSpacing.y;
@@ -217,7 +185,7 @@ void Player::build_export_item_card(ExportItemView& item, float width,
     const float card_h = export_item_card_h(item, s);
     const float ch = card_h - 2.0f * pad;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 0.05f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::kRowCardBg);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusControl));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
     // NoScrollbar: a fixed-size card must clip, never grow its own scrollbar.
@@ -230,7 +198,7 @@ void Player::build_export_item_card(ExportItemView& item, float width,
     const float inner_w = width - 2.0f * pad;
     const float grip_w = ui_s(14.0f);
     const float col2_w = ui_s(150.0f);
-    const float col3_w = ui_s(24.0f);
+    const float col3_w = frame_h; // delete button: same row-height square as the path card's
     const float col1_w = std::max(ui_s(60.0f),
         inner_w - grip_w - col2_w - col3_w - 3.0f * gap);
 
@@ -340,10 +308,8 @@ void Player::build_export_item_card(ExportItemView& item, float width,
     ImGui::SetCursorScreenPos(ImVec2(col3_x, mid_y - col3_w * 0.5f));
     {
         ui::IconButtonResult dr = ui::IconButton("##del", ImVec2(col3_w, col3_w));
-        const ImU32 col = ImGui::IsItemHovered()
-            ? ui::theme::error_u32() : ui::theme::icon_color_dim_u32();
-        draw_x_glyph(dl, ImVec2((dr.min.x + dr.max.x) * 0.5f, (dr.min.y + dr.max.y) * 0.5f),
-            s, col);
+        ui::DrawIconButtonGlyph(dr, ui::AppIcon::Close, ImGui::IsItemHovered()
+            ? ui::theme::error_u32() : ui::theme::icon_color_dim_u32());
         if (dr.clicked)
             ui_intents_.export_remove = item.id;
         if (!ui_str_.export_remove.empty() && ImGui::IsItemHovered())
@@ -415,9 +381,8 @@ void Player::build_export_screen(float top_bar_h){
                 export_global_dir_.empty() ? 1 : export_global_dir_.size() + 1,
                 "-", input_w, ImGuiInputTextFlags_ReadOnly);
             ImGui::SameLine();
-            ui::IconButtonResult r = ui::IconButton("##export_pick_dir", ImVec2(icon_sz, icon_sz));
-            draw_folder_glyph(r.dl, ImVec2((r.min.x + r.max.x) * 0.5f, (r.min.y + r.max.y) * 0.5f),
-                ui_s(1.0f), ui::theme::icon_color_u32());
+            ui::IconButtonResult r = ui::IconButton("##export_pick_dir",
+                ImVec2(icon_sz, icon_sz), ui::AppIcon::FolderInput);
             if (r.clicked)
                 ui_intents_.export_pick_global = true;
         }

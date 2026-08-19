@@ -25,33 +25,12 @@ if(NOT _nbytes EQUAL _expected)
     message(FATAL_ERROR "embed_binary: ${IN} is ${_nbytes} bytes, expected ${_expected} (${WIDTH}x${HEIGHT} RGBA)")
 endif()
 
-# Format as "0xab, 0xcd, ..." with 16 bytes per line.
-set(_body "")
-set(_line "")
-set(_count 0)
-set(_i 0)
-while(_i LESS _hex_len)
-    string(SUBSTRING "${_raw}" ${_i} 2 _byte)
-    if(_line STREQUAL "")
-        set(_line "0x${_byte}")
-    else()
-        set(_line "${_line}, 0x${_byte}")
-    endif()
-    math(EXPR _count "${_count} + 1")
-    math(EXPR _i "${_i} + 2")
-    if(_count EQUAL 16)
-        if(_i LESS _hex_len)
-            set(_body "${_body}    ${_line},\n")
-        else()
-            set(_body "${_body}    ${_line}\n")
-        endif()
-        set(_line "")
-        set(_count 0)
-    endif()
-endwhile()
-if(NOT _line STREQUAL "")
-    set(_body "${_body}    ${_line}\n")
-endif()
+# Format as "0xab,0xcd,..." via ONE regex pass over the hex string. The old per-byte
+# SUBSTRING+append loop was O(n^2) in CMake string time -- fine for the 256KB logo, but it
+# hung the build for tens of minutes on the ~900KB icon atlas.
+string(REGEX REPLACE "(..)" "0x\\1," _body "${_raw}")
+# Wrap to 16 bytes per line so the compiler doesn't see one giant line.
+string(REGEX REPLACE "((0x..,){16})" "\\1\n    " _body "${_body}")
 
 set(_header
 "// SPDX-FileCopyrightText: sumu Authors

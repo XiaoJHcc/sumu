@@ -27,7 +27,7 @@ void apply_theme(ImGuiStyle& style){
     style.GrabMinSize = 10.0f;
     style.WindowBorderSize = 0.0f;   // modal/popup strokes are self-drawn (see ui::BeginModal)
     style.PopupBorderSize = 0.0f;
-    style.FrameBorderSize = 0.0f;    // secondary-button strokes drawn by ui::Button
+    style.FrameBorderSize = 0.0f;    // controls are borderless (only floating windows stroke)
 
     ImVec4* c = style.Colors;
     c[ImGuiCol_Text] = kText;
@@ -106,8 +106,8 @@ void apply_theme(ImGuiStyle& style){
 
     c[ImGuiCol_NavCursor] = kAccent;
     c[ImGuiCol_NavWindowingHighlight] = white(0.70f);
-    c[ImGuiCol_NavWindowingDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.50f);
-    c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.50f);
+    c[ImGuiCol_NavWindowingDimBg] = kDimBg;
+    c[ImGuiCol_ModalWindowDimBg] = kDimBg;
 }
 
 } // namespace ui::theme

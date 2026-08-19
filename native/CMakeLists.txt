@@ -67,7 +67,26 @@ add_custom_command(
     DEPENDS "${LOGO_RGBA_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
     COMMENT "Embedding sumu-logo-256.rgba -> logo_rgba.h"
 )
-add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}" "${LOGO_RGBA_HEADER}")
+
+# ---- icon atlas embedding (assets/generated/icons_atlas.rgba -> icons_atlas.h) ----
+# Source of truth is assets/icons/lucide/*.svg; scripts/gen_icon_atlas.py rasterizes them
+# into this .rgba strip (16 tightly packed 96px cells; native resamples per-DPI at runtime).
+# Same rationale as the logo embed: no image decoder in native.
+set(ICONS_RGBA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../assets/generated/icons_atlas.rgba")
+set(ICONS_RGBA_HEADER "${GENERATED_DIR}/icons_atlas.h")
+add_custom_command(
+    OUTPUT "${ICONS_RGBA_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DIN=${ICONS_RGBA_SRC}
+        -DOUT=${ICONS_RGBA_HEADER}
+        -DVARNAME=IconsAtlas
+        -DWIDTH=1536
+        -DHEIGHT=96
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
+    DEPENDS "${ICONS_RGBA_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
+    COMMENT "Embedding icons_atlas.rgba -> icons_atlas.h"
+)
+add_custom_target(generate_shaders DEPENDS "${PRESENT_HLSL_HEADER}" "${LOGO_RGBA_HEADER}" "${ICONS_RGBA_HEADER}")
 
 
 pybind11_add_module(sumu_core
@@ -81,6 +100,7 @@ pybind11_add_module(sumu_core
     src/ui_util.cpp
     src/ui/theme.cpp
     src/ui/widgets.cpp
+    src/ui/icons.cpp
     src/decoder.cpp
     src/headless_decode.cpp
     "${IMGUI_DIR}/imgui.cpp"

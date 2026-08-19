@@ -88,14 +88,14 @@ void Player::build_open_prompt_overlay(float top_bar_h){
     ImGui::Begin("##sumu_open_prompt", nullptr, flags);
 
     const float logo_draw = ui_s(120.0f);
-    const float logo_gap = ui_s(16.0f);
+    const float logo_gap = ui_s(ui::theme::kSpaceXL);
     bool have_logo = logo_srv_ != nullptr;
 
     const char* prompt = ui_str_.open_prompt.c_str();
     ImVec2 tsize = ImGui::CalcTextSize(prompt);
-    const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(32.0f);
-    const float open_btn_gap = ui_s(8.0f);
-    const float gap = ui_s(16.0f);
+    const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(ui::theme::kControlHeight);
+    const float open_btn_gap = ui_s(ui::theme::kSpaceM);
+    const float gap = ui_s(ui::theme::kSpaceXL);
     // Single row of four entries: local file (Primary accent) + network URL / web-stream /
     // offline export (Secondary neutral).
     const float open_row_w = open_btn_w * 4.0f + open_btn_gap * 3.0f;
@@ -104,9 +104,10 @@ void Player::build_open_prompt_overlay(float top_bar_h){
     // Optional TRT-compile region below the open button (set_compile_ui state != 0). Measure
     // it first so the whole prompt+button+compile block stays vertically centered.
     const float compile_cw = ui_s(380.0f);      // content column width for the compile region
-    const float region_gap = ui_s(30.0f);       // gap between open button and the compile region
-    const float ctrl_gap = ui_s(10.0f);         // gap between the compile text line and its control
-    const float compile_btn_w = ui_s(200.0f), compile_btn_h = ui_s(30.0f), compile_bar_h = ui_s(18.0f);
+    const float region_gap = ui_s(2.0f * ui::theme::kSpaceXL); // gap between open button and the compile region
+    const float ctrl_gap = ui_s(ui::theme::kSpaceL);           // gap between the compile text line and its control
+    const float compile_btn_w = ui_s(200.0f), compile_btn_h = ui_s(ui::theme::kControlHeight),
+        compile_bar_h = ui_s(18.0f);
     bool show_compile = compile_ui_state_ != 0;
     float compile_text_h = 0.0f, compile_block_h = 0.0f;
     if (show_compile) {
@@ -155,22 +156,20 @@ void Player::build_open_prompt_overlay(float top_bar_h){
 
 
         // Frame the whole compile block (text + button/progress-bar) as one visual unit,
-        // same filled-bg + border language as the seekbar's hover thumbnail card above.
+        // same translucent filled-bg language as the seekbar's hover thumbnail card above.
         // DrawList is screen-space; region_x/cy are window-local (SetCursorPos), so add
         // WindowPos -- without it the box sits top_bar_h above the text/button.
-        const float box_pad = ui_s(16.0f);
+        const float box_pad = ui_s(ui::theme::kPaddingContainer);
         float ctrl_h = (compile_ui_state_ == 2) ? compile_bar_h : compile_btn_h;
         ImVec2 wpos = ImGui::GetWindowPos();
         ImVec2 box_min(wpos.x + region_x - box_pad, wpos.y + cy - box_pad);
         ImVec2 box_max(wpos.x + region_x + compile_cw + box_pad,
             wpos.y + cy + compile_text_h + ctrl_gap + ctrl_h + box_pad);
         ImDrawList* box_dl = ImGui::GetWindowDrawList();
-        ImVec4 box_bg = ui::theme::kWindowBg;
-        box_bg.w = 0.63f; // translucent card over the video
+        ImVec4 box_bg = ui::theme::kPanelBg;
+        box_bg.w = ui::theme::kOverlayBgAlpha; // translucent card, same alpha as the overlay floats
         box_dl->AddRectFilled(box_min, box_max, ui::theme::to_u32(box_bg),
-            ui_s(ui::theme::kRadiusControl));
-        box_dl->AddRect(box_min, box_max, ui::theme::border_u32(),
-            ui_s(ui::theme::kRadiusControl));
+            ui_s(ui::theme::kRadiusWindow));
 
         // Center each wrapped line (ImGui::TextUnformatted is left-aligned in the wrap column).
         bool failed = compile_ui_state_ == 3;
@@ -257,8 +256,7 @@ void Player::build_open_url_popup(){
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f); // border self-drawn below
         ImGui::PushStyleColor(ImGuiCol_PopupBg, ui::theme::kPanelBg);
-        // Pure black @ 50% over the chrome (default ModalWindowDimBg is a gray wash).
-        ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.50f));
+        // ModalWindowDimBg needs no push: apply_theme() already installed theme::kDimBg.
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar;
         // Same "###sumu_open_url" ID as the form's BeginModal title below (same window).
@@ -277,7 +275,7 @@ void Player::build_open_url_popup(){
                 ui::theme::border_strong_u32(), ui_s(ui::theme::kRadiusWindow), 0, 1.0f);
             ImGui::EndPopup();
         }
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(1);
         ImGui::PopStyleVar(3);
         return;
     }

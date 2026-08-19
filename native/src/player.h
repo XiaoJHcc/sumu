@@ -329,7 +329,7 @@ public:
     // (fonts/icons/chrome all grow with it; see apply_ui_dpi()). Shared by build_top_bar(),
     // fit_viewport() (reserves this strip so the video is letterboxed BELOW the bar) and
     // resize_window_for_video() (adds it to the target client height).
-    static constexpr float kTopBarHBase = 32.0f;
+    static constexpr float kTopBarHBase = 36.0f;
 
     // Font size ladder (unscaled base @ 96 DPI). FontScaleDpi multiplies at runtime -- pass
     // these to AddFontFromFileTTF / PushFont(NULL, size), never GetFontSize() (would double-scale).
@@ -576,6 +576,8 @@ private:
     using IconButtonResult = ui::IconButtonResult;
 
     IconButtonResult icon_button(const char* str_id, ImVec2 size, bool disabled = false);
+    // Atlas-glyph variant: paints the lucide icon (ui::AppIcon) centered on the hit area.
+    IconButtonResult icon_button(const char* str_id, ImVec2 size, ui::AppIcon icon, bool disabled = false);
 
     void build_top_bar(float& out_height);
 

@@ -27,6 +27,7 @@
 
 #include "imgui.h"
 #include "theme.h"
+#include "icons.h" // ui::AppIcon (icon-atlas glyph ids)
 
 #include <cstddef>
 
@@ -34,9 +35,10 @@ namespace ui {
 
 // ---- buttons ---------------------------------------------------------------------------------
 
-// Button hierarchy: Primary = accent-filled (one per view, the default action),
-// Secondary = neutral fill + hairline border, Danger = destructive (delete/remove),
-// error-tinted text on a quiet fill (macOS destructive-button language).
+// Button hierarchy: Primary = soft-blue chip (translucent accent fill + accent text; one
+// per view, the default action), Secondary = neutral fill, Danger = destructive
+// (delete/remove), error-tinted text on a quiet fill. All borderless -- only floating
+// windows keep a stroke in this design.
 enum class ButtonVariant { Primary, Secondary, Danger };
 // Small = compact rows like the export queue's per-item buttons.
 enum class ControlSize { Regular, Small };
@@ -102,8 +104,9 @@ void UnitText(const char* text);
 
 // ---- containers ----------------------------------------------------------------------------------
 
-// Card: panel-bg rounded child with a hairline border and kPaddingContainer padding on all
-// sides. height == 0 auto-fits the content. Pair every BeginCard with EndCard.
+// Card: panel-bg rounded child with kPaddingContainer padding on all sides. Borderless:
+// cards separate from the window by fill contrast alone. height == 0 auto-fits the
+// content. Pair every BeginCard with EndCard.
 bool BeginCard(const char* id, float height = 0.0f);
 void EndCard();
 
@@ -146,5 +149,16 @@ struct IconButtonResult {
     ImDrawList* dl;
 };
 IconButtonResult IconButton(const char* str_id, ImVec2 size, bool disabled = false);
+
+// Atlas-glyph variant (preferred): paints the lucide icon from ui::icons centered at 7/16
+// of the button size (32px button -> 14px glyph), tinted theme kIconColor / kIconColorDim
+// when disabled. If the atlas failed to build this degrades to the hit-area-only form above.
+IconButtonResult IconButton(const char* str_id, ImVec2 size, AppIcon icon, bool disabled = false);
+
+// Paints the glyph of an already-created bare IconButton with a caller-chosen tint (same
+// centering + 7/16 sizing as the AppIcon overload). For the rare buttons whose tint is
+// state-dependent beyond enabled/disabled -- e.g. delete glyphs that flip dim -> kError
+// on hover.
+void DrawIconButtonGlyph(const IconButtonResult& r, AppIcon icon, ImU32 tint);
 
 } // namespace ui

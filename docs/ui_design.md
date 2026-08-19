@@ -2,8 +2,12 @@
 
 本文档描述 ImGui 设计系统：色板/尺寸层 `ui/theme.h`、控件层 `ui/widgets.h`，以及各
 页面（player_ui_*.cpp）的使用约定。目标是 **macOS 风格的深色极简** 观感：低亮度
-中性底色、细发丝描边（hairline）、统一的 6/8px 圆角语言、单一强调色（macOS dark
-system blue），控件本身不携带任何调用点的样式代码。
+中性底色、统一的 6/8px 圆角语言、单一柔和蓝强调色（#6FA8F7），控件本身不携带任何
+调用点的样式代码。
+
+**描边规则：按钮和卡片一律无描边**（靠填充对比分层）。仅存的描边有两类——浮窗
+外框（`kBorderStrong`：modal/loading 卡片/设置面板/下拉弹窗，用于表示显著的层级
+区分）和标题栏下边缘/标题条分隔线（`kBorder`，划分标题栏与窗口主体）。
 
 **核心原则：彻底重绘，不打样式补丁。** 所有表单型控件（输入框/下拉/勾选框/拉条/
 按钮）的观感与行为由 widgets 层自绘实现并统一度量；页面代码只组合控件，不出现任何
@@ -21,12 +25,13 @@ native/src/
   player_window.cpp      Win32 窗口/WndProc、全屏、DWM chrome、present loop 入口
   player_engine.cpp      解码/调度/缩略图 scrub 等引擎侧逻辑
   player_ui_overlays.cpp build_ui() 调度 + 首屏提示/打开 URL/Web 串流弹窗/状态浮窗
-  player_ui_bars.cpp     顶栏/底栏（手绘 seekbar、音量条、图标）+ 设置面板
+  player_ui_bars.cpp     顶栏/底栏（手绘 seekbar、音量条）+ 设置面板
   player_ui_export.cpp   离线导出页（四段卡片式布局）+ 预设管理器/编辑器
   player_pybind.cpp      pybind11 模块定义
   ui_util.h/.cpp         纯函数工具（basename、elide、mmss、seekbar 映射），可单测
   ui/theme.h/.cpp        设计系统色板 + 尺寸层（namespace ui::theme）
   ui/widgets.h/.cpp      设计系统控件层（namespace ui），见下文
+  ui/icons.h/.cpp        设计系统图标层：lucide 图集纹理 + ui::AppIcon，见下文
 ```
 
 UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / `record_*()`），
@@ -38,18 +43,20 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 |---|---|---|
 | `kWindowBg` | #1E1E20 | 主窗口背景 |
 | `kPanelBg` | #262628 | 卡片/弹窗/面板底色，比窗口背景亮一档；**所有容器背景统一用它**（设置面板等浮窗也已改为实心 `kPanelBg`，不再半透明） |
-| `kBorder` | 白 @ 12% | 发丝描边（卡片描边、Secondary 按钮描边、下拉弹窗描边） |
-| `kBorderStrong` | 白 @ 22% | 浮层 chrome 描边（modal/loading 卡片外框） |
+| `kBorder` | 白 @ 12% | 发丝线（标题栏下边缘、modal 标题条分隔线、下拉弹窗外框、未勾选 Checkbox 描边） |
+| `kBorderStrong` | 白 @ 22% | 浮窗外框（modal / loading 卡片 / 设置面板，表示层级区分） |
 | `kText` / `kTextSecondary` / `kTextDim` | 白 @ 88% / 55% / 32% | 正文 / 次级说明（hint、拉条端文字、摘要） / 弱化 |
-| `kAccent` / `kAccentHover` / `kAccentActive` | #0A84FF / hover / active | 唯一强调色（Primary 按钮、勾选框勾选态、拉条填充、Combo 选中勾、链接） |
-| `kError` / `kWarning` / `kSuccess` | #FF453A / #FFD60A / #32D74B | 错误 / 警告 / 成功文本与状态 |
+| `kAccent` / `kAccentHover` / `kAccentActive` | #6FA8F7 / hover / active | 唯一强调色，柔和蓝（Primary 按钮、勾选框勾选态、拉条填充、Combo 选中勾、链接） |
+| `kError` / `kWarning` / `kSuccess` | #E65050 / #FFD60A / #32D74B | 错误 / 警告 / 成功文本与状态 |
 | `kControlBg` | 白 @ 7% | 输入框/Combo/未勾选 Checkbox 的填充，**比卡片背景浅一档** |
+| `kRowCardBg` | 白 @ 5% | 嵌套列表行卡片填充（导出预设行、队列项卡片——位于 `kPanelBg` 卡片之内，只亮一丝） |
 | `kTrackBg` | 白 @ 10% | 拉条轨道 |
 | `kButtonBg` | 白 @ 8%（hover 12% / active 16%） | Secondary（中性）按钮填充 |
 | `kHoverFill` | 白 @ 12% | 手绘命中区（图标按钮、Combo 下拉行）的 hover 浅底 |
 | `kIconColor` / `kIconColorDim` | (230,230,230) / (110,110,110) | 手绘 chrome 图标 glyph 色 / 弱化态；seekbar/音量旋钮同用 `kIconColor` |
 | `kMediaFill` / `kMediaTrack` | (200,200,60) / (90,90,90) | 手绘媒体条（seekbar/音量）的已播放填充 / 轨道，既定观感，值冻结 |
-| `kOverlayBgAlpha` | 0.55（float） | 仅剩状态浮窗使用的半透明 alpha |
+| `kOverlayBgAlpha` | 0.55（float） | 状态浮窗与开屏编译卡片的半透明 alpha |
+| `kDimBg` | 黑 @ 50% | 模态遮罩（`ModalWindowDimBg`/`NavWindowingDimBg`；`apply_theme` 已装为全局默认，页面无需再 push） |
 
 `apply_theme(ImGuiStyle&)` 在 `Player::ui_init()` 中替代 `StyleColorsDark()`，且在
 `ui_style_base_` 快照**之前**调用，保证 `apply_ui_dpi()` 的 `ScaleAllSizes` 重建总是从
@@ -62,19 +69,32 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 - **`kPaddingContainer = 12`：所有卡片/弹窗/面板必须保证的最小内边距**（四边）。
   控件永远不得贴容器边缘（旧 URL 弹窗输入框右侧贴边即反例，已由 BeginModal 的钉宽
   机制根治）。
-- **卡片** = `ui::BeginCard`：`kPanelBg` 底 + `kRadiusWindow` 圆角 + 1px `kBorder` 描边 +
-  四边 12px padding。
+- **卡片** = `ui::BeginCard`：`kPanelBg` 底 + `kRadiusWindow` 圆角 + 四边 12px padding，
+  **无描边**（靠与窗口底的填充对比分层）。
 - 弹窗 = `ui::BeginModal`：宽度钉死为 `内容宽 + 2×12`，内容列右缘距窗口右缘恒为
   12px。标准内容宽 `kModalContentW = 440`；宽表单（预设编辑器）用
   `kModalContentWLg = 480`。**新弹窗一律从这两个宽度里选。** 标题条高度统一为
-  `kModalTitleH = 32`（与主窗口顶栏 `kTopBarHBase` 同高，全 App 一种标题条；内容区
+  `kModalTitleH = 36`（与主窗口顶栏 `kTopBarHBase` 同高，全 App 一种标题条；内容区
   右缘由 WindowPadding 机制内缩，任何"填满剩余宽"的控件都不可能贴边）。
+
+### 标题栏
+
+- 高度 `kTopBarHBase = 36`（modal 标题条 `kModalTitleH` 同高）；图标按钮 32×32，
+  四边等距 `kSpaceXS = 2`（边距、按钮间距、垂直居中全部读这一个刻度）。
+  底栏高度与标题栏一致（共用 `top_bar_h()`）。
+
+### 图标按钮（标准规格）
+
+- **全 App 一种图标按钮：`kControlHeight`（32px @ 96 DPI）方块 + 7/16 glyph（14px）
+  + hover 浅底**。顶栏、底栏、modal 关闭、导出页删除/文件夹按钮全部遵守；
+  chrome 代码写 `ui_s(kControlHeight)`（顶栏 btn_h 从 36px 栏高减 2×`kSpaceXS` 推出，
+  同为 32），行内场景用 `GetFrameHeight()`（同值，且与所在行对齐）。
+- 新图标按钮不允许自定义尺寸；确需例外时先在这里登记理由。
 
 ### 单行控件（输入框 / 下拉 / 按钮共用）
 
 - **`kControlHeight = 32`**（FramePadding (10,7) + 18px 基础字体），圆角
-  `kRadiusControl = 6`，填充 `kControlBg`，无边框（Secondary 按钮例外：自绘 hairline
-  描边）。按钮与输入框同高——比旧版 28px 更高。
+  `kRadiusControl = 6`，填充 `kControlBg`，无边框。按钮与输入框同高——比旧版 28px 更高。
 - 窗口圆角 `kRadiusWindow = 8`。
 - 数值输入小列宽 `kNumericInputW = 72`（拉条旁的数字框、混排行输入框）。
 
@@ -88,7 +108,8 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 ### 勾选框
 
 - `kCheckboxSize = 16`、圆角 `kRadiusCheckbox = 4`，约与 label 文字同高。
-- 勾选态：`kAccent` 底 + 白色对勾；未勾选：`kControlBg` 底 + hairline 描边。
+- 勾选态：`kAccent` 底 + 深色对勾（柔和蓝太浅，白对勾对比不足）；未勾选：`kControlBg`
+  底 + hairline 描边。
 
 ### 下拉菜单
 
@@ -98,7 +119,7 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 
 ### 间距与字号
 
-- 间距：`kSpaceS/M/L/XL = 4/8/12/16`。
+- 间距：`kSpaceXS/S/M/L/XL = 2/4/8/12/16`。
 - 字号：标准 = `kFontSizeBase = 18`（小节标题、行内 label、控件文字）；小型 =
   `kFontSizeSm = 16`（行前 label、hint、摘要、拉条端文字）。配合
   `PushFont(nullptr, size)`；不要乘 `GetFontSize()`（会重复应用 FontScaleDpi）。
@@ -146,9 +167,9 @@ enum class ControlSize { Regular, Small };
 ```
 
 - `bool Button(label, variant = Secondary, size = Regular, width = 0)`
-  Primary = 强调色填充（**每个视图至多一个**，默认动作）；Secondary = 中性填充 +
-  hairline 描边；Danger = 破坏性操作，安静底色 + `kError` 文字。`Small` 用于紧凑行
-  （导出队列的每行小按钮）。
+  Primary = 柔和蓝 chip（半透明 `kAccent` 底 + `kAccent` 文字，**每个视图至多一个**，
+  默认动作）；Secondary = 中性填充；Danger = 破坏性操作，安静底色 + `kError` 文字。
+  **全部无描边。** `Small` 用于紧凑行（导出队列的每行小按钮）。
 - `bool TextInput(label, buf, cap, hint = nullptr, width = 0, flags = 0)`
   输入框。`flags` 直传 ImGui（`EnterReturnsTrue`、`ReadOnly` 等）。
 - `bool IntInput(label, int*, width = 0)`
@@ -172,13 +193,41 @@ enum class ControlSize { Regular, Small };
 - `void ProgressBar(frac, width = 0, height = 0)`：`frac ∈ [0,1]`，`-1` = 不定态。
 - `void Spinner(id)`：旋转弧线加载指示。
 - `IconButtonResult IconButton(str_id, size, disabled = false)`
-  手绘 glyph 图标按钮命中区；返回点击结果 + 屏幕矩形 + draw list，调用方居中画
-  glyph（文件夹、垃圾桶等），hover 浅底自动绘制。`Player::icon_button()` 是同签名委托。
+  图标按钮命中区（无 glyph 版）；返回点击结果 + 屏幕矩形 + draw list，hover 浅底自动
+  绘制。仅配合 `DrawIconButtonGlyph` 用于自定义 tint 的场合（导出页删除按钮：
+  平时 `kIconColorDim`、hover 变 `kError`）。
+- `IconButtonResult IconButton(str_id, size, AppIcon, disabled = false)`（**首选**）
+  同上，但自动居中绘制 lucide 图集 glyph（按钮边长的 7/16，32px 按钮 → 14px 图标），
+  着色 `kIconColor` / 禁用态 `kIconColorDim`。图集不可用时退化为纯命中区。
+  `Player::icon_button()` 是两个重载的同签名委托。
+- `void DrawIconButtonGlyph(result, AppIcon, tint)`：给无 glyph 版命中区补画图标，
+  居中与 7/16 比例与首选重载一致，仅 tint 由调用方决定。
+
+### 图标（ui/icons.*，lucide 图集）
+
+- 图标一律来自 **lucide**（ISC，`assets/icons/lucide/*.svg`，署名见该目录 README），
+  不再手绘。`scripts/gen_icon_atlas.py` 把 SVG 光栅化成白色 RGBA 图集
+  （`assets/generated/icons_atlas.rgba`），CMake 嵌入 pyd，`ui::icons::draw()` 以
+  tint 着色绘制——禁用/hover 变色都是 tint，SVG 永远保持白色。
+- 渲染质量三原则（别回退）：**不做 GPU mipmap**——2 的幂次 mip 网格几乎永远对不上
+  实际绘制尺寸（150% 时 27px 图标会混 1.78x 和 0.89x 两级），保证不了点对点也保证
+  不了 2 倍超采；改为**运行时按当前物理尺寸 CPU 面积加权重采样**（96px 矢量光栅源
+  → 精确目标尺寸，等价 ~13 源像素/目标像素的积分超采，每种尺寸一次并缓存纹理）；
+  **绘制坐标吸附到整数物理像素**，纹理与绘制矩形 1:1（150% 等分数缩放下居中矩形
+  会落在 .5 坐标上）。
+- 新增图标：往 `assets/icons/lucide/` 放 SVG → 在脚本的 `ICONS` 列表和
+  `ui::AppIcon` 枚举**同序**追加 → 重跑脚本 → 编译。
+- 当前枚举：Settings / OpenFile / OpenUrl / WebServer / Export / WinMinimize /
+  WinMaximize / WinRestore / Fullscreen / Close（顶栏 9 个 + modal 关闭 X 共用）+
+  Play / Pause / Volume / VolumeMute（底栏播放与静音，播放键图标随状态切换，
+  语义与顶栏一致：32px 按钮、7/16 glyph、2px 边距）+ Trash / FolderInput（导出页：
+  预设删除、队列项删除（X 复用 Close）、路径选择文件夹，按钮统一为行高方块，
+  删除类平时 `kIconColorDim`、hover `kError`，走 `DrawIconButtonGlyph`）。
 
 ### BeginCard / EndCard（卡片容器）
 
 ```cpp
-if (ui::BeginCard("##card_id")) {   // kPanelBg + 8px 圆角 + hairline 描边 + 12px 四边 padding
+if (ui::BeginCard("##card_id")) {   // kPanelBg + 8px 圆角 + 12px 四边 padding，无描边
     ui::SectionHeader("小节");
     // ...
 }
@@ -192,8 +241,8 @@ ui::EndCard();
 > 归零（见 imgui.cpp `Begin`：`ChildWindow && !AlwaysUseWindowPadding &&
 > WindowBorderSize == 0` → padding = 0），之前 push 的 padding 会被静默丢弃，内容
 > 直接贴到子窗口顶角。凡是为裸 `BeginChild` push 了非零 WindowPadding 的地方，必须
-> 传 `ImGuiChildFlags_AlwaysUseWindowPadding`（预设行卡、队列项卡即此模式）。
-> `BeginCard` 因带 `Borders` 不受影响；普通窗口/弹窗也不受影响。
+> 传 `ImGuiChildFlags_AlwaysUseWindowPadding`（预设行卡、队列项卡即此模式；`BeginCard`
+> 去描边后同样自带该 flag）。普通窗口/弹窗不受影响。
 
 ### BeginModal / EndModal（统一模态框 chrome）
 
@@ -234,7 +283,7 @@ Web 串流、预设管理器/编辑器。
     intent，Python `ExportQueue.move_to()`；落到某卡 = 插到它前面，落到底部拖放条 =
     移到队尾，拖动悬停的卡显示 accent 描边）。**已废弃上移/下移按钮。**
   - 第 1 栏：状态（小字次级色）/ 文件名（elide，hover 出全路径 tooltip）/ 导出路径
-    （小字次级色，"→ "前缀）；进行中卡片底部加 4px 细进度条。
+    （小字次级色，"→ "前缀）；进行中卡片底部加 6px 细进度条。
   - 第 2 栏：预设下拉 + 输出方式下拉（定宽 150px，堆叠）。
   - 第 3 栏：删除灰叉 icon（`kIconColorDim`，hover 变 `kError`），垂直居中。
     **已废弃每项的取消按钮。**
@@ -265,8 +314,10 @@ Web 串流、预设管理器/编辑器。
   （间距用 Dummy/间距刻度表达）。
 - **Don't**：不改行为——intents 记录、校验、字段读写、可见性条件保持原样；设计系统
   只负责"调用哪个函数、用哪个颜色"。
-- **例外（现存且合理）**：顶/底栏的手绘图标、seekbar/音量条、缩略图卡片是既定手绘
-  媒体观感，保留 ImDrawList 画法；音量条的静音斜杠等一次性色值维持原样。
+- **例外（现存且合理）**：seekbar/音量条、导出队列的六点拖拽 grip 是既定手绘媒体
+  观感，保留 ImDrawList 画法；颜色仍取主题常量。seekbar 悬停缩略图
+  卡片同样保留手绘，但底色 = `kPanelBg` @ 0.90、圆角 = `kRadiusControl`、内边距 =
+  `kSpaceS`，与其他卡片一样无描边。
 
 ## 布局验证
 

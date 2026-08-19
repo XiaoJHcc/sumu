@@ -14,6 +14,9 @@ namespace {
 
 constexpr ImVec4 white(float a) { return ImVec4(1.0f, 1.0f, 1.0f, a); }
 
+// Same hue, different alpha (button fill ramps etc.).
+constexpr ImVec4 with_alpha(ImVec4 c, float a) { c.w = a; return c; }
+
 // Runtime DPI scale proxy: the standard frame is 32px at 96 DPI (theme::kControlHeight ==
 // FramePadding (10,7) + 18px base font) and ScaleAllSizes/FontScaleDpi scale both terms
 // together, so the ratio recovers the monitor scale for self-drawn geometry (same role as
@@ -52,10 +55,12 @@ bool Button(const char* label, ButtonVariant v, ControlSize s, float width){
     }
     switch (v) {
     case ButtonVariant::Primary:
-        ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::kAccentHover);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::kAccentActive);
-        ImGui::PushStyleColor(ImGuiCol_Text, white(0.95f));
+        // Soft-blue chip: translucent accent fill + accent text, no border (buttons are
+        // borderless in this design; only floating windows keep a stroke).
+        ImGui::PushStyleColor(ImGuiCol_Button, with_alpha(theme::kAccent, 0.18f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, with_alpha(theme::kAccent, 0.26f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, with_alpha(theme::kAccent, 0.32f));
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
         pushed_cols = 4;
         break;
     case ButtonVariant::Danger:
@@ -67,7 +72,7 @@ bool Button(const char* label, ButtonVariant v, ControlSize s, float width){
         break;
     case ButtonVariant::Secondary:
     default:
-        // Neutral fill, one step under the FrameBg hover ramp; border stroked below.
+        // Neutral fill, one step under the FrameBg hover ramp; borderless.
         ImGui::PushStyleColor(ImGuiCol_Button, theme::kButtonBg);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, white(0.12f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, white(0.16f));
@@ -75,13 +80,6 @@ bool Button(const char* label, ButtonVariant v, ControlSize s, float width){
         break;
     }
     const bool clicked = ImGui::Button(label, ImVec2(width, 0.0f));
-    if (v == ButtonVariant::Secondary) {
-        // macOS secondary buttons carry a hairline stroke (FrameBorderSize stays 0 so
-        // other frame widgets don't inherit it).
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-            theme::border_u32(), ImGui::GetStyle().FrameRounding, 0, 1.0f);
-    }
     ImGui::PopStyleColor(pushed_cols);
     if (pushed_vars) ImGui::PopStyleVar(pushed_vars);
     return clicked;
@@ -294,11 +292,11 @@ bool Checkbox(const char* label, bool* v){
     const float by = p.y + (frame_h - box) * 0.5f;
     const float rounding = theme::kRadiusCheckbox * s;
     if (*v) {
-        // macOS: accent fill + white check
+        // Soft accent fill + dark check (the accent is too light for a white check now).
         dl->AddRectFilled(ImVec2(p.x, by), ImVec2(p.x + box, by + box),
             theme::to_u32(faded(hovered ? theme::kAccentHover : theme::kAccent)), rounding);
         const float cth = std::max(1.5f, box * 0.11f);
-        const ImU32 ck = IM_COL32(255, 255, 255, (int)(242.0f * style.Alpha));
+        const ImU32 ck = theme::to_u32(faded(theme::kWindowBg));
         const ImVec2 a(p.x + box * 0.24f, by + box * 0.54f);
         const ImVec2 b(p.x + box * 0.44f, by + box * 0.72f);
         const ImVec2 c(p.x + box * 0.77f, by + box * 0.30f);
@@ -506,7 +504,9 @@ bool BeginCard(const char* id, float height){
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, theme::kRadiusWindow * s);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
         ImVec2(theme::kPaddingContainer * s, theme::kPaddingContainer * s));
-    ImGuiChildFlags flags = ImGuiChildFlags_Borders;
+    // Borderless (cards separate by fill contrast alone), so AlwaysUseWindowPadding is
+    // MANDATORY -- ImGui zeroes a borderless child's padding otherwise.
+    ImGuiChildFlags flags = ImGuiChildFlags_AlwaysUseWindowPadding;
     if (height == 0.0f) flags |= ImGuiChildFlags_AutoResizeY;
     return ImGui::BeginChild(id, ImVec2(0.0f, height), flags);
 }
@@ -570,7 +570,7 @@ bool BeginModal(const char* title, bool* open, float content_w_base){
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f); // border self-drawn in EndModal
     ImGui::PushStyleColor(ImGuiCol_PopupBg, theme::kPanelBg);
-    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.50f));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, theme::kDimBg);
 
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
@@ -620,18 +620,10 @@ bool BeginModal(const char* title, bool* open, float content_w_base){
     }
 
     if (open) {
-        const float btn_w = 28.0f * s;
-        const float btn_h = bar_h - 4.0f * s;
-        ImGui::SetCursorPos(ImVec2(strip_w - btn_w - 4.0f * s, (bar_h - btn_h) * 0.5f));
-        IconButtonResult r = IconButton("##modal_close", ImVec2(btn_w, btn_h));
-        const float cx = (r.min.x + r.max.x) * 0.5f;
-        const float cy = (r.min.y + r.max.y) * 0.5f;
-        const float half = 5.0f * s;
-        const float icon_th = std::max(1.0f, 1.5f * s);
-        const bool hovered = ImGui::IsItemHovered();
-        const ImU32 icon_col = hovered ? theme::accent_hover_u32() : theme::text_u32();
-        r.dl->AddLine(ImVec2(cx - half, cy - half), ImVec2(cx + half, cy + half), icon_col, icon_th);
-        r.dl->AddLine(ImVec2(cx - half, cy + half), ImVec2(cx + half, cy - half), icon_col, icon_th);
+        const float btn_w = theme::kControlHeight * s; // icon button = control-height square
+        const float btn_h = bar_h - 2.0f * theme::kSpaceXS * s; // 36 - 2*2 = 32, centered
+        ImGui::SetCursorPos(ImVec2(strip_w - btn_w - theme::kSpaceXS * s, (bar_h - btn_h) * 0.5f));
+        IconButtonResult r = IconButton("##modal_close", ImVec2(btn_w, btn_h), AppIcon::Close);
         if (r.clicked) {
             *open = false;
             ImGui::CloseCurrentPopup();
@@ -677,6 +669,23 @@ IconButtonResult IconButton(const char* str_id, ImVec2 size, bool disabled){
     r.dl = ImGui::GetWindowDrawList();
     if (!disabled && ImGui::IsItemHovered())
         r.dl->AddRectFilled(r.min, r.max, theme::hover_fill_u32(), ImGui::GetStyle().FrameRounding);
+    return r;
+}
+
+void DrawIconButtonGlyph(const IconButtonResult& r, AppIcon icon, ImU32 tint){
+    if (!icons::available()) return; // bare hit area + hover wash (see header contract)
+    // Glyph at 7/16 of the button edge: 14px inside the standard 32px title-bar button.
+    // 7/16 keeps the physical size whole at 100%/150%/200% (14/21/28px); the atlas draw
+    // snaps to integer pixels, so non-integer multiples would shift the glyph off-grid.
+    const float g = std::floorf(std::min(r.max.x - r.min.x, r.max.y - r.min.y) * 0.4375f);
+    const ImVec2 gmin((r.min.x + r.max.x - g) * 0.5f, (r.min.y + r.max.y - g) * 0.5f);
+    icons::draw(r.dl, gmin, ImVec2(gmin.x + g, gmin.y + g), icon, tint);
+}
+
+IconButtonResult IconButton(const char* str_id, ImVec2 size, AppIcon icon, bool disabled){
+    IconButtonResult r = IconButton(str_id, size, disabled);
+    DrawIconButtonGlyph(r, icon,
+        disabled ? theme::icon_color_dim_u32() : theme::icon_color_u32());
     return r;
 }
 
