@@ -387,11 +387,15 @@ void Player::build_settings_panel(float top_bar_h){
     ImGuiIO& io = ImGui::GetIO();
     // Wider than the old 200px: rows are now [number box][slider track] compounds.
     const float panel_w = ui_s(260.0f);
-    ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
+    // Outer margin from the window edges == the panel's own inner padding
+    // (kPaddingContainer), same beat as the export screen's cards.
+    const float margin = ui_s(ui::theme::kPaddingContainer);
+    ImGui::SetNextWindowPos(ImVec2(margin, top_bar_h + margin));
     // Auto-height to content (AlwaysAutoResize) so the panel does not cover the bottom bar.
     // Cap max height so a tiny window still scrolls rather than overflowing the client.
-    // bottom bar height == title bar height (kTopBarHBase).
-    const float max_h = std::max(0.0f, io.DisplaySize.y - top_bar_h - ui_s(kTopBarHBase));
+    // bottom bar height == title bar height (kTopBarHBase); margins kept above it too.
+    const float max_h = std::max(0.0f,
+        io.DisplaySize.y - top_bar_h - 2.0f * margin - ui_s(kTopBarHBase));
     ImGui::SetNextWindowSizeConstraints(ImVec2(panel_w, 0.0f), ImVec2(panel_w, max_h));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
@@ -420,8 +424,8 @@ void Player::build_settings_panel(float top_bar_h){
         settings_edit_init_ = true;
     }
 
-    // Title: plain standard-font text (no divider rules anywhere in the new design).
-    ImGui::TextUnformatted(ui_str_.settings_title.c_str());
+    // (No panel title -- the rows start directly; the first LineLabel skips its top gap
+    // via ui::at_container_top() so the WindowPadding alone insets it.)
 
     // Tooltips at kFontSizeSm (SetTooltip has no font arg -- BeginTooltip + PushFont).
     auto settings_tooltip = [&](const char* text) {

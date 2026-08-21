@@ -731,7 +731,6 @@ private:
         std::string open_url_load_failed;
         std::string compile_retry;
         std::string compile_engine;
-        std::string settings_title;
         std::string lead_label;
         std::string lead_tooltip;
         std::string clip_length_label;

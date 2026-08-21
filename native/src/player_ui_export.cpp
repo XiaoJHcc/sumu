@@ -4,8 +4,8 @@
 // Export screen + export preset editor.
 //
 // Layout contract (docs/ui_design.md): the export screen is a two-column layout --
-// left column cards [设置] [预设] + a cardless full-width
-// [开始导出] action; the right column is one full-height [视频队列] card. Queue items
+// left column cards [设置] [预设]; the right column is one full-height [视频队列] card
+// whose pinned footer rows [添加文件] + [开始导出] side by side. Queue items
 // are cards themselves: col1 = status/filename/output path, col2 = preset + output-mode
 // combos, col3 = a gray delete X (red on hover). Reordering is manual gap-based drag:
 // hold the card's left strip and the list opens an empty slot under the cursor; release
@@ -400,17 +400,19 @@ void Player::build_export_screen(float top_bar_h){
         // scrolls (only this card's preset list does).
         const float presets_h = std::max(ui_s(120.0f),
             floorf(ImGui::GetContentRegionAvail().y) - 1.0f);
-        if (ui::BeginCard("##export_card_presets", presets_h)) {
+        if (ui::BeginCard("##export_card_presets", presets_h, ImGuiWindowFlags_NoScrollbar)) {
             ui::SectionHeader(ui_str_.export_presets_title.empty()
                 ? "Presets" : ui_str_.export_presets_title.c_str());
             // Scrolling list above a pinned full-width "new preset" button. The list
-            // height is exactly what remains below it minus the button row and the one
-            // ItemSpacing between them (-1px guards fractional-DPI rounding from
-            // spilling into a card-level scrollbar).
+            // height is exactly what remains below it minus the button row and the standard
+            // gap between them. That gap is kPaddingContainer (the card's inner padding
+            // width -- the same as the edge insets and the button's bottom inset), not the
+            // smaller ItemSpacing. floorf rounds the freed height down so fractional-DPI
+            // math can never spill the footer past the card edge.
             const float btn_h = ImGui::GetFrameHeight();
+            const float gap_to_btn = ui_s(ui::theme::kPaddingContainer);
             const float list_h = std::max(ImGui::GetFrameHeight(),
-                floorf(ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y
-                    - btn_h) - 1.0f);
+                floorf(ImGui::GetContentRegionAvail().y - gap_to_btn - btn_h));
             // Scroll region: kWindowBg (#1E1E20 -- the app's base-background standard,
             // same as the scrollbar track) with a kSpaceM inner inset. The scrollbar hugs
             // the container's right edge; the right padding keeps the gap between it and
@@ -435,9 +437,20 @@ void Player::build_export_screen(float top_bar_h){
             ImGui::EndChild();
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor();
+            // Gap above the pinned button == kPaddingContainer. The list child's
+            // ItemSpacing.y was zeroed above (for the Dummy-only inter-card gap), so its
+            // EndChild leaves NO ItemSpacing beat behind it -- the Dummy below carries the
+            // ENTIRE gap, not a residual on top of a beat (the old `- sp_y` under-counted,
+            // floating the button up and opening a wide bottom margin). Zero ItemSpacing
+            // for this row: the button's own trailing spacing would otherwise push the
+            // content past the card, even with NoScrollbar.
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+            ImGui::Dummy(ImVec2(0.0f, gap_to_btn));
             if (ui::Button(ui_str_.export_preset_new.c_str(), ui::ButtonVariant::Secondary,
                     ui::ControlSize::Regular, -1.0f))
                 open_export_preset_editor(-2);
+            ImGui::PopStyleVar();
         }
         ui::EndCard();
     }
@@ -445,30 +458,36 @@ void Player::build_export_screen(float top_bar_h){
     ImGui::PopStyleVar(); // WindowPadding(0,0)
     ImGui::SameLine(0.0f, col_gap);
 
-    // ============== right column: 视频队列 card + 开始导出 button below it ==============
+    // ============== right column: 视频队列 card (开始导出 lives in its footer now) ==============
     // Own BeginChild, symmetric with the left column: after a child ends, ImGui returns
-    // the cursor X to the LINE start (not the child's X), so laying the button out in
-    // the parent window would teleport it back under the left column. Inside this child
-    // the cursor math stays local and the button fills the column width.
-    // The queue card leaves room for the button row: real gap is spacing + filler +
-    // spacing (same card_gap bookkeeping as the left column).
+    // the cursor X to the LINE start (not the child's X), so laying a button out in the
+    // parent window would teleport it back under the left column. Inside this child the
+    // cursor math stays local.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##export_right", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
-    const float start_btn_h = ImGui::GetFrameHeight();
-    const float not_ready_h = export_engine_ready_ ? 0.0f
-        : (ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y);
+    // The queue card fills the whole column height; its pinned footer carries the
+    // 开始导出 button next to 添加文件 (no cardless action below the card anymore).
     const float queue_h = std::max(ui_s(120.0f),
-        floorf(ImGui::GetContentRegionAvail().y - ui_s(ui::theme::kSpaceL) - start_btn_h - not_ready_h) - 1.0f);
-    if (ui::BeginCard("##export_card_queue", queue_h)) {
-        // Header row: section title left (vertically centered on the button-height row),
-        // "add files" button pinned to the right edge.
-        const float row_w = ImGui::GetContentRegionAvail().x;
-        const float add_w = ui_s(96.0f);
-        ui::InlineLabel(ui_str_.export_section_queue.c_str(),
-            std::max(0.0f, row_w - add_w - ImGui::GetStyle().ItemInnerSpacing.x));
-        if (ui::Button(ui_str_.export_add_files.empty() ? "Add files" : ui_str_.export_add_files.c_str(),
-                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, add_w))
-            ui_intents_.export_add_files = true;
+        floorf(ImGui::GetContentRegionAvail().y) - 1.0f);
+    if (ui::BeginCard("##export_card_queue", queue_h, ImGuiWindowFlags_NoScrollbar)) {
+        ui::SectionHeader(ui_str_.export_section_queue.c_str());
+        // Queue scrolls above a pinned footer row ([添加文件] + [开始导出]) at the card
+        // bottom -- the same two-beat arrangement as the preset card's "新建预设": gap
+        // above the buttons = kPaddingContainer, bottom inset = the card's own padding.
+        const float btn_h = ImGui::GetFrameHeight();
+        const float gap_to_btn = ui_s(ui::theme::kPaddingContainer);
+        const float list_h = std::max(ImGui::GetFrameHeight(),
+            floorf(ImGui::GetContentRegionAvail().y - gap_to_btn - btn_h) - 1.0f);
+        // Scroll region mirrors the preset list: kWindowBg + kSpaceM inset + slim
+        // scrollbar, so both columns read as the same "list panel + pinned action" card.
+        // ItemSpacing.y stays at the global value here -- the queue item cards read it for
+        // their own line layout, so do NOT zero it (the inter-card gap is instead nudge-
+        // positioned in block_gap() below).
+        const float list_pad = ui_s(ui::theme::kSpaceM);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::kWindowBg);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusWindow));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(list_pad, list_pad));
+        ImGui::BeginChild("##queue_list", ImVec2(0.0f, list_h), ImGuiChildFlags_AlwaysUseWindowPadding);
 
         if (export_items_.empty()) {
             ImGui::Dummy(ImVec2(0.0f, ui_s(4.0f)));
@@ -501,7 +520,7 @@ void Player::build_export_screen(float top_bar_h){
         }
         if (export_drag_id_ >= 0) {
             const float s1 = ui_s(1.0f);
-            const float pitch_gap = card_gap + 2.0f * ImGui::GetStyle().ItemSpacing.y;
+            const float pitch_gap = list_pad; // inter-card gap == kSpaceM (block_gap()'s cursor nudge)
             const float drag_card_h = export_item_card_h(*dragged, s1);
             if (export_drag_slot_ < 0) {
                 // initial slot = the dragged card's own index (gap opens where it was)
@@ -563,7 +582,15 @@ void Player::build_export_screen(float top_bar_h){
         int rendered = 0;
         bool first_block = true;
         auto block_gap = [&](){
-            if (!first_block) ImGui::Dummy(ImVec2(0.0f, card_gap));
+            if (!first_block) {
+                // Inter-card gap == kSpaceM (8px). The previous card's EndChild already
+                // advanced the cursor by one ItemSpacing.y beat (6px); nudge it the rest of
+                // the way to 8px. Do this via the cursor rather than a Dummy so we neither
+                // zero ItemSpacing.y for the list (the item cards read it for their own
+                // line layout) nor double-count the beat around a Dummy.
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY()
+                    - ImGui::GetStyle().ItemSpacing.y + list_pad);
+            }
             first_block = false;
         };
         auto render_slot = [&](){
@@ -583,24 +610,38 @@ void Player::build_export_screen(float top_bar_h){
         }
         // slot past the last card = drop at the queue end (replaces the old trailing strip)
         if (export_drag_id_ >= 0 && rendered == export_drag_slot_) render_slot();
-    }
-    ui::EndCard();
-    ImGui::Dummy(ImVec2(0.0f, card_gap));
-
-    // ---- cardless action: 开始导出 (full queue-column width, under the queue card) ----
-    {
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+        // Gap above the pinned footer row == kPaddingContainer. The list child's EndChild
+        // already leaves one ItemSpacing beat (ItemSpacing.y stays global here), so the
+        // residual Dummy + that beat = the padding width. Zero ItemSpacing for this row:
+        // the buttons' own trailing spacing would otherwise push the content past the card,
+        // even with NoScrollbar. Capturing ItemSpacing.y before the push keeps the Dummy's
+        // math against the real global spacing.
+        const float sp_y = ImGui::GetStyle().ItemSpacing.y;
+        const float gap_above_btn = gap_to_btn - sp_y;
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+            ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+        ImGui::Dummy(ImVec2(0.0f, std::max(0.0f, gap_above_btn)));
+        // Footer row: [添加文件] + [开始导出] side by side, splitting the column width.
+        // The inter-button gap reads the global kPaddingContainer margin (12px) -- the
+        // same value as the card's four-sided inset and the preset card's pinned 新建预设
+        // button margins, so the whole footer sits on one unified rhythm. 开始导出 stays
+        // disabled while the engine is still warming up.
+        const float gap = ui_s(ui::theme::kPaddingContainer);
+        const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+        if (ui::Button(ui_str_.export_add_files.empty() ? "Add files" : ui_str_.export_add_files.c_str(),
+                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, half))
+            ui_intents_.export_add_files = true;
+        ImGui::SameLine(0.0f, gap);
         if (!export_engine_ready_) ImGui::BeginDisabled();
-        if (ui::Button(t_start, ui::ButtonVariant::Primary, ui::ControlSize::Regular, -1.0f))
+        if (ui::Button(t_start, ui::ButtonVariant::Primary, ui::ControlSize::Regular, half))
             ui_intents_.export_start = true;
         if (!export_engine_ready_) ImGui::EndDisabled();
-        if (!export_engine_ready_) {
-            ImGui::PushFont(nullptr, kFontSizeSm);
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
-            ImGui::TextUnformatted(ui_str_.export_not_ready.c_str());
-            ImGui::PopStyleColor();
-            ImGui::PopFont();
-        }
+        ImGui::PopStyleVar();
     }
+    ui::EndCard();
     ImGui::EndChild();
     ImGui::PopStyleVar(); // WindowPadding(0,0)
 

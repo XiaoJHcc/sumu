@@ -12,7 +12,6 @@
   "open_url_load_failed": "无法打开该地址",
   "compile_retry": "重试",
   "compile_engine": "编译加速引擎",
-  "settings_title": "设置",
   "lead_label": "缓冲窗口（帧）",
   "lead_tooltip": "AI 相对播放头的超前缓冲（帧数），简单段囤去码帧给难段消费。",
   "clip_length_label": "处理片段长度（帧）",

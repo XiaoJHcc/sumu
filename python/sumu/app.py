@@ -222,8 +222,8 @@ def main():
     ap.add_argument("video", nargs="?", default=None)
     # Initial windowed size for the open-prompt window (before any video is opened). Once a
     # video opens, the native side auto-sizes the window to the video (resize_window_for_video()).
-    ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--width", type=int, default=1080)
+    ap.add_argument("--height", type=int, default=640)
     # Default to windowed. `--maximized` still forces a maximized start. (This previously
     # defaulted to True, so store_true made the window ALWAYS start maximized -- the flag was a
     # no-op and there was no way to get a windowed start.)

@@ -119,8 +119,11 @@ void SectionHeader(const char* text){
 
 void LineLabel(const char* text){
     const float s = ui_scale();
-    // Wide gap above (12px), narrow below (the plain ItemSpacing.y).
-    const float gap_top = theme::kSpaceL * s - ImGui::GetStyle().ItemSpacing.y;
+    // Gap above the previous row's control == the container's inner padding
+    // (kPaddingContainer), so a label sits exactly one padding beat below the last input --
+    // the same distance the card edge keeps from the controls. The spacer Dummy attracts
+    // ItemSpacing.y on BOTH sides, so the dummy itself is the remainder after two spacings.
+    const float gap_top = theme::kPaddingContainer * s - 2.0f * ImGui::GetStyle().ItemSpacing.y;
     if (!at_container_top())
         ImGui::Dummy(ImVec2(0.0f, std::max(0.0f, gap_top)));
     ImGui::PushFont(nullptr, theme::kFontSizeSm);
@@ -510,7 +513,7 @@ bool SliderFloat(const char* label, float* v, float mn, float mx,
 
 // ---- containers --------------------------------------------------------------------------------
 
-bool BeginCard(const char* id, float height){
+bool BeginCard(const char* id, float height, ImGuiWindowFlags flags){
     const float s = ui_scale();
     ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::kPanelBg);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, theme::kRadiusWindow * s);
@@ -518,9 +521,9 @@ bool BeginCard(const char* id, float height){
         ImVec2(theme::kPaddingContainer * s, theme::kPaddingContainer * s));
     // Borderless (cards separate by fill contrast alone), so AlwaysUseWindowPadding is
     // MANDATORY -- ImGui zeroes a borderless child's padding otherwise.
-    ImGuiChildFlags flags = ImGuiChildFlags_AlwaysUseWindowPadding;
-    if (height == 0.0f) flags |= ImGuiChildFlags_AutoResizeY;
-    return ImGui::BeginChild(id, ImVec2(0.0f, height), flags);
+    ImGuiChildFlags child_flags = ImGuiChildFlags_AlwaysUseWindowPadding;
+    if (height == 0.0f) child_flags |= ImGuiChildFlags_AutoResizeY;
+    return ImGui::BeginChild(id, ImVec2(0.0f, height), child_flags, flags);
 }
 
 void EndCard(){

@@ -12,7 +12,6 @@
   "open_url_load_failed": "Could not open this URL",
   "compile_retry": "Retry",
   "compile_engine": "Compile acceleration engines",
-  "settings_title": "Settings",
   "lead_label": "Buffer window (frames)",
   "lead_tooltip": "How far ahead of the playhead AI stocks restored frames for hard segments.",
   "clip_length_label": "Clip length (frames)",

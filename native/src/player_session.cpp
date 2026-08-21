@@ -1050,7 +1050,6 @@ void Player::set_ui_strings(const py::dict& d){
     take("open_url_load_failed", ui_str_.open_url_load_failed);
     take("compile_retry", ui_str_.compile_retry);
     take("compile_engine", ui_str_.compile_engine);
-    take("settings_title", ui_str_.settings_title);
     take("lead_label", ui_str_.lead_label);
     take("lead_tooltip", ui_str_.lead_tooltip);
     take("clip_length_label", ui_str_.clip_length_label);

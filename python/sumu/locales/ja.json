@@ -12,7 +12,6 @@
   "open_url_load_failed": "この URL を開けませんでした",
   "compile_retry": "再試行",
   "compile_engine": "加速エンジンをコンパイル",
-  "settings_title": "設定",
   "lead_label": "バッファ窓（フレーム）",
   "lead_tooltip": "再生位置より先に AI が復元フレームを蓄える量。簡単な区間で貯め、難しい区間で消費する。",
   "clip_length_label": "処理クリップ長（フレーム）",

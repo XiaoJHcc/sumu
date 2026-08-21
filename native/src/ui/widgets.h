@@ -115,8 +115,10 @@ void UnitText(const char* text);
 
 // Card: panel-bg rounded child with kPaddingContainer padding on all sides. Borderless:
 // cards separate from the window by fill contrast alone. height == 0 auto-fits the
-// content. Pair every BeginCard with EndCard.
-bool BeginCard(const char* id, float height = 0.0f);
+// content. Optional extra window flags, e.g. ImGuiWindowFlags_NoScrollbar for a fixed
+// card whose inner list panel scrolls (a fully-filled fixed card otherwise paints a
+// phantom card-level scrollbar). Pair every BeginCard with EndCard.
+bool BeginCard(const char* id, float height = 0.0f, ImGuiWindowFlags flags = 0);
 void EndCard();
 
 // ---- feedback --------------------------------------------------------------------------------------

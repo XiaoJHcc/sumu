@@ -298,8 +298,13 @@ Web 串流、预设编辑器。
      距 = 单个 `kSpaceM`（列表内 `ItemSpacing.y` 归零，由 Dummy 单算，避免 Dummy 两侧
      各叠一次 ItemSpacing 的双重间距）。底部固定全宽"新建预设"按钮。
      **管理不再是弹窗**；只有预设编辑器仍是 `BeginModal`（内容宽 480）。
-  4. 无卡：**[开始导出]** Primary 全列宽，引擎未就绪时灰显并附小字说明。
-- **右列**：**视频队列**整列高卡片。标题 + 右侧"添加文件"共行；每个队列项一张卡：
+  - **右列**：**视频队列**整列高卡片。标题（SectionHeader）+ 滚动队列表格（`kWindowBg` +
+  `kSpaceM` 内边距 + 细滚动条，卡片间距 = `kSpaceM` 8px，由 `block_gap` 对光标做
+  nudge（`ItemSpacing.y` 保持全局值，队列项卡内部行距依赖它，不得归零）；镜像预设列表
+  版面）+ 底部固定一行两按钮：**添加文件**
+  Secondary 与 **[开始导出]** Primary 各占半列宽，按钮间距 = `kPaddingContainer` 12px
+  （同卡片四边、新建预设按钮上下边距，全局统一节奏；引擎未就绪时灰显）——不再占用
+  标题行，避免撑高标题行破坏边距。每个队列项一张卡：
   - 第 0 栏：拖拽 grip（六点 icon）——拖拽排序（`export_move_id` + `export_move_to`
     intent，Python `ExportQueue.move_to()`；落到某卡 = 插到它前面，落到底部拖放条 =
     移到队尾，拖动悬停的卡显示 accent 描边）。**已废弃上移/下移按钮。**
