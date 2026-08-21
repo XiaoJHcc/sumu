@@ -4,7 +4,7 @@
 // Export screen + export preset editor.
 //
 // Layout contract (docs/ui_design.md): the export screen is a two-column layout --
-// left column cards [AI 管线设置] [导出路径] [导出预设] + a cardless full-width
+// left column cards [设置] [预设] + a cardless full-width
 // [开始导出] action; the right column is one full-height [视频队列] card. Queue items
 // are cards themselves: col1 = status/filename/output path, col2 = preset + output-mode
 // combos, col3 = a gray delete X (red on hover). Reordering is manual gap-based drag:
@@ -76,17 +76,19 @@ int Player::export_quality_idx_of(const std::string& preset){
     return 6;
 }
 
-// One preset row card (shared by the 导出预设 card's scrolling list): default checkbox,
+// One preset row card (shared by the 预设 card's scrolling list): default checkbox,
 // click-to-edit name + summary, trash icon at the right edge.
 void Player::build_export_preset_card(int i, float width){
     const auto& p = export_presets_[i];
     ImGui::PushID(i);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::kRowCardBg);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusControl));
-    // Compact uniform inset: the row is a list entry, not a form card.
-    const float pad = ui_s(ui::theme::kSpaceM);
+    // Row height is the single-row container standard (kTopBarHBase, shared with the
+    // title bar); pad is what remains around the 32px frame controls, giving the trash
+    // button equal top/right/bottom margins (title-bar's uniform kSpaceXS beat).
+    const float row_h = ui_s(kTopBarHBase);
+    const float pad = std::max(0.0f, (row_h - ImGui::GetFrameHeight()) * 0.5f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
-    const float row_h = ImGui::GetFrameHeight() + 2.0f * pad;
     // NoScrollbar: the row fits exactly; rounding overflow must clip, never scroll.
     // AlwaysUseWindowPadding is MANDATORY: ImGui zeroes a borderless child window's
     // padding otherwise (imgui.cpp Begin), silently discarding the push above.
@@ -95,8 +97,16 @@ void Player::build_export_preset_card(int i, float width){
 
     const float gap = ImGui::GetStyle().ItemSpacing.x;
 
+    // The checkbox's VISIBLE box is 16px, not the 32px frame the trash button uses:
+    // its equal-margin inset is (row_h - box)/2 = 10px. Vertically that already falls
+    // out of the box being centered in its frame-height item; horizontally the cursor
+    // must move past the window pad, and the right gap takes the same inset.
+    const float cb_inset = std::max(0.0f,
+        (row_h - ui::theme::kCheckboxSize * ui_s(1.0f)) * 0.5f);
+
     // Default marker: exactly one preset is the queue default. Checkbox is the standard
     // control; clicking the already-default card's box is a no-op.
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + cb_inset - pad);
     bool is_def = (export_default_preset_idx_ == i);
     if (ui::Checkbox("##def", &is_def) && is_def) {
         export_default_preset_idx_ = i;
@@ -104,11 +114,11 @@ void Player::build_export_preset_card(int i, float width){
     }
     if (ImGui::IsItemHovered() && !ui_str_.export_preset_default.empty())
         ImGui::SetTooltip("%s", ui_str_.export_preset_default.c_str());
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, cb_inset); // checkbox right margin == its other three margins
 
     // Name + summary text column, plain drawing: the WHOLE card is the click-to-edit
     // target (see below), so there is no inner hover rect for the text to sit in.
-    const float icon_sz = ImGui::GetFrameHeight(); // full-row-height square delete
+    const float icon_sz = ImGui::GetFrameHeight(); // delete size unchanged: 32px square
     const float text_w = std::max(ui_s(40.0f),
         ImGui::GetContentRegionAvail().x - icon_sz - gap);
     ImGui::Dummy(ImVec2(text_w, ImGui::GetFrameHeight())); // reserve the column, advance the line
@@ -136,7 +146,7 @@ void Player::build_export_preset_card(int i, float width){
         dl->PopClipRect();
     }
 
-    // Trash: full-row-height square at the right edge; glyph turns red on hover.
+    // Trash: square at the right edge (inset pad on top/right/bottom); glyph red on hover.
     ImGui::SameLine(0.0f, gap);
     ui::IconButtonResult dr = ui::IconButton("##del", ImVec2(icon_sz, icon_sz));
     ui::DrawIconButtonGlyph(dr, ui::AppIcon::Trash, ImGui::IsItemHovered()
@@ -344,13 +354,13 @@ void Player::build_export_screen(float top_bar_h){
     const float left_w = ui_s(320.0f);
     const float col_gap = ui_s(ui::theme::kSpaceL);
 
-    // ================= left column: AI 管线设置 / 导出路径 / 导出预设 ==================
+    // ================= left column: 设置 / 预设 ==================
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##export_left", ImVec2(left_w, 0.0f), ImGuiChildFlags_None);
     {
-        // ---- card: AI 管线设置 ----
-        if (ui::BeginCard("##export_card_ai")) {
-            ui::SectionHeader(ui_str_.export_section_ai.c_str());
+        // ---- card: 设置 (AI pipeline + export path merged; small LineLabels only) ----
+        if (ui::BeginCard("##export_card_settings")) {
+            ui::SectionHeader(ui_str_.export_section_settings.c_str());
             ui::LineLabel(ui_str_.export_clip_length_label.c_str());
             if (!export_clip_edit_init_) {
                 export_clip_length_edit_ = export_clip_length_;
@@ -360,15 +370,9 @@ void Player::build_export_screen(float top_bar_h){
             ui::SliderInt("##export_clip_length", &export_clip_length_edit_, 30, 180, 0.0f, &committed);
             if (committed && export_clip_length_edit_ != export_clip_length_)
                 ui_intents_.export_clip_length = export_clip_length_edit_;
-        }
-        ui::EndCard();
-        ImGui::Dummy(ImVec2(0.0f, card_gap));
 
-        // ---- card: 导出路径 ----
-        if (ui::BeginCard("##export_card_path")) {
-            ui::SectionHeader(ui_str_.export_section_path.c_str());
-            // Row: 全局输出目录 inline label + read-only path input + folder icon button.
-            ui::InlineLabel(ui_str_.export_global_dir_label.c_str());
+            // Row: read-only path input + folder icon button (label is the LineLabel above).
+            ui::LineLabel(ui_str_.export_global_dir_label.c_str());
             const float icon_sz = ImGui::GetFrameHeight();
             const float gap = ImGui::GetStyle().ItemSpacing.x;
             const float input_w = std::max(ui_s(40.0f),
@@ -381,7 +385,9 @@ void Player::build_export_screen(float top_bar_h){
                 export_global_dir_.empty() ? 1 : export_global_dir_.size() + 1,
                 "-", input_w, ImGuiInputTextFlags_ReadOnly);
             ImGui::SameLine();
-            ui::IconButtonResult r = ui::IconButton("##export_pick_dir",
+            // Framed icon button: form-row pickers carry the standard button fill ramp,
+            // not the bare hover wash (design standard, see ui::IconButtonFramed).
+            ui::IconButtonResult r = ui::IconButtonFramed("##export_pick_dir",
                 ImVec2(icon_sz, icon_sz), ui::AppIcon::FolderInput);
             if (r.clicked)
                 ui_intents_.export_pick_global = true;
@@ -389,7 +395,7 @@ void Player::build_export_screen(float top_bar_h){
         ui::EndCard();
         ImGui::Dummy(ImVec2(0.0f, card_gap));
 
-        // ---- card: 导出预设 (manager as a first-class card; editor stays a modal) ----
+        // ---- card: 预设 (manager as a first-class card; editor stays a modal) ----
         // Height = whatever the column has left, so the left column itself never
         // scrolls (only this card's preset list does).
         const float presets_h = std::max(ui_s(120.0f),
@@ -405,15 +411,30 @@ void Player::build_export_screen(float top_bar_h){
             const float list_h = std::max(ImGui::GetFrameHeight(),
                 floorf(ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y
                     - btn_h) - 1.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-            ImGui::BeginChild("##preset_list", ImVec2(0.0f, list_h), ImGuiChildFlags_None);
+            // Scroll region: kWindowBg (#1E1E20 -- the app's base-background standard,
+            // same as the scrollbar track) with a kSpaceM inner inset. The scrollbar hugs
+            // the container's right edge; the right padding keeps the gap between it and
+            // the cards, so a card's visible margin is equal on all four sides.
+            // AlwaysUseWindowPadding keeps ImGui from zeroing this borderless child's
+            // padding (same Begin() caveat as the row cards).
+            // ItemSpacing.y is zeroed inside the list so the inter-card gap is the Dummy
+            // alone (one kSpaceM, same as the edge inset) -- otherwise ItemSpacing would
+            // apply on BOTH sides of the Dummy and double-count the gap.
+            const float list_pad = ui_s(ui::theme::kSpaceM);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::kWindowBg);
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_s(ui::theme::kRadiusWindow));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(list_pad, list_pad));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+            ImGui::BeginChild("##preset_list", ImVec2(0.0f, list_h), ImGuiChildFlags_AlwaysUseWindowPadding);
             const float list_w = ImGui::GetContentRegionAvail().x;
             for (int i = 0; i < (int)export_presets_.size(); ++i) {
-                if (i > 0) ImGui::Dummy(ImVec2(0.0f, ui_s(2.0f)));
+                if (i > 0) ImGui::Dummy(ImVec2(0.0f, list_pad));
                 build_export_preset_card(i, list_w);
             }
             ImGui::EndChild();
-            ImGui::PopStyleVar();
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor();
             if (ui::Button(ui_str_.export_preset_new.c_str(), ui::ButtonVariant::Secondary,
                     ui::ControlSize::Regular, -1.0f))
                 open_export_preset_editor(-2);

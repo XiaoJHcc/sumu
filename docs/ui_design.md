@@ -85,10 +85,16 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 
 ### 图标按钮（标准规格）
 
-- **全 App 一种图标按钮：`kControlHeight`（32px @ 96 DPI）方块 + 7/16 glyph（14px）
-  + hover 浅底**。顶栏、底栏、modal 关闭、导出页删除/文件夹按钮全部遵守；
+- **全 App 一种图标按钮：`kControlHeight`（32px @ 96 DPI）方块 + 7/16 glyph（14px）**。
+  顶栏、底栏、modal 关闭、导出页删除/文件夹按钮全部遵守；
   chrome 代码写 `ui_s(kControlHeight)`（顶栏 btn_h 从 36px 栏高减 2×`kSpaceXS` 推出，
   同为 32），行内场景用 `GetFrameHeight()`（同值，且与所在行对齐）。
+- 底色两种场合：**chrome/列表行内**用裸命中区 + hover 浅底（`kHoverFill`）；
+  **表单行内**（与输入框等带框控件同行，如路径选择按钮）用 `ui::IconButtonFramed`，
+  底色 = Secondary 按钮梯度（`kButtonBg` / hover 白 12% / active 白 16%）。
+- **破坏性操作（关闭/删除）hover 变红**：glyph hover 时翻 `kError`——预设删除、队列
+  移除、主窗口关闭、modal 关闭 X 全部遵守（平时 chrome 用 `kIconColor`，列表行内删除
+  用 `kIconColorDim`）。
 - 新图标按钮不允许自定义尺寸；确需例外时先在这里登记理由。
 
 ### 单行控件（输入框 / 下拉 / 按钮共用）
@@ -133,13 +139,18 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
   DPI 因子。
 - **布局定宽走 `Player::ui_s()`**（96 DPI 基准 × 缩放），经由各控件尾部的 `width`
   参数传入（`0` = 填满剩余内容宽 / 保持调用方的 item width）。
-- widgets 层内部需要固定像素度量时用 `ui_scale() = GetFrameHeight() / 32` 作代理。
+- widgets 层内部需要固定像素度量时用 `ui_scale()` —— 它返回的是
+  `Player::apply_ui_dpi()` 通过 `ui::set_ui_scale()` 推入的**权威显示器缩放**。
+  **禁止**再从 `GetFrameHeight() / 32` 之类的光栅化字体度量反推：字体光栅化会把
+  27px 请求对齐成 26px，代理值（≈1.469）与真实缩放（1.5）混用会使"窗口宽用代理、
+  内容宽用真值"的算式相差十几像素，控件直接贴到窗口右缘（模态框右边距屡修屡错的
+  根因）。
 
 ## 标签三分法
 
 | 种类 | 控件 | 字号 | 用法 |
 |---|---|---|---|
-| 小节标题 | `ui::SectionHeader(text)` | 标准 18，`kText` | 卡片/面板内的小节名（如"设置"、AI 管线设置）。上间距 12、下间距 8，**无分割线**。 |
+| 小节标题 | `ui::SectionHeader(text)` | 标准 18，`kText` | 卡片/面板内的小节名（如"设置"、"预设"）。上间距 12、下间距 8，**无分割线**。 |
 | 行前 label | `ui::LineLabel(text)` | 小型 16 | 较长 label，独占一行位于控件上方（缓冲窗口（帧）、粘贴 https 直链）。**上间距宽（12）、下间距窄**。 |
 | 行内 label | `ui::InlineLabel(text, width = 0)` | 标准 18 | 短 label，与控件同行（名称、编码格式）。`width > 0` 时占固定列宽（文字垂直居中、裁切），用于多行对齐。**以 SameLine 收尾**（职责是引出后续控件）。 |
 | 单位文本 | `ui::UnitText(text)` | 标准 18，次级色 | 行尾的单位（kbps 等），垂直居中，**不拖 SameLine**——行终结符。 |
@@ -200,6 +211,9 @@ enum class ControlSize { Regular, Small };
   同上，但自动居中绘制 lucide 图集 glyph（按钮边长的 7/16，32px 按钮 → 14px 图标），
   着色 `kIconColor` / 禁用态 `kIconColorDim`。图集不可用时退化为纯命中区。
   `Player::icon_button()` 是两个重载的同签名委托。
+- `IconButtonResult IconButtonFramed(str_id, size, AppIcon, disabled = false)`
+  带底 variant：Secondary 按钮梯度底色（`kButtonBg`/hover 白 12%/active 白 16%），
+  用于表单行内的图标按钮（导出路径、web 串流根目录的文件夹选择按钮）。
 - `void DrawIconButtonGlyph(result, AppIcon, tint)`：给无 glyph 版命中区补画图标，
   居中与 7/16 比例与首选重载一致，仅 tint 由调用方决定。
 
@@ -261,7 +275,7 @@ if (ui::BeginModal(title.c_str(), &open)) {   // 默认内容宽 kModalContentW 
 
 Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表单错误标志时在
 `BeginModal` 返回后检查 `!open`）。已有用例：open-URL（含 chromeless 加载卡片特例）、
-Web 串流、预设管理器/编辑器。
+Web 串流、预设编辑器。
 
 ## 页面布局约定
 
@@ -269,14 +283,21 @@ Web 串流、预设管理器/编辑器。
 
 左右分栏（左列定宽 320px，右列填满剩余宽；两列各自滚动，外窗不滚动）：
 
-- **左列**，三张卡片 + 无卡操作区：
-  1. **AI 管线设置** —— SectionHeader + LineLabel + SliderInt（片段长度）。
-  2. **导出路径** —— 行内 label"全局输出目录" + 只读输入框（空时 hint "-"）+ 文件夹
-     图标按钮同行。
-  3. **导出预设**（一级卡片，高度 = 左列剩余空间，使左列整体永不滚动）—— 预设列表为
+- **左列**，两张卡片 + 无卡操作区：
+  1. **设置**（AI 管线 + 导出路径合并）—— SectionHeader"设置" + 两行小字 LineLabel
+     （"去码模型处理片段长度（帧）"、"全局默认导出路径"）：片段长度 SliderInt；只读
+     输入框（空时 hint "-"）+ 文件夹图标按钮同行。
+  2. **预设**（一级卡片，高度 = 左列剩余空间，使左列整体永不滚动）—— 预设列表为
      卡片行（卡内：默认勾选框 / 名称+摘要点击进编辑 / 末尾垃圾桶 icon，全部以整行高
-     为命中区垂直居中），列表区滚动，底部固定全宽"新建预设"按钮。**管理不再是弹窗**；
-     只有预设编辑器仍是 `BeginModal`（内容宽 480）。
+     为命中区垂直居中），行高 = 单行容器标准 36px（`kTopBarHBase`，与标题栏统一）。
+     边距按各自可视尺寸定：垃圾桶按钮（32px）上右下 = (36-32)/2 = 2px 均等；勾选框
+     可视盒子 16px，上左下右 = (36-16)/2 = 10px 均等。滚动区容器底色 = 底层背景标准
+     `kWindowBg`（#1E1E20，滚动条轨道同值），内边距 `kSpaceM`（8px）四边均等——
+     滚动条贴容器右边（`ScrollbarPadding=0`，滑块不再内缩，否则右边距会多读一个
+     内缩量；`ScrollbarSize=8` 细滚动条），右 padding 留出它与卡片间的间距。卡片间
+     距 = 单个 `kSpaceM`（列表内 `ItemSpacing.y` 归零，由 Dummy 单算，避免 Dummy 两侧
+     各叠一次 ItemSpacing 的双重间距）。底部固定全宽"新建预设"按钮。
+     **管理不再是弹窗**；只有预设编辑器仍是 `BeginModal`（内容宽 480）。
   4. 无卡：**[开始导出]** Primary 全列宽，引擎未就绪时灰显并附小字说明。
 - **右列**：**视频队列**整列高卡片。标题 + 右侧"添加文件"共行；每个队列项一张卡：
   - 第 0 栏：拖拽 grip（六点 icon）——拖拽排序（`export_move_id` + `export_move_to`

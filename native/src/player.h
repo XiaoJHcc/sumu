@@ -764,9 +764,8 @@ private:
         std::string export_title;
         std::string export_start;
         std::string cancel;
-        std::string export_section_ai;
+        std::string export_section_settings;
         std::string export_clip_length_label;
-        std::string export_section_path;
         std::string export_global_dir_label;
         std::string export_pick_dir;
         std::string export_section_queue;

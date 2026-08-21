@@ -187,8 +187,11 @@ void Player::build_top_bar(float& out_height){
     }
     ImGui::SameLine();
 
-    { // close
-        IconButtonResult r = icon_button("##close_btn", ImVec2(btn_w, btn_h), ui::AppIcon::Close);
+    { // close -- destructive-action standard: glyph flips to kError on hover (same as the
+      // export preset trash / queue remove buttons).
+        IconButtonResult r = icon_button("##close_btn", ImVec2(btn_w, btn_h));
+        ui::DrawIconButtonGlyph(r, ui::AppIcon::Close, ImGui::IsItemHovered()
+            ? ui::theme::error_u32() : ui::theme::icon_color_u32());
         if (r.clicked) PostMessageA(hwnd_, WM_CLOSE, 0, 0);
     }
 

@@ -49,6 +49,7 @@ ICONS = [
     "volume-x",        # VolumeMute
     "trash",           # Trash (export preset/queue delete)
     "folder-input",    # FolderInput (export path picker)
+    "folder",          # Folder (web-server root picker)
 ]
 
 ICON_PX = 96    # raster size of one glyph (lucide grid is 24 -> 4x, stroke = whole 10px)

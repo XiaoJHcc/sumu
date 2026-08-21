@@ -436,7 +436,6 @@ void Player::build_stream_popup(){
     const float label_w = ui_s(88.0f);
     // InlineLabel leaves the cursor past the label column + ItemInnerSpacing.
     const float field_w = content_w - label_w - ImGui::GetStyle().ItemInnerSpacing.x;
-    const float pick_w = ui_s(96.0f);
 
     if (stream_running_) {
         // Running: the access URL lives here (no persistent status float), clickable → browser.
@@ -453,11 +452,17 @@ void Player::build_stream_popup(){
         if (stream_port_edit_ > 65535) stream_port_edit_ = 65535;
 
         ui::InlineLabel(ui_str_.stream_root_label.empty() ? "Root" : ui_str_.stream_root_label.c_str(), label_w);
+        // Folder pick: framed icon button (lucide folder), same style as the export
+        // page's path picker; the row stays label + input + square button.
+        const float pick_sz = ImGui::GetFrameHeight();
         ui::TextInput("##stream_root", stream_root_buf_, sizeof(stream_root_buf_), nullptr,
-            field_w - pick_w - ImGui::GetStyle().ItemSpacing.x);
+            field_w - pick_sz - ImGui::GetStyle().ItemSpacing.x);
         ImGui::SameLine();
-        if (ui::Button(ui_str_.stream_pick.empty() ? "Browse" : ui_str_.stream_pick.c_str(),
-                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, pick_w)) {
+        ui::IconButtonResult pick_r = ui::IconButtonFramed("##stream_pick",
+            ImVec2(pick_sz, pick_sz), ui::AppIcon::Folder);
+        if (!ui_str_.stream_pick.empty() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", ui_str_.stream_pick.c_str());
+        if (pick_r.clicked) {
             std::string dir = pick_folder();
             if (!dir.empty()) {
                 size_t n = std::min(dir.size(), sizeof(stream_root_buf_) - 1);

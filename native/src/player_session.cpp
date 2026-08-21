@@ -980,6 +980,8 @@ void Player::apply_ui_dpi(float scale){
     if (std::fabs(scale - ui_dpi_scale_) < 0.001f && ui_ready_) return;
 
     ui_dpi_scale_ = scale;
+    ui::set_ui_scale(scale); // the ui layer's fixed-metric arithmetic must use THIS exact
+                             // value, not a rasterized-font proxy (see ui::set_ui_scale)
 
     ImGuiStyle& style = ImGui::GetStyle();
     style = ui_style_base_;
@@ -1080,9 +1082,8 @@ void Player::set_ui_strings(const py::dict& d){
     take("export_title", ui_str_.export_title);
     take("export_start", ui_str_.export_start);
     take("cancel", ui_str_.cancel);
-    take("export_section_ai", ui_str_.export_section_ai);
+    take("export_section_settings", ui_str_.export_section_settings);
     take("export_clip_length_label", ui_str_.export_clip_length_label);
-    take("export_section_path", ui_str_.export_section_path);
     take("export_global_dir_label", ui_str_.export_global_dir_label);
     take("export_pick_dir", ui_str_.export_pick_dir);
     take("export_section_queue", ui_str_.export_section_queue);

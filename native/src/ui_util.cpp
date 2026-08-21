@@ -31,6 +31,33 @@ float seekbar_x_for_frame(int64_t frame, float x0, float x1, int64_t frame_count
     return x0 + t * (x1 - x0);
 }
 
+std::string percent_decode(const std::string& s)
+{
+    // Decode URL percent-encoding ("%20" -> ' ', "%E6..." -> UTF-8 bytes) so a network
+    // URL's basename shows the real filename in the title bar instead of "%XX" escapes.
+    std::string out;
+    out.reserve(s.size());
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            int hi = hex(s[i + 1]);
+            int lo = hex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
 std::string basename_of(const std::string& path)
 {
     // Strip query/fragment so "http://host/a/b.mp4?token=x" shows as "b.mp4", not the token.
@@ -39,7 +66,9 @@ std::string basename_of(const std::string& path)
     if (cut != std::string::npos)
         p = p.substr(0, cut);
     size_t pos = p.find_last_of("/\\");
-    return (pos == std::string::npos) ? p : p.substr(pos + 1);
+    std::string base = (pos == std::string::npos) ? p : p.substr(pos + 1);
+    // Network URLs carry the filename percent-encoded; show the decoded name in the UI.
+    return percent_decode(base);
 }
 
 std::string elide_text_to_width(const std::string& text, float max_w)

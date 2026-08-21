@@ -24,6 +24,7 @@ namespace sumu_ui {
 int64_t frame_for_seekbar_x(float mx, float x0, float x1, int64_t frame_count);
 float seekbar_x_for_frame(int64_t frame, float x0, float x1, int64_t frame_count);
 std::string basename_of(const std::string& path);
+std::string percent_decode(const std::string& s);
 // Title-bar filename elide: keep a UTF-8-safe prefix that fits max_w, append "..." when clipped.
 // Uses current ImGui font metrics (must be called during an active ImGui frame).
 std::string elide_text_to_width(const std::string& text, float max_w);

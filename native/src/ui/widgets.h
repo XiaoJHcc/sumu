@@ -19,9 +19,13 @@
 // DPI principle: control geometry is derived from the ImGui style (GetFrameHeight(),
 // CalcTextSize(), style vars) which apply_ui_dpi() already scaled via ScaleAllSizes +
 // FontScaleDpi -- nothing here multiplies by a DPI factor itself, except the ui_scale()
-// proxy for the few fixed pixel metrics. Callers that need a fixed width keep wrapping
-// with Player::ui_s() and pass it via the trailing `width` argument (0 = fill the
-// remaining content width).
+// factor for the few fixed pixel metrics. ui_scale() is the AUTHORITATIVE monitor scale
+// pushed by Player::apply_ui_dpi (set_ui_scale) -- it must NOT be re-derived from the
+// rasterized frame height: the font rasterizer's pixel snapping makes that proxy a few
+// percent off the true scale, and any width arithmetic mixing the two (window width vs
+// content width) lands controls flush against the window's right edge. Callers that need
+// a fixed width keep wrapping with Player::ui_s() and pass it via the trailing `width`
+// argument (0 = fill the remaining content width).
 
 #pragma once
 
@@ -32,6 +36,11 @@
 #include <cstddef>
 
 namespace ui {
+
+// The authoritative monitor DPI scale (dpi/96), pushed by Player::apply_ui_dpi. Everything
+// in this layer that scales a 96-DPI base metric goes through ui_scale() so it matches
+// Player::ui_s() exactly. Defaults to 1.0 before the first apply_ui_dpi call.
+void set_ui_scale(float scale);
 
 // ---- buttons ---------------------------------------------------------------------------------
 
@@ -154,6 +163,12 @@ IconButtonResult IconButton(const char* str_id, ImVec2 size, bool disabled = fal
 // of the button size (32px button -> 14px glyph), tinted theme kIconColor / kIconColorDim
 // when disabled. If the atlas failed to build this degrades to the hit-area-only form above.
 IconButtonResult IconButton(const char* str_id, ImVec2 size, AppIcon icon, bool disabled = false);
+
+// Framed variant: same centered glyph, but on the standard button fill ramp (kButtonBg /
+// white 12% hover / white 16% active -- the Secondary Button colors) instead of a bare
+// hover wash. For icon buttons that sit inside form rows next to framed controls (path
+// pickers etc.), where the bare wash reads as "not a button".
+IconButtonResult IconButtonFramed(const char* str_id, ImVec2 size, AppIcon icon, bool disabled = false);
 
 // Paints the glyph of an already-created bare IconButton with a caller-chosen tint (same
 // centering + 7/16 sizing as the AppIcon overload). For the rare buttons whose tint is

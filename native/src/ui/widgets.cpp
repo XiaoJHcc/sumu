@@ -7,6 +7,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 
 namespace ui {
 
@@ -17,11 +18,22 @@ constexpr ImVec4 white(float a) { return ImVec4(1.0f, 1.0f, 1.0f, a); }
 // Same hue, different alpha (button fill ramps etc.).
 constexpr ImVec4 with_alpha(ImVec4 c, float a) { c.w = a; return c; }
 
-// Runtime DPI scale proxy: the standard frame is 32px at 96 DPI (theme::kControlHeight ==
-// FramePadding (10,7) + 18px base font) and ScaleAllSizes/FontScaleDpi scale both terms
-// together, so the ratio recovers the monitor scale for self-drawn geometry (same role as
-// Player::ui_s, but style-derived so this layer stays Player-free).
-float ui_scale() { return ImGui::GetFrameHeight() / theme::kControlHeight; }
+// Runtime DPI scale: the AUTHORITATIVE monitor scale pushed by Player::apply_ui_dpi
+// (set_ui_scale), so fixed-metric arithmetic here matches Player::ui_s() exactly. Do NOT
+// re-derive it from GetFrameHeight()/kControlHeight: the font rasterizer snaps the pixel
+// size (27px requested -> 26px rasterized at 150%), so that proxy reads ~1.469 instead of
+// 1.5 -- and any widget whose window width is computed with the proxy while its content
+// is laid out with the true scale overflows the content column and ends up flush against
+// the window's right edge (the recurring modal right-padding bug).
+float g_ui_scale = 1.0f;
+
+} // namespace
+
+void set_ui_scale(float scale) { g_ui_scale = scale; }
+
+namespace {
+
+float ui_scale() { return g_ui_scale; }
 
 // Visible part of an ImGui "label##id" string. (ImGui::FindRenderedTextEnd lives in
 // imgui_internal.h; this layer stays public-API-only, so split on the first "##" by hand --
@@ -623,7 +635,11 @@ bool BeginModal(const char* title, bool* open, float content_w_base){
         const float btn_w = theme::kControlHeight * s; // icon button = control-height square
         const float btn_h = bar_h - 2.0f * theme::kSpaceXS * s; // 36 - 2*2 = 32, centered
         ImGui::SetCursorPos(ImVec2(strip_w - btn_w - theme::kSpaceXS * s, (bar_h - btn_h) * 0.5f));
-        IconButtonResult r = IconButton("##modal_close", ImVec2(btn_w, btn_h), AppIcon::Close);
+        // Destructive-action standard: the close glyph flips to kError on hover (same as
+        // the main-window close / export delete buttons).
+        IconButtonResult r = IconButton("##modal_close", ImVec2(btn_w, btn_h));
+        DrawIconButtonGlyph(r, AppIcon::Close, ImGui::IsItemHovered()
+            ? theme::error_u32() : theme::icon_color_u32());
         if (r.clicked) {
             *open = false;
             ImGui::CloseCurrentPopup();
@@ -684,6 +700,28 @@ void DrawIconButtonGlyph(const IconButtonResult& r, AppIcon icon, ImU32 tint){
 
 IconButtonResult IconButton(const char* str_id, ImVec2 size, AppIcon icon, bool disabled){
     IconButtonResult r = IconButton(str_id, size, disabled);
+    DrawIconButtonGlyph(r, icon,
+        disabled ? theme::icon_color_dim_u32() : theme::icon_color_u32());
+    return r;
+}
+
+IconButtonResult IconButtonFramed(const char* str_id, ImVec2 size, AppIcon icon, bool disabled){
+    // Hit area WITHOUT the bare wash: IconButton(str_id, size, disabled)'s own hover fill
+    // is replaced below by the full button-fill ramp, so replicate it inline.
+    IconButtonResult r{};
+    if (disabled) ImGui::BeginDisabled();
+    r.clicked = ImGui::InvisibleButton(str_id, size);
+    r.dl = ImGui::GetWindowDrawList();
+    // State colors BEFORE EndDisabled so the active/hover reads aren't alpha-faded twice.
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (disabled) ImGui::EndDisabled();
+    r.min = ImGui::GetItemRectMin();
+    r.max = ImGui::GetItemRectMax();
+    // Secondary Button ramp (theme kButtonBg -> white 12% hover -> white 16% active).
+    const ImU32 fill = theme::to_u32(faded(
+        active ? white(0.16f) : hovered ? white(0.12f) : theme::kButtonBg));
+    r.dl->AddRectFilled(r.min, r.max, fill, ImGui::GetStyle().FrameRounding);
     DrawIconButtonGlyph(r, icon,
         disabled ? theme::icon_color_dim_u32() : theme::icon_color_u32());
     return r;

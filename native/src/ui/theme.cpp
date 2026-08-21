@@ -23,7 +23,11 @@ void apply_theme(ImGuiStyle& style){
     style.PopupRounding = kRadiusControl;
     style.ScrollbarRounding = kRadiusControl;
     style.GrabRounding = kRadiusControl;
-    style.ScrollbarSize = 12.0f;
+    // Slim scrollbar: kSpaceM, same rhythm as scroll-region insets.
+    style.ScrollbarSize = 8.0f;
+    // Grab hugs the container edge (default 2px inset would make a scroll region's right
+    // margin read as padding+inset, breaking the equal-margin standard).
+    style.ScrollbarPadding = 0.0f;
     style.GrabMinSize = 10.0f;
     style.WindowBorderSize = 0.0f;   // modal/popup strokes are self-drawn (see ui::BeginModal)
     style.PopupBorderSize = 0.0f;
@@ -51,7 +55,9 @@ void apply_theme(ImGuiStyle& style){
     c[ImGuiCol_TitleBgCollapsed] = kWindowBg;
     c[ImGuiCol_MenuBarBg] = kPanelBg;
 
-    c[ImGuiCol_ScrollbarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.20f);
+    // Scrollbar track reads the base-background standard (kWindowBg, #1E1E20), so a
+    // track over any darker scroll region stays the same value instead of a black wash.
+    c[ImGuiCol_ScrollbarBg] = kWindowBg;
     c[ImGuiCol_ScrollbarGrab] = white(0.20f);
     c[ImGuiCol_ScrollbarGrabHovered] = white(0.30f);
     c[ImGuiCol_ScrollbarGrabActive] = white(0.40f);

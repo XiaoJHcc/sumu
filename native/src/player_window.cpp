@@ -101,7 +101,14 @@ void Player::create_window(int width_hint, int height_hint, bool maximized){
     RegisterClassExA(&wc);
 
 
-    RECT rc{ 0, 0, std::max(1, width_hint), std::max(1, height_hint) };
+    // width_hint/height_hint are 96-DPI LOGICAL units: the startup window lands on the
+    // primary monitor (CW_USEDEFAULT), so scale the hints to physical pixels by the system
+    // DPI -- otherwise a 150%/200% display gets a window 1.5x/2x smaller than intended.
+    // Cross-monitor moves after creation are already covered by WM_DPICHANGED's
+    // system-suggested rect.
+    const int startup_dpi = (int)GetDpiForSystem();
+    RECT rc{ 0, 0, std::max(1, MulDiv(width_hint, startup_dpi, 96)),
+                  std::max(1, MulDiv(height_hint, startup_dpi, 96)) };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd_ = CreateWindowExA(0, wc.lpszClassName, "sumu",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

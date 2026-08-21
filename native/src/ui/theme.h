@@ -15,7 +15,8 @@ namespace ui::theme {
 
 // ---- palette (ImVec4; matching ImU32 helpers below) ---------------------------------------
 
-// #1E1E20 -- main window background.
+// #1E1E20 -- main window background. ALSO the standard for scroll-region and
+// scrollbar-track backgrounds (apply_theme installs it as ImGuiCol_ScrollbarBg).
 inline constexpr ImVec4 kWindowBg{ 30.0f / 255.0f, 30.0f / 255.0f, 32.0f / 255.0f, 1.0f };
 // #262628 -- cards / popups / panels, one step above the window background.
 inline constexpr ImVec4 kPanelBg{ 38.0f / 255.0f, 38.0f / 255.0f, 40.0f / 255.0f, 1.0f };
