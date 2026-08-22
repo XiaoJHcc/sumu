@@ -199,6 +199,11 @@ struct UiIntents {
     // same as every other field here).
     std::string open_path;
     bool open_dialog = false;
+    // Title-bar X / ESC while park_on_close_ is set: the user asked to close the window, but
+    // native no longer decides to quit -- Python drains this and chooses between parking
+    // (hide window, keep the warm models for a fast reopen) and a real exit. See app.py's
+    // park handling; with park_on_close_ unset WM_CLOSE/ESC keep their legacy quit behavior.
+    bool close_request = false;
     // First-screen "compile TRT acceleration engines" button (open-prompt overlay only). Python
     // responds by spawning the blocking compile off the main thread and driving the compile UI
     // via set_compile_ui(). Doubles as the "retry" click in the failed state.
@@ -396,6 +401,18 @@ public:
     bool should_quit() const { return quit_.load(std::memory_order_relaxed); }
     void set_quit() { quit_.store(true, std::memory_order_relaxed); }
 
+    // Close-parking (see UiIntents::close_request). With park_on_close_ set, WM_CLOSE/ESC
+    // record an intent instead of quitting; Python then hide_window()s and keeps the process
+    // (and its warm AI models) alive briefly. Main-thread-only flag, same as UiIntents.
+    void set_park_on_close(bool on) { park_on_close_ = on; }
+    bool park_on_close() const { return park_on_close_; }
+
+    // Hide/show the window across a park. show_window() additionally tries to take the
+    // foreground (failure just flashes the taskbar button -- acceptable). Present keeps
+    // running while hidden -- deliberately, see park_on_close_'s comment.
+    void hide_window();
+    void show_window();
+
     void on_resize(UINT w, UINT h);
 
     void resize_window_for_video();
@@ -447,6 +464,8 @@ public:
     void record_open_dialog();
 
     void record_compile_engine();
+
+    void record_close_request();
 
     void request_stream_popup();
 
@@ -1033,6 +1052,14 @@ private:
     // WndProc's forward declaration) -- replaces a file-level global that used to be silently
     // shared across every Player instance in the process.
     std::atomic<bool> quit_{ false };
+    // Close-parking (see UiIntents::close_request / set_park_on_close()). Main-thread-only
+    // flag, same discipline as UiIntents itself. NOTE: hide_window() deliberately does NOT
+    // idle present_loop() -- an earlier version did (Sleep+continue while hidden) and the
+    // CUDA/D3D11 interop state broke during the hidden idle (reopen-after-park then failed
+    // with DXGI_ERROR_DEVICE_REMOVED / CUDA_ERROR_INVALID_HANDLE on cuGraphicsD3D11Register
+    // Resource; reproduced only with torch resident). Rendering the splash into the hidden
+    // window for the <=60s park is near-free, so present simply keeps running.
+    bool park_on_close_ = false;
     // M-C1: session-only stop signal for decode_thread_/audio_thread_, distinct from stop_
     // (present_thread_'s own, whole-Player-lifetime stop flag -- present_loop() must keep
     // checking ONLY stop_, never this). Set true by close_session(), then reset back to false

@@ -3,7 +3,11 @@
 #
 # Daily-use player entrypoint -- unlike scripts/run_player.py (verification scaffolding: fixed
 # --seconds auto-exit, --seek-test, --correctness, trace dump), this has no timeout, no forced
-# seek, no trace dump. Runs until the user closes the window (Player.should_quit()) or Ctrl-C.
+# seek, no trace dump. Closing the window (X/ESC) no longer quits directly: with native
+# park_on_close enabled it close-parks the player (window hidden, warm models kept resident)
+# for _PARK_SECONDS, and a relaunch inside that window is forwarded back to THIS process over
+# the single-instance pipe (single_instance.py) for a zero-warmup reopen. The park deadline
+# passing with no relaunch -- or Ctrl-C -- is what actually exits (finally -> player.close()).
 #
 # Frozen-safe: no sys.path hacks here -- the caller (dev shim scripts/play.py, or a future
 # PyInstaller spec/entry point) is responsible for making `sumu` and `sumu_core` importable
@@ -21,6 +25,7 @@
 # frames start covering the passthrough ones with no playback interruption.
 import argparse
 import os
+import queue
 import re
 import sys
 import threading
@@ -34,6 +39,11 @@ from sumu import i18n as i18n_mod  # noqa: E402
 # Offline-export quality-first pipeline: no per-frame region cap (the live player's cap is a perf
 # knob; export wants every detected mosaic restored, so use a sentinel effectively == unlimited).
 _EXPORT_MAX_REGIONS = 1024
+
+# Close-parking window: how long the process lingers after the window closes (X/ESC), warm
+# models still resident, waiting for a single-instance relaunch to reuse them. See the module
+# docstring above. Fixed on purpose -- this is a UX constant, not a user setting.
+_PARK_SECONDS = 60.0
 
 
 class _WarmupState:
@@ -230,6 +240,15 @@ def main():
     ap.add_argument("--maximized", action="store_true", default=False)
     args = ap.parse_args()
 
+    # Single-instance handoff (before ANY heavy init): if another sumu process is alive --
+    # playing, or close-parked with its models still warm -- forward our video (or a bare
+    # "resurface" nudge) over the pipe and exit. The receiver reopens in place with zero
+    # warmup; this early return is what makes reopen-right-after-closing fast.
+    from sumu.single_instance import PipeListener, try_forward_to_running
+    if try_forward_to_running(args.video):
+        print("== single-instance == forwarded to the running/parked instance", file=sys.stderr)
+        return
+
     settings = settings_mod.load()
     # Resolve language before the first overlay frame so native labels + status/compile
     # strings match the OS (or settings.language) from tick 1.
@@ -237,6 +256,17 @@ def main():
     print(f"== i18n == preference={settings.language!r} active={lang!r}", file=sys.stderr)
 
     player = sumu_core.Player(args.width, args.height, args.maximized)
+    # Close-parking + single-instance listener. Both need the new native methods; a stale
+    # sumu_core build without them degrades to the legacy multi-instance/close-quits behavior
+    # (no listener => later launches find no pipe and run standalone).
+    ipc_listener = None
+    if hasattr(player, "set_park_on_close"):
+        player.set_park_on_close(True)
+        ipc_listener = PipeListener()
+        ipc_listener.start()
+    else:
+        print("== park == native build lacks close-parking; legacy close-to-quit behavior",
+              file=sys.stderr)
     player.set_volume(settings.volume)
     player.set_muted(settings.muted)
     i18n_mod.apply_to_player(player, settings.language)
@@ -600,10 +630,38 @@ def main():
     # Async network open: keeps pump_messages/ui_tick alive so the URL float can show loading.
     open_state = None
 
+    # Close-parking state: parked=True while the window is hidden post-close, waiting out
+    # _PARK_SECONDS for a single-instance relaunch to forward a new video (zero-warmup
+    # reopen). The warm models stay referenced by `warmup`/locals the whole time -- parking
+    # deliberately does NOT release them.
+    parked = False
+    park_deadline = 0.0
 
     try:
         while not player.should_quit():
             player.pump_messages()
+
+            # Single-instance inbox (see single_instance.py): a later launch forwarded its
+            # video path (or an empty nudge = just resurface). Unpark if hidden and reseed
+            # the same pending_open_path slot the CLI arg uses -- the regular open machinery
+            # below picks it up later this very tick (do_open from the parked opened=False
+            # state, do_reopen while playing) against the still-warm models.
+            if ipc_listener is not None:
+                try:
+                    while True:
+                        fwd = ipc_listener.incoming.get_nowait()
+                        player.show_window()
+                        parked = False
+                        if fwd:
+                            if export_mode:
+                                # Export owns the GPU; the UI's own open buttons are gated
+                                # the same way while an export runs.
+                                print(f"== single-instance == ignored during export: {fwd!r}",
+                                      file=sys.stderr)
+                            else:
+                                pending_open_path = fwd
+                except queue.Empty:
+                    pass
 
             with warmup.lock:
                 warm_ready = warmup.ready
@@ -742,6 +800,48 @@ def main():
             player.ui_tick()
 
             intents = player.take_ui_intents()
+
+            # Close-parking (native park_on_close routes X/ESC here instead of quitting):
+            # tear down everything the finally block would EXCEPT player.close(), hide the
+            # window, and keep the warm models resident for _PARK_SECONDS. A relaunch inside
+            # the window unparks via the inbox above; the deadline check at the bottom of
+            # the loop is the real exit.
+            if intents.get("close_request") and not parked:
+                if warm_error is not None or open_state is not None:
+                    # Nothing warm worth keeping, or an async network open is in flight
+                    # (close_current_session would race its worker thread): plain quit.
+                    break
+                print(f"== park == window closed; keeping warm models {_PARK_SECONDS:.0f}s "
+                      "for a relaunch", file=sys.stderr)
+                if current_path is not None:
+                    try:
+                        settings.set_position(current_path, player.current_frame())
+                    except Exception:  # noqa: BLE001 -- persistence must never crash shutdown
+                        pass
+                settings_mod.save(settings)
+                if scheduler is not None:
+                    scheduler.stop()
+                    scheduler = None
+                if stream_server is not None:
+                    try:
+                        stream_server.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    stream_server = None
+                    player.set_stream_running(False)
+                if export_queue is not None:
+                    export_queue.cancel_all()
+                _exit_export_mode()  # no-op outside export mode; drops the screen + persists
+                if opened:
+                    try:
+                        player.close_current_session()
+                    except Exception:  # noqa: BLE001 -- present detach failed; can't park
+                        break
+                    opened = False
+                    current_path = None
+                player.hide_window()
+                parked = True
+                park_deadline = time.monotonic() + _PARK_SECONDS
 
             # Offline-export mode enter/exit runs FIRST, before open/URL/stream intents: the native
             # title bar sets export_exit together with open/URL/web clicks (in export mode), so the
@@ -1078,6 +1178,12 @@ def main():
                 if persist != settings.export_queue:
                     settings.export_queue = persist
                     settings_mod.save(settings)
+
+            # Park deadline reached with no relaunch: exit for real -- this IS the deferred
+            # model unload (finally -> player.close() -> process exit returns the GPU memory).
+            if parked and time.monotonic() >= park_deadline:
+                print("== park == no relaunch within the window; exiting", file=sys.stderr)
+                break
 
             # 50Hz main loop. NOT 0.008 (125Hz): measured regression (see run_player.py:236 /
             # docs/native_core.md) -- a 125Hz loop starves the present thread, breaking present

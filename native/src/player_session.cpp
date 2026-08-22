@@ -819,6 +819,26 @@ void Player::record_open_dialog() { ui_intents_.open_dialog = true; }
 
 void Player::record_compile_engine() { ui_intents_.compile_engine = true; }
 
+// park_on_close (see UiIntents::close_request): WM_CLOSE/ESC while parking is enabled.
+// Main-thread-only, same as record_seek() above.
+void Player::record_close_request() { ui_intents_.close_request = true; }
+
+void Player::hide_window(){
+    // Just hide. Do NOT idle present_loop() here -- see park_on_close_'s comment in
+    // player.h for the device-removed/invalid-handle failure that caused.
+    if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
+}
+
+void Player::show_window(){
+    if (hwnd_) {
+        ShowWindow(hwnd_, SW_SHOW);
+        // Best-effort foreground: the request usually comes from a freshly-launched second
+        // instance forwarding its video over the single-instance pipe, so foreground rights
+        // may be denied -- the taskbar button just flashes then, which is acceptable.
+        SetForegroundWindow(hwnd_);
+    }
+}
+
 // Web-stream popup request (main-thread-only, see UiIntents header comment). The offline
 // export entry is a full-screen mode, driven by ui_intents_.export_enter (see build_top_bar /
 // build_open_prompt_overlay) + Python's set_export_mode().
@@ -1130,6 +1150,7 @@ py::dict Player::take_ui_intents(){
     d["target_fps"] = ui_intents_.target_fps.has_value() ? py::cast(*ui_intents_.target_fps) : py::none();
     d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
     d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
+    d["close_request"] = ui_intents_.close_request; // park_on_close: X/ESC -> Python decides park vs quit
     d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
     d["stream_start"] = ui_intents_.stream_start; // web-stream server: start with port/root
     d["stream_port"] = ui_intents_.stream_port;

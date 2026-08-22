@@ -46,8 +46,26 @@ p.push_ai_frame(frame_num, cuda_dev_ptr, width, height, pitch_bytes)
 p.current_frame() / p.frame_count() / p.fps() / p.dims()
 p.ai_hit_rate() / p.stats() / p.present_stats() / p.dump_present_trace(path)
 p.pump_messages() / p.should_quit()   # Win32 消息泵，需在主线程周期调用
+p.set_park_on_close(on)      # 关窗驻留开关：on 时 X/ESC 不再直接退出，而是经
+                             # take_ui_intents() 的 close_request 交给 Python 决定驻留/退出
+p.hide_window() / p.show_window()   # 驻留：隐藏窗口 / 恢复并前台化（present 保持运行，
+                                    # 空闲 present 会破坏 CUDA/D3D interop 状态——勿改回）
 p.close()
 ```
+
+### 关窗驻留（close-parking）与单实例
+
+`set_park_on_close(True)` 后（仅 `python/sumu/app.py` 启用；验证脚本保持旧语义），标题栏 X 与 ESC
+在 WndProc 里只记录 `ui_intents_.close_request`，不再 `DestroyWindow`/`set_quit`。Python 主循环收到后
+镜像 finally 的清理（存位置、停 scheduler/stream/export、`close_current_session()`）但**不调
+`player.close()`**，随后 `hide_window()` 隐藏窗口，进程带着热模型驻留 `_PARK_SECONDS`（60s）。
+期间新启动的进程经 named pipe 单实例转发（`python/sumu/single_instance.py`）把视频路径发回主实例，
+主实例 `show_window()` + 走常规 open/reopen 路径，零预热；截止时间到则 break 出主循环，走原有
+finally 真正退出（此时才"卸载模型"）。
+
+注意：驻留期间 present 线程保持正常运行（向隐藏窗口渲染 splash，开销可忽略）。曾尝试让 present
+在隐藏时空转休眠，结果驻留后的 open 稳定报 `DXGI_ERROR_DEVICE_REMOVED` /
+`CUDA_ERROR_INVALID_HANDLE`（需 torch 驻留才复现）——不要改回。
 
 ## 线程/锁模型（继承 Spike 2，新增 `decoder_mutex_`/`trace_mutex_`）
 

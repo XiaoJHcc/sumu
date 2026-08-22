@@ -483,12 +483,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PostQuitMessage(0);
         return 0;
     case WM_CLOSE:
-        DestroyWindow(hwnd);
+        // park_on_close: don't destroy -- hand the decision to Python via close_request
+        // (it hides the window and keeps the process/models warm for a fast reopen).
+        // Unset (verification scripts): legacy immediate teardown, unchanged.
+        if (self && self->park_on_close()) self->record_close_request();
+        else DestroyWindow(hwnd);
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
-            // ESC always quits, regardless of ImGui's keyboard-capture state (unchanged M1/M2
+            // ESC quits regardless of ImGui's keyboard-capture state (unchanged M1/M2
             // behavior) -- an escape hatch that must never be swallowed by a focused widget.
+            // Under park_on_close it takes the same close_request detour as WM_CLOSE above.
+            if (self && self->park_on_close()) {
+                self->record_close_request();
+                return 0;
+            }
             if (self) self->set_quit();
             PostQuitMessage(0);
             return 0;

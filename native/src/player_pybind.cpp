@@ -75,6 +75,9 @@ PYBIND11_MODULE(sumu_core, m)
         .def("dump_present_trace", &Player::dump_present_trace, py::arg("path"))
         .def("pump_messages", &Player::pump_messages)
         .def("should_quit", &Player::should_quit)
+        .def("set_park_on_close", &Player::set_park_on_close, py::arg("on")) // close-parking: X/ESC -> close_request intent
+        .def("hide_window", &Player::hide_window) // park: hide + idle present
+        .def("show_window", &Player::show_window) // unpark: restore + foreground
         .def("close", &Player::close);
 
     // Headless decode bridge (transcode / web-streaming / offline-export): implemented in
