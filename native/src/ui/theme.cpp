@@ -15,7 +15,9 @@ void apply_theme(ImGuiStyle& style){
     // shared by every single-line control: inputs, combos, buttons.
     style.WindowPadding = ImVec2(kPaddingContainer, 10.0f);
     style.FramePadding = ImVec2(10.0f, 7.0f);
-    style.ItemSpacing = ImVec2(kSpaceM, 6.0f);
+    // ItemSpacing: x = kSpaceM (8px) in-row gap, y = kSpaceM (8px) row gap -- the row gap
+    // must not fall below the in-row gap, or stacked rows read as one block.
+    style.ItemSpacing = ImVec2(kSpaceM, kSpaceM);
     style.ItemInnerSpacing = ImVec2(6.0f, kSpaceS);
     style.WindowRounding = kRadiusWindow;
     style.ChildRounding = kRadiusControl;

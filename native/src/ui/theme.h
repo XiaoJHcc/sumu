@@ -30,11 +30,13 @@ inline constexpr ImVec4 kText{ 1.0f, 1.0f, 1.0f, 0.88f };
 inline constexpr ImVec4 kTextSecondary{ 1.0f, 1.0f, 1.0f, 0.55f };
 inline constexpr ImVec4 kTextDim{ 1.0f, 1.0f, 1.0f, 0.32f };
 
-// Soft accent blue (#6FA8F7) with hover/active steps. Used for the Primary button chip,
-// checkbox on-state, slider fill, combo check, links -- the single accent everywhere.
-inline constexpr ImVec4 kAccent{ 111.0f / 255.0f, 168.0f / 255.0f, 247.0f / 255.0f, 1.0f };
-inline constexpr ImVec4 kAccentHover{ 137.0f / 255.0f, 187.0f / 255.0f, 249.0f / 255.0f, 1.0f };
-inline constexpr ImVec4 kAccentActive{ 93.0f / 255.0f, 150.0f / 255.0f, 230.0f / 255.0f, 1.0f };
+// Fill blue (#3965A8) with hover/active steps. This is the BACKGROUND blue shared by
+// the slider fill, checkbox on-state and the Primary button chip -- a compromise
+// between the quiet control blue and the punchy button blue. Marks on top of it
+// (button label, checkbox check) are plain white.
+inline constexpr ImVec4 kAccent{ 57.0f / 255.0f, 101.0f / 255.0f, 168.0f / 255.0f, 1.0f };
+inline constexpr ImVec4 kAccentHover{ 70.0f / 255.0f, 118.0f / 255.0f, 190.0f / 255.0f, 1.0f };
+inline constexpr ImVec4 kAccentActive{ 48.0f / 255.0f, 86.0f / 255.0f, 143.0f / 255.0f, 1.0f };
 
 inline constexpr ImVec4 kError{ 230.0f / 255.0f, 80.0f / 255.0f, 80.0f / 255.0f, 1.0f }; // #E65050
 inline constexpr ImVec4 kWarning{ 1.0f, 214.0f / 255.0f, 10.0f / 255.0f, 1.0f }; // #FFD60A
@@ -126,8 +128,8 @@ inline constexpr float kControlHeight = 32.0f;
 // Compact numeric column used inside mixed rows and next to sliders.
 inline constexpr float kNumericInputW = 72.0f;
 
-// macOS slider: thin gray track, accent fill, large round knob.
-inline constexpr float kSliderTrackH = 4.0f;
+// macOS slider: gray track, accent fill, large round knob.
+inline constexpr float kSliderTrackH = 6.0f;
 inline constexpr float kSliderKnobR = 9.0f; // radius; diameter 18px ≈ label cap height
 
 // macOS checkbox: small rounded square about as tall as the label text.

@@ -78,8 +78,8 @@ bool Checkbox(const char* label, bool* v);
 bool Radio(const char* label, bool active);
 
 // ---- sliders (custom, macOS style) -------------------------------------------------------------
-// Compound row: [number input][pure slider track] -- thin gray track, accent fill left of
-// the knob, large round light knob. Returns true while the value changes;
+// Compound row: [number input][pure slider track] -- gray track, accent fill left of
+// the knob, large round light knob (kept fully inside the track at both ends). Returns true while the value changes;
 // `committed` (optional out) turns true exactly once when the edit FINISHES (mouse release
 // after a drag, or the number box losing focus / Enter) -- this replaces the old
 // IsItemDeactivatedAfterEdit() pattern, which cannot span a compound widget.

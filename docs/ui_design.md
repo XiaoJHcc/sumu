@@ -2,7 +2,8 @@
 
 本文档描述 ImGui 设计系统：色板/尺寸层 `ui/theme.h`、控件层 `ui/widgets.h`，以及各
 页面（player_ui_*.cpp）的使用约定。目标是 **macOS 风格的深色极简** 观感：低亮度
-中性底色、统一的 6/8px 圆角语言、单一柔和蓝强调色（#6FA8F7），控件本身不携带任何
+中性底色、统一的 6/8px 圆角语言、单一背景填充蓝（#3965A8，拉条/勾选框/Primary 按钮
+底色共用，蓝底上的文字与勾用白色），控件本身不携带任何
 调用点的样式代码。
 
 **描边规则：按钮和卡片一律无描边**（靠填充对比分层）。仅存的描边有两类——浮窗
@@ -46,7 +47,7 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 | `kBorder` | 白 @ 12% | 发丝线（标题栏下边缘、modal 标题条分隔线、下拉弹窗外框、未勾选 Checkbox 描边） |
 | `kBorderStrong` | 白 @ 22% | 浮窗外框（modal / loading 卡片 / 设置面板，表示层级区分） |
 | `kText` / `kTextSecondary` / `kTextDim` | 白 @ 88% / 55% / 32% | 正文 / 次级说明（hint、拉条端文字、摘要） / 弱化 |
-| `kAccent` / `kAccentHover` / `kAccentActive` | #6FA8F7 / hover / active | 唯一强调色，柔和蓝（Primary 按钮、勾选框勾选态、拉条填充、Combo 选中勾、链接） |
+| `kAccent` / `kAccentHover` / `kAccentActive` | #3965A8 / hover / active | 背景填充蓝（拉条填充、勾选框勾选态、Primary 按钮底色共用；另有 Combo 选中勾、链接）。蓝底上的标记（按钮文字、勾选框的勾）一律用白色 |
 | `kError` / `kWarning` / `kSuccess` | #E65050 / #FFD60A / #32D74B | 错误 / 警告 / 成功文本与状态 |
 | `kControlBg` | 白 @ 7% | 输入框/Combo/未勾选 Checkbox 的填充，**比卡片背景浅一档** |
 | `kRowCardBg` | 白 @ 5% | 嵌套列表行卡片填充（导出预设行、队列项卡片——位于 `kPanelBg` 卡片之内，只亮一丝） |
@@ -125,7 +126,9 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 
 ### 间距与字号
 
-- 间距：`kSpaceXS/S/M/L/XL = 2/4/8/12/16`。
+- 间距：`kSpaceXS/S/M/L/XL = 2/4/8/12/16`。`ItemSpacing = (kSpaceM, kSpaceM)`，即行内
+  间距与行间距同为 8px——行间距不得小于行内间距，否则纵向堆叠的行会糊成一团；
+  拉条行内"输入框→轨道"的间距单独用 `kSpaceL`（12px）。
 - 字号：标准 = `kFontSizeBase = 18`（小节标题、行内 label、控件文字）；小型 =
   `kFontSizeSm = 16`（行前 label、hint、摘要、拉条端文字）。配合
   `PushFont(nullptr, size)`；不要乘 `GetFontSize()`（会重复应用 FontScaleDpi）。

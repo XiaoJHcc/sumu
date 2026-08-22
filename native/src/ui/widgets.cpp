@@ -67,12 +67,14 @@ bool Button(const char* label, ButtonVariant v, ControlSize s, float width){
     }
     switch (v) {
     case ButtonVariant::Primary:
-        // Soft-blue chip: translucent accent fill + accent text, no border (buttons are
-        // borderless in this design; only floating windows keep a stroke).
-        ImGui::PushStyleColor(ImGuiCol_Button, with_alpha(theme::kAccent, 0.18f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, with_alpha(theme::kAccent, 0.26f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, with_alpha(theme::kAccent, 0.32f));
-        ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
+        // Chip background is the SOLID fill blue (kAccent and its hover/active steps) --
+        // the same value the slider fill and checkbox on-state render, so all three read
+        // as one blue (a translucent fill over the dark panel would mix down to a murkier
+        // tone). The label is plain white. Borderless.
+        ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::kAccentHover);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::kAccentActive);
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
         pushed_cols = 4;
         break;
     case ButtonVariant::Danger:
@@ -119,16 +121,17 @@ void SectionHeader(const char* text){
 
 void LineLabel(const char* text){
     const float s = ui_scale();
-    // Gap above the previous row's control == the container's inner padding
-    // (kPaddingContainer), so a label sits exactly one padding beat below the last input --
-    // the same distance the card edge keeps from the controls. The spacer Dummy attracts
-    // ItemSpacing.y on BOTH sides, so the dummy itself is the remainder after two spacings.
-    const float gap_top = theme::kPaddingContainer * s - 2.0f * ImGui::GetStyle().ItemSpacing.y;
+    // Gap above the previous row's control == 12px (kPaddingContainer beat). A spacer
+    // Dummy would attract ItemSpacing.y on BOTH sides (2x8 = 16px before any dummy
+    // height, overshooting 12), so nudge the cursor instead: the label's own preceding
+    // ItemSpacing.y contributes 8px, we add only the remainder.
     if (!at_container_top())
-        ImGui::Dummy(ImVec2(0.0f, std::max(0.0f, gap_top)));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+            std::max(0.0f, theme::kPaddingContainer * s - ImGui::GetStyle().ItemSpacing.y));
     ImGui::PushFont(nullptr, theme::kFontSizeSm);
     ImGui::TextUnformatted(text);
     ImGui::PopFont();
+    // Gap below the label stays at ItemSpacing.y (8px) -- nothing to add.
 }
 
 void InlineLabel(const char* text, float width){
@@ -307,11 +310,11 @@ bool Checkbox(const char* label, bool* v){
     const float by = p.y + (frame_h - box) * 0.5f;
     const float rounding = theme::kRadiusCheckbox * s;
     if (*v) {
-        // Soft accent fill + dark check (the accent is too light for a white check now).
+        // Accent fill + white check.
         dl->AddRectFilled(ImVec2(p.x, by), ImVec2(p.x + box, by + box),
             theme::to_u32(faded(hovered ? theme::kAccentHover : theme::kAccent)), rounding);
         const float cth = std::max(1.5f, box * 0.11f);
-        const ImU32 ck = theme::to_u32(faded(theme::kWindowBg));
+        const ImU32 ck = theme::to_u32(faded(theme::kText));
         const ImVec2 a(p.x + box * 0.24f, by + box * 0.54f);
         const ImVec2 b(p.x + box * 0.44f, by + box * 0.72f);
         const ImVec2 c(p.x + box * 0.77f, by + box * 0.30f);
@@ -354,7 +357,9 @@ void slider_track(const char* id, float* t, float track_w,
 
     ImGui::InvisibleButton(id, ImVec2(track_w, h));
     const ImVec2 p = ImGui::GetItemRectMin();
-    const float inset = 4.0f * s; // knob-center travel inset from the track ends
+    // Knob-center travel is inset by the knob radius so the knob stays fully inside the
+    // track at both ends -- it never pokes past the track into the row's reserved margin.
+    const float inset = theme::kSliderKnobR * s;
     const float span = std::max(1.0f, track_w - 2.0f * inset);
 
     if (ImGui::IsItemActive()) {
@@ -420,7 +425,8 @@ bool slider_int_impl(const char* label, int* v, int mn, int mx,
 
     float avail = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
     const float box_w = theme::kNumericInputW * s;
-    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    // Box-to-track gap uses the kSpaceL tier (12px), one step roomier than ItemSpacing.
+    const float gap = theme::kSpaceL * s;
     float track_w = avail - box_w - gap - slider_ends_width(left, right);
     track_w = std::max(track_w, 40.0f * s);
 
@@ -437,7 +443,7 @@ bool slider_int_impl(const char* label, int* v, int mn, int mx,
 
     // [left end text][track][right end text] -- SameLine orchestrated here, row terminates
     // with the track/right text (no trailing SameLine leaks into the next row).
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, gap);
     if (left) {
         slider_end_text(left);
         ImGui::SameLine();
@@ -483,7 +489,8 @@ bool SliderFloat(const char* label, float* v, float mn, float mx,
 
     float avail = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
     const float box_w = theme::kNumericInputW * s;
-    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    // Box-to-track gap uses the kSpaceL tier (12px), one step roomier than ItemSpacing.
+    const float gap = theme::kSpaceL * s;
     float track_w = std::max(avail - box_w - gap, 40.0f * s);
 
     ImGui::SetNextItemWidth(box_w);
@@ -496,7 +503,7 @@ bool SliderFloat(const char* label, float* v, float mn, float mx,
         if (committed) *committed = true;
     }
 
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, gap);
     float t = (mx > mn) ? (*v - mn) / (mx - mn) : 0.0f;
     t = std::clamp(t, 0.0f, 1.0f);
     bool drag_changed, released;
