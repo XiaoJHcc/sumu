@@ -10,6 +10,13 @@
       "command": "${workspaceFolder}/.venv/Scripts/python.exe",
       "args": ["scripts/play.py"],
       "options": { "cwd": "${workspaceFolder}" },
+      // Close-parking keeps the player process alive ~60s after the window closes, so the
+      // task still counts as "active" during that window. With the default instanceLimit=1
+      // re-running the task would prompt to terminate/restart -- killing the parked process
+      // (and its warm models) before the new instance can take over via single-instance
+      // forwarding. Extra instances forward over the pipe and exit within ~1s, so a limit
+      // of 4 is effectively "the parked/playing one + a transient forwarder".
+      "runOptions": { "instanceLimit": 4 },
       "problemMatcher": []
     },
     {
