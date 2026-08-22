@@ -239,9 +239,8 @@ struct UiIntents {
     int export_preset_codec = 0;      // 0 hevc / 1 h264
     bool export_preset_cq_enabled = true;
     int export_preset_cq = 33;
-    bool export_preset_bitrate_enabled = false;
+    bool export_preset_vbr_enabled = false;
     int export_preset_bitrate = 0;    // kbps
-    bool export_preset_maxrate_enabled = false;
     int export_preset_maxrate = 0;    // kbps
     int export_preset_quality = 6;    // 0..6 -> p1..p7
     bool export_preset_audio_copy = true;
@@ -262,10 +261,9 @@ struct ExportPresetView {
     std::string preset;    // "p1".."p7"
     bool cq_enabled = true;
     int cq = 0;
-    bool bitrate_enabled = false;
-    int bitrate = 0;       // kbps
-    bool maxrate_enabled = false;
-    int maxrate = 0;       // kbps
+    bool vbr_enabled = false;
+    int bitrate = 2000;    // kbps
+    int maxrate = 2500;    // kbps
     bool audio_copy = true;
     int audio_bitrate = 256;  // kbps
     bool subtitle = true;
@@ -804,11 +802,14 @@ private:
         std::string export_preset_cq_label;
         std::string export_preset_bitrate_label;
         std::string export_preset_maxrate_label;
+        std::string export_preset_vbr_label;
         std::string export_preset_quality_label;
         std::string export_preset_audio_label;
         std::string export_preset_audio_copy;
         std::string export_preset_audio_encode;
         std::string export_preset_subtitle_label;
+        std::string export_preset_subtitle_none;
+        std::string export_preset_subtitle_copy;
         std::string export_preset_suffix_label;
         std::string export_preset_default;
         std::string export_preset_save;
@@ -860,10 +861,9 @@ private:
     int export_preset_codec_idx_ = 0;   // 0 hevc / 1 h264
     bool export_preset_cq_enabled_ = true;
     int export_preset_cq_ = 33;
-    bool export_preset_bitrate_enabled_ = false;
-    int export_preset_bitrate_ = 0;     // kbps
-    bool export_preset_maxrate_enabled_ = false;
-    int export_preset_maxrate_ = 0;     // kbps
+    bool export_preset_vbr_enabled_ = false;
+    int export_preset_bitrate_ = 2000;  // kbps
+    int export_preset_maxrate_ = 2500;  // kbps
     int export_preset_quality_idx_ = 6; // 0..6 -> p1..p7
     bool export_preset_audio_copy_ = true;
     int export_preset_audio_bitrate_ = 256;  // kbps

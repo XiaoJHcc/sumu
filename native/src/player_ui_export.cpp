@@ -35,6 +35,17 @@ float export_item_card_h(const ExportItemView& item, float s){
     return ch + 2.0f * ui::theme::kPaddingContainer * s;
 }
 
+// kbps -> compact Mbps text for the preset summary: 2000 -> "2M", 1500 -> "1.5M".
+std::string format_mbps(int kbps){
+    if (kbps <= 0) return "0M";
+    char buf[32];
+    if (kbps % 1000 == 0)
+        snprintf(buf, sizeof(buf), "%dM", kbps / 1000);
+    else
+        snprintf(buf, sizeof(buf), "%.1fM", kbps / 1000.0);
+    return std::string(buf);
+}
+
 // Drag grip: two columns of three dots.
 void draw_grip_glyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col){
     const float r = 1.3f * s;
@@ -56,15 +67,16 @@ const char* Player::export_status_label(const std::string& s) const{
 }
 
 std::string Player::export_preset_summary(const ExportPresetView& p){
-    std::string s = p.name;
-    s += " · ";
-    if (p.cq_enabled) s += "CQ " + std::to_string(p.cq);
-    if (p.bitrate_enabled)
-        s += (p.cq_enabled ? " + " : "") + std::to_string(p.bitrate) + "k";
-    if (p.maxrate_enabled)
-        s += " max " + std::to_string(p.maxrate) + "k";
-    s += " · " + p.preset;
-    s += p.codec == "h264" ? " · H.264" : " · HEVC";
+    std::vector<std::string> parts;
+    parts.push_back(p.name);
+    if (p.cq_enabled) parts.push_back("CQ" + std::to_string(p.cq));
+    if (p.vbr_enabled) parts.push_back(format_mbps(p.bitrate));
+    parts.push_back(p.codec == "h264" ? "H.264" : "HEVC");
+    std::string s;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) s += " · ";
+        s += parts[i];
+    }
     return s;
 }
 
@@ -125,23 +137,32 @@ void Player::build_export_preset_card(int i, float width){
     {
         const ImVec2 tmin = ImGui::GetItemRectMin();
         const ImVec2 tmax = ImGui::GetItemRectMax();
-        // Elide the WHOLE summary to the text width first -- hard clipping cut glyphs in
-        // half; the name keeps the primary color, the "· CQ … · p7 · HEVC" tail secondary.
-        std::string summary = sumu_ui::elide_text_to_width(export_preset_summary(p), text_w);
-        const bool name_intact = summary.size() >= p.name.size() &&
-            summary.compare(0, p.name.size(), p.name) == 0;
+        const float row_h = tmax.y - tmin.y;
+        const float th_base = ImGui::GetTextLineHeight();
+        const float ty_base = tmin.y + (row_h - th_base) * 0.5f;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float th = ImGui::GetTextLineHeight();
-        const float ty = tmin.y + (tmax.y - tmin.y - th) * 0.5f;
         dl->PushClipRect(tmin, tmax, true);
-        if (name_intact) {
-            const float name_w = ImGui::CalcTextSize(p.name.c_str()).x;
-            dl->AddText(ImVec2(tmin.x, ty), ui::theme::text_u32(), p.name.c_str());
-            if (summary.size() > p.name.size())
-                dl->AddText(ImVec2(tmin.x + name_w, ty),
-                    ui::theme::text_secondary_u32(), summary.c_str() + p.name.size());
+
+        // Name (base font, primary) followed by the "· CQ33 · 2M · HEVC" tail (small font,
+        // secondary). Elide each in its own font: the name first, the tail to what's left.
+        const std::string full = export_preset_summary(p);
+        const std::string tail = full.size() > p.name.size() ? full.substr(p.name.size()) : "";
+        const float name_w = ImGui::CalcTextSize(p.name.c_str()).x;
+        if (name_w >= text_w) {
+            std::string name = sumu_ui::elide_text_to_width(p.name, text_w);
+            dl->AddText(ImVec2(tmin.x, ty_base), ui::theme::text_u32(), name.c_str());
         } else {
-            dl->AddText(ImVec2(tmin.x, ty), ui::theme::text_u32(), summary.c_str());
+            dl->AddText(ImVec2(tmin.x, ty_base), ui::theme::text_u32(), p.name.c_str());
+            if (!tail.empty()) {
+                ImGui::PushFont(nullptr, kFontSizeSm);
+                const float th_sm = ImGui::GetTextLineHeight();
+                const float ty_sm = tmin.y + (row_h - th_sm) * 0.5f;
+                std::string tail_el = sumu_ui::elide_text_to_width(tail, text_w - name_w);
+                if (!tail_el.empty())
+                    dl->AddText(ImVec2(tmin.x + name_w, ty_sm),
+                        ui::theme::text_secondary_u32(), tail_el.c_str());
+                ImGui::PopFont();
+            }
         }
         dl->PopClipRect();
     }
@@ -490,9 +511,14 @@ void Player::build_export_screen(float top_bar_h){
         ImGui::BeginChild("##queue_list", ImVec2(0.0f, list_h), ImGuiChildFlags_AlwaysUseWindowPadding);
 
         if (export_items_.empty()) {
-            ImGui::Dummy(ImVec2(0.0f, ui_s(4.0f)));
+            const char* empty = ui_str_.export_empty.c_str();
+            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            const ImVec2 text_sz = ImGui::CalcTextSize(empty);
+            ImGui::SetCursorPos(ImVec2(
+                std::max(0.0f, (avail.x - text_sz.x) * 0.5f),
+                std::max(0.0f, (avail.y - text_sz.y) * 0.5f)));
             ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
-            ImGui::TextWrapped("%s", ui_str_.export_empty.c_str());
+            ImGui::TextUnformatted(empty);
             ImGui::PopStyleColor();
         }
 
@@ -681,9 +707,8 @@ void Player::build_export_preset_editor(){
             export_preset_codec_idx_ = (src->codec == "h264") ? 1 : 0;
             export_preset_cq_enabled_ = src->cq_enabled;
             export_preset_cq_ = src->cq;
-            export_preset_bitrate_enabled_ = src->bitrate_enabled;
+            export_preset_vbr_enabled_ = src->vbr_enabled;
             export_preset_bitrate_ = src->bitrate;
-            export_preset_maxrate_enabled_ = src->maxrate_enabled;
             export_preset_maxrate_ = src->maxrate;
             export_preset_quality_idx_ = export_quality_idx_of(src->preset);
             export_preset_audio_copy_ = src->audio_copy;
@@ -695,10 +720,9 @@ void Player::build_export_preset_editor(){
             export_preset_codec_idx_ = 0;
             export_preset_cq_enabled_ = true;
             export_preset_cq_ = 33;
-            export_preset_bitrate_enabled_ = false;
-            export_preset_bitrate_ = 0;
-            export_preset_maxrate_enabled_ = false;
-            export_preset_maxrate_ = 0;
+            export_preset_vbr_enabled_ = false;
+            export_preset_bitrate_ = 2000;
+            export_preset_maxrate_ = 2500;
             export_preset_quality_idx_ = 6;
             export_preset_audio_copy_ = true;
             export_preset_audio_bitrate_ = 256;
@@ -726,39 +750,41 @@ void Player::build_export_preset_editor(){
     ui::InlineLabel(ui_str_.export_preset_codec_label.c_str(), label_w);
     ui::Combo("##ep_codec", codec_items, 2, &export_preset_codec_idx_, field_w);
 
-    // CQ / bitrate / maxrate are INDEPENDENT, each enabled by its own checkbox.
-    // Mixed-row order: checkbox, inline label, number input, slider / unit.
+    // CQ is a standalone knob; 码率/最大码率 are merged behind a single VBR checkbox.
+    // Unchecked -> their controls hide entirely, not just gray out.
     // CQ's direction is counter-intuitive (LOW number == HIGH quality), so its slider
     // carries end texts (macOS volume-slider icon positions, text instead of icons).
     ui::Checkbox("##ep_cq_en", &export_preset_cq_enabled_);
     ImGui::SameLine();
     ui::InlineLabel(ui_str_.export_preset_cq_label.c_str(), mix_label_w);
-    if (!export_preset_cq_enabled_) ImGui::BeginDisabled();
-    ui::SliderIntEnds("##ep_cq", &export_preset_cq_, 0, 51,
-        u8"高质量", u8"小体积");
-    if (!export_preset_cq_enabled_) ImGui::EndDisabled();
+    if (export_preset_cq_enabled_)
+        ui::SliderIntEnds("##ep_cq", &export_preset_cq_, 0, 51,
+            u8"高质量", u8"小体积");
+    else
+        ImGui::NewLine();
 
-    ui::Checkbox("##ep_br_en", &export_preset_bitrate_enabled_);
+    ui::Checkbox("##ep_vbr_en", &export_preset_vbr_enabled_);
     ImGui::SameLine();
-    ui::InlineLabel(ui_str_.export_preset_bitrate_label.c_str(), mix_label_w);
-    if (!export_preset_bitrate_enabled_) ImGui::BeginDisabled();
-    ui::IntInput("##ep_bitrate", &export_preset_bitrate_, num_w);
-    ImGui::SameLine();
-    ui::UnitText("kbps");
-    if (!export_preset_bitrate_enabled_) ImGui::EndDisabled();
+    ui::InlineLabel(ui_str_.export_preset_vbr_label.c_str(), mix_label_w);
+    if (export_preset_vbr_enabled_) {
+        ui::InlineLabel(ui_str_.export_preset_bitrate_label.c_str());
+        ui::IntInput("##ep_bitrate", &export_preset_bitrate_, num_w);
+        ImGui::SameLine();
+        ui::UnitText("kbps");
+        ImGui::SameLine();
+        ui::InlineLabel(ui_str_.export_preset_maxrate_label.c_str());
+        ui::IntInput("##ep_maxrate", &export_preset_maxrate_, num_w);
+        ImGui::SameLine();
+        ui::UnitText("kbps");
+    } else {
+        ImGui::NewLine();
+    }
 
-    ui::Checkbox("##ep_mr_en", &export_preset_maxrate_enabled_);
-    ImGui::SameLine();
-    ui::InlineLabel(ui_str_.export_preset_maxrate_label.c_str(), mix_label_w);
-    if (!export_preset_maxrate_enabled_) ImGui::BeginDisabled();
-    ui::IntInput("##ep_maxrate", &export_preset_maxrate_, num_w);
-    ImGui::SameLine();
-    ui::UnitText("kbps");
-    if (!export_preset_maxrate_enabled_) ImGui::EndDisabled();
+    const float combo_w = ui_s(160.0f);
 
-    const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7" };
+    const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7（最高）" };
     ui::InlineLabel(ui_str_.export_preset_quality_label.c_str(), label_w);
-    ui::Combo("##ep_quality", quality_items, 7, &export_preset_quality_idx_, field_w);
+    ui::Combo("##ep_quality", quality_items, 7, &export_preset_quality_idx_, combo_w);
 
     const char* audio_items[] = {
         ui_str_.export_preset_audio_copy.c_str(),
@@ -766,7 +792,7 @@ void Player::build_export_preset_editor(){
     };
     ui::InlineLabel(ui_str_.export_preset_audio_label.c_str(), label_w);
     int audio_mode = export_preset_audio_copy_ ? 0 : 1;
-    if (ui::Combo("##ep_audio", audio_items, 2, &audio_mode, ui_s(160.0f)))
+    if (ui::Combo("##ep_audio", audio_items, 2, &audio_mode, combo_w))
         export_preset_audio_copy_ = (audio_mode == 0);
     if (!export_preset_audio_copy_) {
         ImGui::SameLine();
@@ -775,7 +801,14 @@ void Player::build_export_preset_editor(){
         ui::UnitText("kbps");
     }
 
-    ui::Checkbox(ui_str_.export_preset_subtitle_label.c_str(), &export_preset_subtitle_);
+    const char* subtitle_items[] = {
+        ui_str_.export_preset_subtitle_none.c_str(),
+        ui_str_.export_preset_subtitle_copy.c_str(),
+    };
+    ui::InlineLabel(ui_str_.export_preset_subtitle_label.c_str(), label_w);
+    int subtitle_mode = export_preset_subtitle_ ? 1 : 0;
+    if (ui::Combo("##ep_subtitle", subtitle_items, 2, &subtitle_mode, combo_w))
+        export_preset_subtitle_ = (subtitle_mode == 1);
 
     ui::InlineLabel(ui_str_.export_preset_suffix_label.c_str(), label_w);
     ui::TextInput("##ep_suffix", export_preset_suffix_buf_, sizeof(export_preset_suffix_buf_),
@@ -792,9 +825,8 @@ void Player::build_export_preset_editor(){
         ui_intents_.export_preset_codec = export_preset_codec_idx_;
         ui_intents_.export_preset_cq_enabled = export_preset_cq_enabled_;
         ui_intents_.export_preset_cq = export_preset_cq_;
-        ui_intents_.export_preset_bitrate_enabled = export_preset_bitrate_enabled_;
+        ui_intents_.export_preset_vbr_enabled = export_preset_vbr_enabled_;
         ui_intents_.export_preset_bitrate = export_preset_bitrate_;
-        ui_intents_.export_preset_maxrate_enabled = export_preset_maxrate_enabled_;
         ui_intents_.export_preset_maxrate = export_preset_maxrate_;
         ui_intents_.export_preset_quality = export_preset_quality_idx_;
         ui_intents_.export_preset_audio_copy = export_preset_audio_copy_;

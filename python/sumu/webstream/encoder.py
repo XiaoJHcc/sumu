@@ -125,7 +125,7 @@ class EncoderError(RuntimeError):
 
 @dataclass
 class EncodeOptions:
-    """User-facing encode knobs for the offline-export presets. CQ / bitrate / maxrate are
+    """User-facing encode knobs for the offline-export presets. CQ and VBR (bitrate+maxrate) are
     INDEPENDENT, each gated by its *_enabled flag -- matching NVENC's VBR rate control, where
     targetQuality (-cq), averageBitRate (-b:v) and maxBitRate (-maxrate) coexist (the user's bat
     uses all three together). Bitrates are int kbps. Serialized as plain dicts into settings.json
@@ -135,10 +135,9 @@ class EncodeOptions:
     preset: str = "p7"            # NVENC preset p1..p7 (p7 = slowest / best quality)
     cq_enabled: bool = True
     cq: int = 33                  # 0..51 (NVENC targetQuality)
-    bitrate_enabled: bool = False
-    bitrate: int = 0              # kbps (averageBitRate)
-    maxrate_enabled: bool = False
-    maxrate: int = 0              # kbps (maxBitRate)
+    vbr_enabled: bool = False
+    bitrate: int = 2000           # kbps (averageBitRate)
+    maxrate: int = 2500           # kbps (maxBitRate)
     audio_copy: bool = True
     audio_bitrate: int = 256      # kbps (audio_copy=False only)
     subtitle: bool = True
@@ -154,10 +153,10 @@ class EncodeOptions:
             preset=str(d.get("preset") or "p7"),
             cq_enabled=bool(d.get("cq_enabled", True)),
             cq=max(0, min(51, int(d.get("cq") or 0))),
-            bitrate_enabled=bool(d.get("bitrate_enabled", False)),
-            bitrate=max(0, int(d.get("bitrate") or 0)),
-            maxrate_enabled=bool(d.get("maxrate_enabled", False)),
-            maxrate=max(0, int(d.get("maxrate") or 0)),
+            vbr_enabled=bool(d.get("vbr_enabled",
+                                   d.get("bitrate_enabled", False) or d.get("maxrate_enabled", False))),
+            bitrate=max(0, int(d.get("bitrate") or 2000)),
+            maxrate=max(0, int(d.get("maxrate") or 2500)),
             audio_copy=bool(d.get("audio_copy", True)),
             audio_bitrate=max(0, int(d.get("audio_bitrate") or 256)),
             subtitle=bool(d.get("subtitle", True)),
@@ -200,7 +199,7 @@ class NvencEncoder:
         # EncodeOptions (HEVC / CQ / p7 / copy) + quality_first=True instead.
         enc = encode if encode is not None else EncodeOptions(
             codec="h264", preset="p4", cq_enabled=False,
-            bitrate_enabled=True, bitrate=8000,
+            vbr_enabled=True, bitrate=8000, maxrate=0,
             audio_copy=False, subtitle=False)
         w, h = int(width), int(height)
         gop = max(1, int(round(float(fps) * gop_seconds)))
@@ -252,10 +251,11 @@ class NvencEncoder:
             cmd += ["-tag:v", "hvc1"]
         if enc.cq_enabled:
             cmd += ["-cq", str(int(enc.cq))]
-        if enc.bitrate_enabled and enc.bitrate > 0:
-            cmd += ["-b:v", f"{int(enc.bitrate)}k"]
-        if enc.maxrate_enabled and enc.maxrate > 0:
-            cmd += ["-maxrate", f"{int(enc.maxrate)}k"]
+        if enc.vbr_enabled:
+            if enc.bitrate > 0:
+                cmd += ["-b:v", f"{int(enc.bitrate)}k"]
+            if enc.maxrate > 0:
+                cmd += ["-maxrate", f"{int(enc.maxrate)}k"]
         if quality_first:
             # Offline-export "always-on" quality flags (deliberately NOT in the preset panel):
             # max spatial/temporal AQ, B-frame references, full lookahead, and the hq tune. Even

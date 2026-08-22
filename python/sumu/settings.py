@@ -58,14 +58,13 @@ EXPORT_DEFAULT_PRESET_INDEX = 0  # fallback index of the "default" preset (singl
 
 # Shipped encode presets (plain JSON-serializable dicts; webstream.encoder.EncodeOptions is the
 # runtime form). One quality-first "自动" preset: HEVC + CQ 33 + audio copy + subtitle, no
-# bitrate/maxrate constraint (quality-driven, bounded only by CQ). CQ / bitrate / maxrate are
-# INDEPENDENT knobs (each gated by its *_enabled flag), matching NVENC's VBR rate control where
-# targetQuality, averageBitRate and maxBitRate coexist. Bitrates are int kbps.
+# bitrate/maxrate constraint (quality-driven, bounded only by CQ). CQ and VBR (bitrate+maxrate
+# together) are INDEPENDENT knobs, matching NVENC's VBR rate control where targetQuality,
+# averageBitRate and maxBitRate coexist. Bitrates are int kbps.
 EXPORT_PRESET_DEFAULTS: list[dict] = [
     {"name": "自动", "codec": "hevc", "preset": "p7",
      "cq_enabled": True, "cq": 33,
-     "bitrate_enabled": False, "bitrate": 0,
-     "maxrate_enabled": False, "maxrate": 0,
+     "vbr_enabled": False, "bitrate": 2000, "maxrate": 2500,
      "audio_copy": True, "audio_bitrate": 256,
      "subtitle": True, "suffix": "_Decensored"},
 ]
@@ -277,10 +276,10 @@ def _coerce_export_preset(p: dict) -> dict:
         "preset": str(p.get("preset") or "p7"),
         "cq_enabled": bool(p.get("cq_enabled", True)),
         "cq": max(0, min(51, cq)),
-        "bitrate_enabled": bool(p.get("bitrate_enabled", False)),
-        "bitrate": _clamp_kbps(p.get("bitrate")),
-        "maxrate_enabled": bool(p.get("maxrate_enabled", False)),
-        "maxrate": _clamp_kbps(p.get("maxrate")),
+        "vbr_enabled": bool(p.get("vbr_enabled",
+            p.get("bitrate_enabled", False) or p.get("maxrate_enabled", False))),
+        "bitrate": _clamp_kbps(p.get("bitrate"), 2000) or 2000,
+        "maxrate": _clamp_kbps(p.get("maxrate"), 2500) or 2500,
         "audio_copy": bool(p.get("audio_copy", True)),
         "audio_bitrate": _clamp_kbps(p.get("audio_bitrate"), 256),
         "subtitle": bool(p.get("subtitle", True)),

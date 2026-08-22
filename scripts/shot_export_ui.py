@@ -33,8 +33,7 @@ def make_preset(name, cq, codec="hevc", preset="p7", bitrate=0, maxrate=0):
     return {
         "name": name, "codec": codec, "preset": preset,
         "cq_enabled": cq is not None, "cq": cq if cq is not None else 0,
-        "bitrate_enabled": bitrate > 0, "bitrate": bitrate,
-        "maxrate_enabled": maxrate > 0, "maxrate": maxrate,
+        "vbr_enabled": bitrate > 0 or maxrate > 0, "bitrate": bitrate, "maxrate": maxrate,
         "audio_copy": True, "audio_bitrate": 256, "subtitle": True,
         "suffix": "_Decensored",
     }

@@ -75,7 +75,7 @@ class TranscodeEngine:
         run finishes, instead of corrupting shared model/cancel state."""
         if encode is None:
             encode = EncodeOptions(codec="h264", preset="p4", cq_enabled=False,
-                                   bitrate_enabled=True, bitrate=_parse_kbps(bitrate),
+                                   vbr_enabled=True, bitrate=_parse_kbps(bitrate), maxrate=0,
                                    audio_copy=False, subtitle=False)
         with self._run_lock:
             return self._run_locked(source, out, mode, encode=encode,

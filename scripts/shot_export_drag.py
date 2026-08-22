@@ -44,8 +44,8 @@ def main():
         "engine_ready": True, "running": False, "clip_length": 120, "global_dir": "E:\\SUMU",
         "default_preset_idx": 0,
         "presets": [{"name": "默认", "codec": "hevc", "preset": "p7", "cq_enabled": True,
-                     "cq": 33, "bitrate_enabled": False, "bitrate": 0, "maxrate_enabled": False,
-                     "maxrate": 0, "audio_copy": True, "audio_bitrate": 256, "subtitle": True,
+                     "cq": 33, "vbr_enabled": False, "bitrate": 2000, "maxrate": 2500,
+                     "audio_copy": True, "audio_bitrate": 256, "subtitle": True,
                      "suffix": "_Decensored"}],
         "items": [mk(1, "aaa"), mk(2, "bbb"), mk(3, "ccc")],
     })

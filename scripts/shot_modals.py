@@ -33,8 +33,7 @@ FRAME = (53, 53, 55)      # kControlBg (white 7%) over kPanelBg -- input frames
 def make_preset(name, cq):
     return {"name": name, "codec": "hevc", "preset": "p7",
             "cq_enabled": cq is not None, "cq": cq or 0,
-            "bitrate_enabled": False, "bitrate": 0,
-            "maxrate_enabled": False, "maxrate": 0,
+            "vbr_enabled": False, "bitrate": 2000, "maxrate": 2500,
             "audio_copy": True, "audio_bitrate": 256, "subtitle": True,
             "suffix": "_Decensored"}
 

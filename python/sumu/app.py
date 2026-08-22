@@ -455,16 +455,16 @@ def main():
             "preset": f"p{q + 1}",
             "cq_enabled": bool(ints.get("export_preset_cq_enabled")),
             "cq": max(0, min(51, int(ints.get("export_preset_cq") or 0))),
-            "bitrate_enabled": bool(ints.get("export_preset_bitrate_enabled")),
-            "bitrate": max(0, int(ints.get("export_preset_bitrate") or 0)),
-            "maxrate_enabled": bool(ints.get("export_preset_maxrate_enabled")),
-            "maxrate": max(0, int(ints.get("export_preset_maxrate") or 0)),
+            "vbr_enabled": bool(ints.get("export_preset_vbr_enabled")),
+            "bitrate": max(0, int(ints.get("export_preset_bitrate") or 2000)),
+            "maxrate": max(0, int(ints.get("export_preset_maxrate") or 2500)),
             "audio_copy": bool(ints.get("export_preset_audio_copy")),
             "audio_bitrate": max(0, int(ints.get("export_preset_audio_bitrate") or 256)),
             "subtitle": bool(ints.get("export_preset_subtitle")),
             "suffix": (ints.get("export_preset_suffix") or "").strip() or "_Decensored",
         }
-        idx = int(ints.get("export_preset_edit_idx") or -2)
+        eidx = ints.get("export_preset_edit_idx")
+        idx = int(eidx) if isinstance(eidx, int) else -2
         if 0 <= idx < len(settings.export_presets):
             settings.export_presets[idx] = preset
         else:
@@ -1083,7 +1083,9 @@ def main():
                     settings.export_clip_length = settings_mod.clamp_export_clip_length(cl)
                     settings_mod.save(settings)
                 if intents.get("export_preset_delete"):
-                    _export_delete_preset(int(intents.get("export_preset_edit_idx") or -1))
+                    pidx = intents.get("export_preset_edit_idx")
+                    if isinstance(pidx, int) and pidx >= 0:
+                        _export_delete_preset(pidx)
                 elif intents.get("export_preset_save"):
                     _export_save_preset(intents)
                 sd = intents.get("export_set_default")
