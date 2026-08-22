@@ -81,10 +81,14 @@ void Player::build_open_prompt_overlay(float top_bar_h){
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground;
-        // (deliberately NOT ImGuiWindowFlags_NoInputs -- this overlay must accept clicks)
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+        // (deliberately NOT ImGuiWindowFlags_NoInputs -- this overlay must accept clicks;
+        //  and NOT NoBackground -- the first screen fills with the standard card color)
     ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, std::max(0.0f, io.DisplaySize.y - top_bar_h)));
+    // Standard card color (kPanelBg) as the first-screen background, one step above the
+    // window background the top bar still shows.
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
     ImGui::Begin("##sumu_open_prompt", nullptr, flags);
 
     const float logo_draw = ui_s(120.0f);
@@ -156,7 +160,9 @@ void Player::build_open_prompt_overlay(float top_bar_h){
 
 
         // Frame the whole compile block (text + button/progress-bar) as one visual unit,
-        // same translucent filled-bg language as the seekbar's hover thumbnail card above.
+        // same translucent filled-bg language as the seekbar's hover thumbnail card above,
+        // plus the settings float's 1px border (kBorderStrong) for separation on the
+        // now-card-colored background.
         // DrawList is screen-space; region_x/cy are window-local (SetCursorPos), so add
         // WindowPos -- without it the box sits top_bar_h above the text/button.
         const float box_pad = ui_s(ui::theme::kPaddingContainer);
@@ -170,6 +176,9 @@ void Player::build_open_prompt_overlay(float top_bar_h){
         box_bg.w = ui::theme::kOverlayBgAlpha; // translucent card, same alpha as the overlay floats
         box_dl->AddRectFilled(box_min, box_max, ui::theme::to_u32(box_bg),
             ui_s(ui::theme::kRadiusWindow));
+        box_dl->AddRect(ImVec2(box_min.x + 0.5f, box_min.y + 0.5f),
+            ImVec2(box_max.x - 0.5f, box_max.y - 0.5f),
+            ui::theme::border_strong_u32(), ui_s(ui::theme::kRadiusWindow), 0, 1.0f);
 
         // Center each wrapped line (ImGui::TextUnformatted is left-aligned in the wrap column).
         bool failed = compile_ui_state_ == 3;
@@ -226,6 +235,7 @@ void Player::build_open_prompt_overlay(float top_bar_h){
     }
 
     ImGui::End();
+    ImGui::PopStyleColor(); // WindowBg (kPanelBg first-screen background)
 }
 
 // Open-URL modal: first-screen "打开 URL" button and top-bar link icon both call
