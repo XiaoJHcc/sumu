@@ -228,14 +228,13 @@ def compile_basicvsrpp_sub_engines(
     fp16: bool,
     model_weights_path: str,
     max_clip_size: int = 60,
-    optimization_level: int = 5,
+    optimization_level: int = 3,
 ) -> dict[str, str]:
     import torch_tensorrt  # type: ignore[import-not-found]
 
     dtype = torch.float16 if fp16 else torch.float32
     engine_dir = _sub_engine_dir(model_weights_path)
     os.makedirs(engine_dir, exist_ok=True)
-    workspace_size = get_workspace_size_bytes()
 
     generator = _get_inference_generator(model)
     mid = generator.mid_channels
@@ -266,6 +265,13 @@ def compile_basicvsrpp_sub_engines(
         inp_f1 = torch.randn(1, 2, FEATURE_SIZE, FEATURE_SIZE, dtype=dtype, device=device)
         inp_f2 = torch.randn(1, 2, FEATURE_SIZE, FEATURE_SIZE, dtype=dtype, device=device)
         inp_bp = torch.randn(1, prefix_channels, FEATURE_SIZE, FEATURE_SIZE, dtype=dtype, device=device)
+        # Recalculate workspace and flush VRAM before each engine: free VRAM can
+        # shrink between engines (fragmentation, prior engine's CUDA context), and
+        # a stale workspace computed against a now-stale free value is what causes
+        # the occasional sysmem spill → 10-100x slowdown.
+        gc.collect()
+        torch.cuda.empty_cache()
+        workspace_size = get_workspace_size_bytes()
         compile_and_save_torchtrt_dynamo(
             module=wrapper,
             inputs=[inp_fp, inp_g1, inp_fn2, inp_g2, inp_fc, inp_f1, inp_f2, inp_bp],
@@ -291,6 +297,9 @@ def compile_basicvsrpp_sub_engines(
             max_shape=[max_clip_size, 3, INPUT_SIZE, INPUT_SIZE],
             dtype=dtype,
         )
+        gc.collect()
+        torch.cuda.empty_cache()
+        workspace_size = get_workspace_size_bytes()
         compile_and_save_torchtrt_dynamo(
             module=wrapper,
             inputs=[dyn_input],
@@ -322,6 +331,9 @@ def compile_basicvsrpp_sub_engines(
             max_shape=[max_clip_size, in_ch, FEATURE_SIZE, FEATURE_SIZE],
             dtype=dtype,
         )
+        gc.collect()
+        torch.cuda.empty_cache()
+        workspace_size = get_workspace_size_bytes()
         compile_and_save_torchtrt_dynamo(
             module=wrapper,
             inputs=[dyn_input],

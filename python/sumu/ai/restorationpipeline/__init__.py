@@ -108,7 +108,7 @@ def compile_and_activate_trt(res_model, mosaic_restoration_model_path: str, devi
     ok = basicvsrpp_startup_policy(
         restoration_model_path=mosaic_restoration_model_path,
         device=device, fp16=fp16, compile_basicvsrpp=True,
-        max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=5,
+        max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=3,
     )
     if not ok:
         logger.warning("On-demand TRT compile did not produce usable engines; staying on PyTorch path.")
@@ -150,7 +150,7 @@ def _maybe_build_trt_split_forward(model, mosaic_restoration_model_path: str, de
             use_trt = basicvsrpp_startup_policy(
                 restoration_model_path=mosaic_restoration_model_path,
                 device=device, fp16=fp16, compile_basicvsrpp=True,
-                max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=5,
+                max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=3,
             )
         else:
             # Load-only: use engines if they already exist, but never compile.

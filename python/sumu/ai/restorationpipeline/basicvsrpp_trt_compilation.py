@@ -35,7 +35,7 @@ def compile_mosaic_restoration_model(
     fp16: bool,
     mosaic_restoration_config_path: str | None = None,
     max_clip_size: int = 60,
-    optimization_level: int = 5,
+    optimization_level: int = 3,
 ) -> bool:
     """Compile BasicVSR++ into 6 TensorRT sub-engines (loop_body × 4 + preprocess + upsample).
 
@@ -91,7 +91,7 @@ def basicvsrpp_startup_policy(
     fp16: bool,
     compile_basicvsrpp: bool,
     max_clip_size: int = 60,
-    optimization_level: int = 5,
+    optimization_level: int = 3,
 ) -> bool:
     """Returns whether runtime should attempt TensorRT execution.
 

@@ -3,7 +3,7 @@
 #
 # One-off build-time measurement harness for the BasicVSR++ TensorRT sub-engines.
 # Compiles all 6 sub-engines with the exact settings the on-demand prompt uses
-# (optimization_level=5, max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, workspace=free*0.95)
+# (optimization_level=3, max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, workspace=free*0.9)
 # so the [trt-timing] lines reflect real player behavior.
 #
 # Takes the restoration weights path as argv[1] so it can point at a throwaway COPY of
@@ -56,7 +56,7 @@ def main() -> int:
     t0 = time.perf_counter()
     compile_basicvsrpp_sub_engines(
         model=model, device=device, fp16=fp16, model_weights_path=weights_path,
-        max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=5,
+        max_clip_size=BASICVSRPP_TRT_MAX_CLIP_SIZE, optimization_level=3,
     )
     dt = time.perf_counter() - t0
     print(f"[measure] done total_wall={dt:.1f}s", flush=True)

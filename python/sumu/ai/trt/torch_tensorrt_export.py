@@ -20,17 +20,15 @@ _torchtrt_muted = False
 # needing more than this is simply dropped (TRT always keeps low-workspace fallbacks, so
 # a small cap never fails the build).
 #
-# Why cap at 3 GiB: measured (scripts/measure_trt_build.py, RTX 4080). Two full builds,
+# Why cap at 2 GiB: measured (scripts/measure_trt_build.py, RTX 4080). Two full builds,
 # one with workspace=13.88GiB (free*0.95 on a clean GPU) and one pinned down to 4.85GiB,
 # came out statistically identical -- 163.9s vs 168.8s total, per-engine within noise --
 # and free-VRAM traces showed the hungriest engine (dynamic preprocess) only ever consumed
-# ~2.4GiB. So a large workspace buys nothing here; it just risks pushing peak usage past
-# free VRAM when compiling under memory pressure (e.g. compile-while-playing, or a 12 GB
-# card with other apps open), which spills TRT's build onto sysmem (PCIe) and slows it
-# 10-100x -- the real cause of the occasional multi-minute-per-engine blowups. Capping at
-# 3 GiB (measured peak ~2.5GiB + margin) keeps build speed identical while bounding peak so
-# smaller/busy GPUs stay in-VRAM. Revisit if a future engine's free-VRAM trace nears this.
-_WORKSPACE_CAP_BYTES = 3 * 1024**3
+# ~2.4GiB *at optimization_level=5*. At level 3, peak is lower. Capping at 2 GiB gives
+# TRT enough room while leaving more headroom so a busy/fragmented GPU never spills the
+# build onto sysmem (PCIe, 10-100x slower). If the cap is too tight for a future engine it
+# just drops a tactic, never fails the build — TRT always keeps low-workspace fallbacks.
+_WORKSPACE_CAP_BYTES = 2 * 1024**3
 
 
 def _mute_torch_tensorrt() -> None:
@@ -122,6 +120,12 @@ def compile_and_save_torchtrt_dynamo(
     ws_gib = int(workspace_size_bytes) / 1024**3
     free_before, _ = torch.cuda.mem_get_info(device)
     kind = "dynamic" if has_dynamic else "static"
+    # Aggressive cache flush before every engine build: PyTorch's caching allocator
+    # may hold fragmented blocks from prior engines / model weights, and TRT sees that
+    # as "VRAM not free" → spills to sysmem (PCIe, 10-100x slower). Emptying the cache
+    # gives TRT the cleanest possible view of free VRAM right before it allocates.
+    if device is not None and device.type == "cuda":
+        torch.cuda.empty_cache()
     t_compile_start = time.perf_counter()
     with torch.cuda.device(device):
         trt_gm = torch_tensorrt.compile(
