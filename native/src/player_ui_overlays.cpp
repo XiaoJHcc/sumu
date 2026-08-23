@@ -97,7 +97,7 @@ void Player::build_open_prompt_overlay(float top_bar_h){
 
     const char* prompt = ui_str_.open_prompt.c_str();
     ImVec2 tsize = ImGui::CalcTextSize(prompt);
-    const float open_btn_w = ui_s(96.0f), open_btn_h = ui_s(ui::theme::kControlHeight);
+    const float open_btn_w = ui_s(120.0f), open_btn_h = ui_s(ui::theme::kControlHeight);
     const float open_btn_gap = ui_s(ui::theme::kSpaceM);
     const float gap = ui_s(ui::theme::kSpaceXL);
     // Single row of four entries: local file (Primary accent) + network URL / web-stream /
@@ -141,17 +141,18 @@ void Player::build_open_prompt_overlay(float top_bar_h){
     const float open_row_x = (io.DisplaySize.x - open_row_w) * 0.5f;
     const float open_row_y = y + tsize.y + gap;
     // "open file" is the primary (accent) action; URL / web-stream / export are secondary.
+    // All four carry their top-bar counterpart's glyph (icon-text button standard).
     ImGui::SetCursorPos(ImVec2(open_row_x, open_row_y));
-    if (ui::Button(ui_str_.open_file.c_str(), ui::ButtonVariant::Primary,
+    if (ui::Button(ui_str_.open_file.c_str(), ui::AppIcon::OpenFile, ui::ButtonVariant::Primary,
             ui::ControlSize::Regular, open_btn_w)) record_open_dialog();
     ImGui::SameLine(0.0f, open_btn_gap);
-    if (ui::Button(ui_str_.open_url.c_str(), ui::ButtonVariant::Secondary,
+    if (ui::Button(ui_str_.open_url.c_str(), ui::AppIcon::OpenUrl, ui::ButtonVariant::Secondary,
             ui::ControlSize::Regular, open_btn_w)) request_open_url_popup();
     ImGui::SameLine(0.0f, open_btn_gap);
-    if (ui::Button(ui_str_.stream_server.c_str(), ui::ButtonVariant::Secondary,
+    if (ui::Button(ui_str_.stream_server.c_str(), ui::AppIcon::WebServer, ui::ButtonVariant::Secondary,
             ui::ControlSize::Regular, open_btn_w)) request_stream_popup();
     ImGui::SameLine(0.0f, open_btn_gap);
-    if (ui::Button(ui_str_.export_video.c_str(), ui::ButtonVariant::Secondary,
+    if (ui::Button(ui_str_.export_video.c_str(), ui::AppIcon::Export, ui::ButtonVariant::Secondary,
             ui::ControlSize::Regular, open_btn_w)) ui_intents_.export_enter = true;
 
     if (show_compile) {

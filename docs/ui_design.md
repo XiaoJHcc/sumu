@@ -219,6 +219,11 @@ enum class ControlSize { Regular, Small };
   用于表单行内的图标按钮（导出路径、web 串流根目录的文件夹选择按钮）。
 - `void DrawIconButtonGlyph(result, AppIcon, tint)`：给无 glyph 版命中区补画图标，
   居中与 7/16 比例与首选重载一致，仅 tint 由调用方决定。
+- `bool Button(label, AppIcon icon, variant = Secondary, size = Regular, width = 0)`
+  **图标+文字按钮标准**（"新增"类动作：新建预设 / 添加文件）：与 `Button` 同一套
+  variant 底色梯度，label 左侧画 lucide glyph（frame 高度的 7/16，同 IconButton；
+  gap = ItemInnerSpacing.x）。width 语义同 `Button`（0 = 贴内容，负数 = 填满剩余）。
+  图集不可用时退化为纯文字。
 
 ### 图标（ui/icons.*，lucide 图集）
 

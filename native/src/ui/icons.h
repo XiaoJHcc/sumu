@@ -25,8 +25,8 @@ namespace ui {
 enum class AppIcon {
     Settings = 0,  // settings-2
     OpenFile,      // folder-open
-    OpenUrl,       // tv-minimal-play
-    WebServer,     // cast
+    OpenUrl,       // link
+    WebServer,     // hard-drive-upload
     Export,        // clapperboard
     WinMinimize,   // minus
     WinMaximize,   // square
@@ -40,6 +40,7 @@ enum class AppIcon {
     Trash,         // trash (export preset/queue delete)
     FolderInput,   // folder-input (export path picker)
     Folder,        // folder (web-server root picker)
+    Plus,          // plus (icon-text button standard: 新建预设/添加文件)
 };
 
 namespace icons {
@@ -48,7 +49,7 @@ namespace icons {
 // of kIconSrcPx (4x the 24px lucide grid, so the 2.5px stroke is a whole 10px -- the runtime
 // area resample always starts from a clean, integer-stroked image).
 inline constexpr int kIconSrcPx = 96;
-inline constexpr int kIconCount = static_cast<int>(AppIcon::Folder) + 1;
+inline constexpr int kIconCount = static_cast<int>(AppIcon::Plus) + 1;
 
 // Records the D3D11 device; per-size glyph textures are built lazily on first draw. Call
 // once after the device exists (Player::ui_init), pair with shutdown() before device

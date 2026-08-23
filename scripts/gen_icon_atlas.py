@@ -35,8 +35,8 @@ OUT = ROOT / "assets" / "generated" / "icons_atlas.rgba"
 ICONS = [
     "settings-2",      # Settings
     "folder-open",     # OpenFile
-    "tv-minimal-play", # OpenUrl
-    "cast",            # WebServer
+    "link",            # OpenUrl
+    "hard-drive-upload", # WebServer
     "clapperboard",    # Export
     "minus",           # WinMinimize
     "square",          # WinMaximize
@@ -50,6 +50,7 @@ ICONS = [
     "trash",           # Trash (export preset/queue delete)
     "folder-input",    # FolderInput (export path picker)
     "folder",          # Folder (web-server root picker)
+    "plus",            # Plus (icon-text button standard: 新建预设/添加文件)
 ]
 
 ICON_PX = 96    # raster size of one glyph (lucide grid is 24 -> 4x, stroke = whole 10px)

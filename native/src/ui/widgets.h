@@ -57,6 +57,14 @@ enum class ControlSize { Regular, Small };
 bool Button(const char* label, ButtonVariant v = ButtonVariant::Secondary,
             ControlSize s = ControlSize::Regular, float width = 0.0f);
 
+// Icon-text button standard: the same Button() (fill ramp / variants / sizes), with a
+// lucide glyph painted left of the label -- the "add" pattern ([＋ 新建预设] /
+// [＋ 添加文件]). Glyph is 7/16 of the frame height (same ratio as IconButton), gap =
+// ItemInnerSpacing.x. width semantics match Button() (0 = fit content, negative = fill
+// remaining). Degrades to plain text-only when the icon atlas is unavailable.
+bool Button(const char* label, AppIcon icon, ButtonVariant v = ButtonVariant::Secondary,
+            ControlSize s = ControlSize::Regular, float width = 0.0f);
+
 // ---- single-line field controls ---------------------------------------------------------------
 // All take the ImGui "label##id" convention. width == 0 fills the remaining content-region
 // width (SetNextItemWidth(-FLT_MIN) equivalent); a visible (non-"##") label part is drawn

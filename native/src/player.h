@@ -419,6 +419,12 @@ public:
 
     bool is_fullscreen() const { return fullscreen_.load(std::memory_order_relaxed); }
 
+    // Leave borderless-fullscreen (no-op when already windowed). Public wrapper over the
+    // private toggle_fullscreen() for WndProc's WM_NCLBUTTONDOWN/HTCAPTION path: a caption
+    // drag while fullscreen must exit FS first, then let DefWindowProc start its native
+    // move-loop on the now-windowed window.
+    void exit_fullscreen(){ if (fullscreen_.load(std::memory_order_relaxed)) toggle_fullscreen(); }
+
     // ---- transport control -------------------------------------------------------------
 
     void play();

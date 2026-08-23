@@ -468,8 +468,8 @@ void Player::build_export_screen(float top_bar_h){
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                 ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
             ImGui::Dummy(ImVec2(0.0f, gap_to_btn));
-            if (ui::Button(ui_str_.export_preset_new.c_str(), ui::ButtonVariant::Secondary,
-                    ui::ControlSize::Regular, -1.0f))
+            if (ui::Button(ui_str_.export_preset_new.c_str(), ui::AppIcon::Plus,
+                    ui::ButtonVariant::Secondary, ui::ControlSize::Regular, -1.0f))
                 open_export_preset_editor(-2);
             ImGui::PopStyleVar();
         }
@@ -658,11 +658,12 @@ void Player::build_export_screen(float top_bar_h){
         const float gap = ui_s(ui::theme::kPaddingContainer);
         const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
         if (ui::Button(ui_str_.export_add_files.empty() ? "Add files" : ui_str_.export_add_files.c_str(),
-                ui::ButtonVariant::Secondary, ui::ControlSize::Regular, half))
+                ui::AppIcon::Plus, ui::ButtonVariant::Secondary, ui::ControlSize::Regular, half))
             ui_intents_.export_add_files = true;
         ImGui::SameLine(0.0f, gap);
         if (!export_engine_ready_) ImGui::BeginDisabled();
-        if (ui::Button(t_start, ui::ButtonVariant::Primary, ui::ControlSize::Regular, half))
+        if (ui::Button(t_start, ui::AppIcon::Export, ui::ButtonVariant::Primary,
+                ui::ControlSize::Regular, half))
             ui_intents_.export_start = true;
         if (!export_engine_ready_) ImGui::EndDisabled();
         ImGui::PopStyleVar();

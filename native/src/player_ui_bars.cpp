@@ -3,13 +3,31 @@
 #include "player.h"
 #include "ui_util.h"
 
+namespace {
+
+// Shared renderer for the bottom bar's two media sliders (seekbar / volume). Visual
+// language mirrors the settings-panel slider_track() in ui/widgets.cpp minus the knob:
+// a thin fully rounded track with a rounded yellow fill (hover/drag brightens it).
+void draw_media_bar(ImDrawList* dl, float x0, float x1, float cy, float t,
+                    float track_h, bool emphasized){
+    const float half = track_h * 0.5f;
+    dl->AddRectFilled(ImVec2(x0, cy - half), ImVec2(x1, cy + half),
+        ui::theme::media_track_u32(), half);
+    const float fill_x = x0 + (x1 - x0) * std::clamp(t, 0.0f, 1.0f);
+    if (fill_x > x0 + track_h) // guard: a hair-thin fill would round into a blob
+        dl->AddRectFilled(ImVec2(x0, cy - half), ImVec2(fill_x, cy + half),
+            emphasized ? ui::theme::media_fill_hover_u32() : ui::theme::media_fill_u32(),
+            half);
+}
+
+} // namespace
+
 Player::IconButtonResult Player::icon_button(const char* str_id, ImVec2 size, bool disabled){
     // Promoted to the design-system widget layer (ui/widgets.cpp). The hover-wash rounding
     // there reads GetStyle().FrameRounding -- apply_theme sets it to kRadiusControl (6px @
     // 96 DPI) and apply_ui_dpi()'s ScaleAllSizes scales it, so it equals the old ui_s(6.0f).
     return ui::IconButton(str_id, size, disabled);
 }
-
 Player::IconButtonResult Player::icon_button(const char* str_id, ImVec2 size, ui::AppIcon icon, bool disabled){
     return ui::IconButton(str_id, size, icon, disabled);
 }
@@ -38,12 +56,12 @@ void Player::build_top_bar(float& out_height){
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, bar_h));
+    // NoBackground: the bg is self-drawn right after Begin() with per-corner rounding --
+    // square TOP corners + rounded BOTTOM corners (WindowRounding is all-four-corners only).
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
-    // Panel tone (theme kPanelBg), one step above the window background, so the chrome
-    // reads as a bar against the video/splash.
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoBackground;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(ui::theme::kSpaceXS), 0.0f));
     // Uniform 2px gap between the bar's buttons (the same kSpaceXS beat as the edge padding
     // and the vertical inset: 36px bar / 32px buttons). Pushed for the whole bar so the bare
@@ -52,6 +70,19 @@ void Player::build_top_bar(float& out_height){
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
         ImVec2(ui_s(ui::theme::kSpaceXS), ImGui::GetStyle().ItemSpacing.y));
     ImGui::Begin("##sumu_top_bar", nullptr, flags);
+
+    { // Bar background: panel tone (theme kPanelBg), one step above the window background so
+      // the chrome reads as a bar against the video/splash. TOP corners are SQUARE -- the
+      // theme's kRadiusWindow rounding there leaves two transparent notches at the screen's
+      // top corners in fullscreen (DWM chrome disabled / DONOTROUND); square corners instead
+      // get clipped by DWM's ~8px window rounding in windowed mode -- both states end up
+      // flush with zero leakage. BOTTOM corners keep the theme rounding.
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetWindowPos();
+        const ImVec2 p1 = ImVec2(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
+        dl->AddRectFilled(p0, p1, ui::theme::panel_bg_u32(), ui_s(ui::theme::kRadiusWindow),
+            ImDrawFlags_RoundCornersBottom);
+    }
 
     const float btn_w = ui_s(ui::theme::kControlHeight); // icon button = control-height square
     const float btn_h = bar_h - ui_s(2.0f * ui::theme::kSpaceXS); // 36 - 2*2 = 32, centered
@@ -207,7 +238,6 @@ void Player::build_top_bar(float& out_height){
 
     ImGui::End();
     ImGui::PopStyleVar(2); // ItemSpacing + WindowPadding
-    ImGui::PopStyleColor(); // WindowBg
 }
 
 // Auto-hides when the mouse leaves the bottom ~15% of the client area (simple mouse-Y-zone
@@ -224,13 +254,27 @@ void Player::build_bottom_bar(){
 
     ImGui::SetNextWindowPos(ImVec2(0, io.DisplaySize.y - bar_h));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, bar_h));
+    // NoBackground: the bg is self-drawn right after Begin() with per-corner rounding --
+    // rounded TOP corners + square BOTTOM corners (WindowRounding is all-four-corners only),
+    // mirroring the top bar's square-top treatment.
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
-    // Match build_status_float(): translucent so the video shows through.
-    ImGui::SetNextWindowBgAlpha(ui::theme::kOverlayBgAlpha);
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoBackground;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(ui::theme::kSpaceXS), 0.0f));
     ImGui::Begin("##sumu_bottom_bar", nullptr, flags);
+
+    { // Bar background: same translucent wash the window bg used to provide
+      // (kWindowBg @ kOverlayBgAlpha, video shows through), but with only the TOP corners
+      // rounded -- square bottom corners sit flush against the window's bottom edge.
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetWindowPos();
+        const ImVec2 p1 = ImVec2(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
+        const ImVec4 bg = ui::theme::kWindowBg; // same translucent wash the window bg used
+        dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32( // to provide (video shows
+            ImVec4(bg.x, bg.y, bg.z, ui::theme::kOverlayBgAlpha)), // through), top corners only
+            ui_s(ui::theme::kRadiusWindow), ImDrawFlags_RoundCornersTop);
+    }
 
     // Row height for every control -- vertically centered, same 2px-inset beat as the title
     // bar (36px bar / 32px controls, theme::kSpaceXS).
@@ -266,11 +310,9 @@ void Player::build_bottom_bar(){
     // being overdrawn.
     const float vol_icon_w = ui_s(ui::theme::kControlHeight); // standard icon-button square
     const float vol_slider_w = ui_s(70.0f);
-    const float vol_knob_r = ui_s(5.0f);
-    // Right-edge clearance: kSpaceM (8px) of clear space past the knob's outer edge. The
-    // knob overhangs the track end by its radius and the window padding eats kSpaceXS, so
-    // the reserve is knob_r + (kSpaceM - kSpaceXS).
-    const float right_pad = vol_knob_r + ui_s(ui::theme::kSpaceM - ui::theme::kSpaceXS);
+    // Right-edge clearance: kSpaceM (8px) of clear space past the track's end, minus the
+    // window padding already eaten (kSpaceXS).
+    const float right_pad = ui_s(ui::theme::kSpaceM - ui::theme::kSpaceXS);
     float vol_ctrl_w = has_audio()
         ? (ImGui::GetStyle().ItemSpacing.x + vol_icon_w + ImGui::GetStyle().ItemSpacing.x + vol_slider_w + right_pad)
         : right_pad;
@@ -299,14 +341,13 @@ void Player::build_bottom_bar(){
         seekbar_last_seek_frame_ = -1; // next press always counts as a fresh click
     }
 
+    // Slider-language rendering (the settings-panel 拉条 look): thin rounded track +
+    // rounded yellow fill + white outlined knob; hover/drag brightens the fill.
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float track_half = ui_s(2.0f);
-    dl->AddRectFilled(ImVec2(x0, bar_y - track_half), ImVec2(x1, bar_y + track_half),
-        ui::theme::media_track_u32());
-    float played_x = sumu_ui::seekbar_x_for_frame(current_frame(), x0, x1, fc);
-    dl->AddRectFilled(ImVec2(x0, bar_y - track_half), ImVec2(played_x, bar_y + track_half),
-        ui::theme::media_fill_u32());
-    dl->AddCircleFilled(ImVec2(played_x, bar_y), ui_s(5.0f), ui::theme::icon_color_u32());
+    const float media_track_h = ui_s(ui::theme::kSliderTrackH);
+    const float played_x = sumu_ui::seekbar_x_for_frame(current_frame(), x0, x1, fc);
+    draw_media_bar(dl, x0, x1, bar_y, (played_x - x0) / std::max(x1 - x0, 1.0f),
+        media_track_h, track_hovered || track_active);
 
     if (track_hovered || track_active) {
         float hx = std::clamp(ImGui::GetIO().MousePos.x, x0, x1);
@@ -369,13 +410,9 @@ void Player::build_bottom_bar(){
                 set_volume(std::clamp(t, 0.0f, 1.0f));
             }
             float vol = get_volume();
-            float filled_x = vx0 + (vx1 - vx0) * std::clamp(vol, 0.0f, 1.0f);
             ImDrawList* vdl = ImGui::GetWindowDrawList();
-            vdl->AddRectFilled(ImVec2(vx0, vbar_y - track_half), ImVec2(vx1, vbar_y + track_half),
-                ui::theme::media_track_u32());
-            vdl->AddRectFilled(ImVec2(vx0, vbar_y - track_half), ImVec2(filled_x, vbar_y + track_half),
-                ui::theme::media_fill_u32());
-            vdl->AddCircleFilled(ImVec2(filled_x, vbar_y), vol_knob_r, ui::theme::icon_color_u32());
+            draw_media_bar(vdl, vx0, vx1, vbar_y, std::clamp(vol, 0.0f, 1.0f),
+                media_track_h, vs_active || ImGui::IsItemHovered());
         }
     }
 

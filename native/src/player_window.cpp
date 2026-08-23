@@ -533,6 +533,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN) return 0; // swallow Alt+Enter, no exclusive fullscreen here
         break;
+    // ---- fullscreen caption drag -> windowed -------------------------------------------------------------------
+    // While borderless-fullscreen the revealed top bar still reports HTCAPTION (WM_NCHITTEST),
+    // so a drag would slide the monitor-sized FS window around. Instead: leave fullscreen
+    // FIRST (toggle_fullscreen() restores the saved pre-FS placement synchronously -- flag,
+    // style and SetWindowPos all complete inside this handler), then fall through to
+    // DefWindowProc so the OS move-loop starts right here on the already-windowed window --
+    // the drag continues seamlessly with no second click. If the pre-FS placement was
+    // maximized, Windows' native "drag restores a maximized window" takes over from there.
+    case WM_NCLBUTTONDOWN:
+        if (wp == HTCAPTION && self && self->is_fullscreen()) self->exit_fullscreen();
+        break;
     // ---- borderless custom-caption (see Player::point_in_caption_drag()'s header comment) --
     // WS_OVERLAPPEDWINDOW/WS_CAPTION/WS_THICKFRAME stay ON the window (unlike a from-scratch
     // popup-style borderless window) -- this pair just hollows out the non-client area so the

@@ -61,10 +61,13 @@ inline constexpr ImVec4 kHoverFill{ 1.0f, 1.0f, 1.0f, 0.12f };
 inline constexpr ImVec4 kIconColor{ 230.0f / 255.0f, 230.0f / 255.0f, 230.0f / 255.0f, 1.0f };
 inline constexpr ImVec4 kIconColorDim{ 110.0f / 255.0f, 110.0f / 255.0f, 110.0f / 255.0f, 1.0f };
 
-// Hand-drawn media bars (seekbar / volume): warm-yellow played fill (200,200,60) on a
-// quiet gray track (90,90,90) -- established look, values frozen from the original code.
-inline constexpr ImVec4 kMediaFill{ 200.0f / 255.0f, 200.0f / 255.0f, 60.0f / 255.0f, 1.0f };
-inline constexpr ImVec4 kMediaTrack{ 90.0f / 255.0f, 90.0f / 255.0f, 90.0f / 255.0f, 1.0f };
+// Hand-drawn media bars (seekbar / volume): modern warm-yellow played fill (#FACC15)
+// on a quiet translucent-white track -- rendered with the macOS slider language of
+// ui/widgets.cpp (thin fully-rounded track, white outlined knob). Hover/drag brightens
+// the fill one step (#FFDD57).
+inline constexpr ImVec4 kMediaFill{ 250.0f / 255.0f, 204.0f / 255.0f, 21.0f / 255.0f, 1.0f };
+inline constexpr ImVec4 kMediaFillHover{ 255.0f / 255.0f, 221.0f / 255.0f, 87.0f / 255.0f, 1.0f };
+inline constexpr ImVec4 kMediaTrack{ 1.0f, 1.0f, 1.0f, 0.18f };
 
 // Alpha for translucent overlay windows (status float / bottom bar / settings panel)
 // fed to ImGui::SetNextWindowBgAlpha so the video shows through.
@@ -97,6 +100,7 @@ inline ImU32 hover_fill_u32() { return to_u32(kHoverFill); }
 inline ImU32 icon_color_u32() { return to_u32(kIconColor); }
 inline ImU32 icon_color_dim_u32() { return to_u32(kIconColorDim); }
 inline ImU32 media_fill_u32() { return to_u32(kMediaFill); }
+inline ImU32 media_fill_hover_u32() { return to_u32(kMediaFillHover); }
 inline ImU32 media_track_u32() { return to_u32(kMediaTrack); }
 
 // ---- metrics (96-DPI bases) ---------------------------------------------------------------

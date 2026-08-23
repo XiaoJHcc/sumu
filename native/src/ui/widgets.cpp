@@ -57,44 +57,161 @@ ImVec4 faded(ImVec4 c){
 
 // ---- Button --------------------------------------------------------------------------------
 
+// Shared fill-ramp resolution for both Button forms: returns the Button/Text colors for
+// one variant (fill, hovered fill, active fill, label color).
+struct ButtonRamp { ImVec4 bg, bg_hover, bg_active, text; };
+static ButtonRamp button_ramp(ButtonVariant v){
+    switch (v) {
+    case ButtonVariant::Primary:
+        return { theme::kAccent, theme::kAccentHover, theme::kAccentActive, theme::kText };
+    case ButtonVariant::Danger:
+        return { white(0.06f), white(0.10f), white(0.14f), theme::kError };
+    case ButtonVariant::Secondary:
+    default:
+        return { theme::kButtonBg, white(0.12f), white(0.16f), theme::kText };
+    }
+}
+
+// Glyph tint per variant (Secondary keeps the quiet icon color; Primary/Danger tint the
+// glyph like their label).
+static ImVec4 button_icon_tint(ButtonVariant v){
+    switch (v) {
+    case ButtonVariant::Danger:   return theme::kError;
+    case ButtonVariant::Primary:  return theme::kText;
+    case ButtonVariant::Secondary:
+    default:                      return theme::kIconColor;
+    }
+}
+
+// ABSOLUTE vertical centering of button-label INK. ImGui centers the font's line box
+// (ascent+descent); the descent slack below the baseline makes ink sit above the true
+// center -- invisible next to other text, but exposed once geometrically centered atlas
+// glyphs share the button (measured: CJK labels sat 2 logical px high). Anchor the
+// midpoint of THE LABEL'S OWN ink band (min Y0 .. max Y1 over its glyphs -- CJK and
+// Latin bands differ, so the label itself is the only reliable source) onto the rect's
+// center. Result rounds to whole physical pixels because glyph quads are pixel-snapped
+// at render time (IM_TRUNC).
+static float centered_text_y(float min_y, float max_y, const char* text, const char* text_end){
+    const float center = (min_y + max_y) * 0.5f;
+    ImFontBaked* baked = ImGui::GetFontBaked();
+    const float k = ImGui::GetFontSize() / baked->Size; // layout px per baked metric px
+    float y0 = FLT_MAX, y1 = -FLT_MAX;
+    // Minimal UTF-8 decode (this layer stays public-API-only, so no ImTextCharFromUtf8).
+    for (const char* s = text; s < text_end;) {
+        const unsigned char b = static_cast<unsigned char>(*s);
+        unsigned int c = b;
+        int len = 1;
+        if (b >= 0xF0 && s + 3 < text_end) { c = ((b & 0x07u) << 18); len = 4; }
+        else if (b >= 0xE0 && s + 2 < text_end) { c = ((b & 0x0Fu) << 12); len = 3; }
+        else if (b >= 0xC0 && s + 1 < text_end) { c = ((b & 0x1Fu) << 6); len = 2; }
+        for (int i = 1; i < len; ++i) c |= (static_cast<unsigned char>(s[i]) & 0x3Fu) << (6 * (len - 1 - i));
+        s += len;
+        const ImFontGlyph* g = baked->FindGlyphNoFallback(static_cast<ImWchar>(c));
+        if (!g || !g->Visible) continue;
+        y0 = std::min(y0, g->Y0);
+        y1 = std::max(y1, g->Y1);
+    }
+    const float band_mid = (y0 <= y1) ? (y0 + y1) * 0.5f * k : (max_y - min_y) * 0.5f;
+    return std::round(center - band_mid);
+}
+
+// Shared self-draw body for both Button forms: hit area + variant fill ramp + label.
+// Replaces the stock ImGui::Button path so the label placement follows the absolute
+// centering standard above (stock rendering centers the ascent/descent line box instead
+// of the ink -- see centered_text_y).
+static bool draw_button_body(const char* label, ButtonVariant v, const ImVec2& size,
+                             bool small_pad_pushed){
+    ImGui::PushID(label);
+    const bool clicked = ImGui::InvisibleButton("##btn", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImGui::PopID();
+
+    const ButtonRamp r = button_ramp(v);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 pmin = ImGui::GetItemRectMin();
+    dl->AddRectFilled(pmin, ImVec2(pmin.x + size.x, pmin.y + size.y),
+        theme::to_u32(faded(active ? r.bg_active : hovered ? r.bg_hover : r.bg)),
+        ImGui::GetStyle().FrameRounding);
+
+    const LabelParts lp = split_label(label);
+    const float text_w = ImGui::CalcTextSize(lp.text, lp.text_end).x;
+    // Horizontal centering matches the stock ButtonTextAlign (0.5, 0.5); vertical follows
+    // the absolute ink-centering standard (centered_text_y).
+    const float tx = pmin.x + std::max(0.0f, (size.x - text_w) * 0.5f);
+    const float ty = centered_text_y(pmin.y, pmin.y + size.y, lp.text, lp.text_end);
+    dl->AddText(ImVec2(tx, ty), theme::to_u32(faded(r.text)), lp.text, lp.text_end);
+
+    if (small_pad_pushed) ImGui::PopStyleVar(); // FramePadding (Small size)
+    return clicked;
+}
+
 bool Button(const char* label, ButtonVariant v, ControlSize s, float width){
-    int pushed_cols = 0;
+    const float dpi = ui_scale();
     int pushed_vars = 0;
     if (s == ControlSize::Small) {
-        const float dpi = ui_scale(); // (8,4) is a 96-DPI base value; scale like everything else
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * dpi, 4.0f * dpi));
         ++pushed_vars;
     }
-    switch (v) {
-    case ButtonVariant::Primary:
-        // Chip background is the SOLID fill blue (kAccent and its hover/active steps) --
-        // the same value the slider fill and checkbox on-state render, so all three read
-        // as one blue (a translucent fill over the dark panel would mix down to a murkier
-        // tone). The label is plain white. Borderless.
-        ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::kAccentHover);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::kAccentActive);
-        ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
-        pushed_cols = 4;
-        break;
-    case ButtonVariant::Danger:
-        ImGui::PushStyleColor(ImGuiCol_Button, white(0.06f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, white(0.10f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, white(0.14f));
-        ImGui::PushStyleColor(ImGuiCol_Text, theme::kError);
-        pushed_cols = 4;
-        break;
-    case ButtonVariant::Secondary:
-    default:
-        // Neutral fill, one step under the FrameBg hover ramp; borderless.
-        ImGui::PushStyleColor(ImGuiCol_Button, theme::kButtonBg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, white(0.12f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, white(0.16f));
-        pushed_cols = 3;
-        break;
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const LabelParts lp = split_label(label);
+    const float frame_h = ImGui::GetFrameHeight();
+
+    // width semantics match Button()/CalcItemSize: 0 = fit content, negative = fill.
+    float w = st.FramePadding.x * 2.0f + ImGui::CalcTextSize(lp.text, lp.text_end).x;
+    if (width < 0.0f) w = std::max(4.0f, ImGui::GetContentRegionAvail().x + width);
+    else if (width > 0.0f) w = width;
+
+    return draw_button_body(label, v, ImVec2(w, frame_h), pushed_vars > 0);
+}
+bool Button(const char* label, AppIcon icon, ButtonVariant v, ControlSize s, float width){
+    const float dpi = ui_scale();
+    int pushed_vars = 0;
+    if (s == ControlSize::Small) {
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * dpi, 4.0f * dpi));
+        ++pushed_vars;
     }
-    const bool clicked = ImGui::Button(label, ImVec2(width, 0.0f));
-    ImGui::PopStyleColor(pushed_cols);
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const LabelParts lp = split_label(label);
+    const float frame_h = ImGui::GetFrameHeight();
+    // Same 7/16 glyph ratio as IconButton (whole px at 100/150/200% DPI).
+    const float g = std::floorf(frame_h * 0.4375f);
+    const float text_w = ImGui::CalcTextSize(lp.text, lp.text_end).x;
+    const bool has_icon = icons::available();
+    const float block_w = (has_icon ? g + st.ItemInnerSpacing.x : 0.0f) + text_w;
+
+    // width semantics match Button()/CalcItemSize: 0 = fit content, negative = fill.
+    float w = st.FramePadding.x * 2.0f + block_w;
+    if (width < 0.0f) w = std::max(4.0f, ImGui::GetContentRegionAvail().x + width);
+    else if (width > 0.0f) w = width;
+
+    ImGui::PushID(label);
+    const bool clicked = ImGui::InvisibleButton("##btn_icon_text", ImVec2(w, frame_h));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImGui::PopID();
+
+    const ButtonRamp r = button_ramp(v);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 pmin = ImGui::GetItemRectMin();
+    dl->AddRectFilled(pmin, ImVec2(pmin.x + w, pmin.y + frame_h),
+        theme::to_u32(faded(active ? r.bg_active : hovered ? r.bg_hover : r.bg)),
+        st.FrameRounding);
+
+    // Content block (glyph + gap + text) is CENTERED horizontally -- the standard is
+    // used on fixed/fill widths ([＋ 新建预设] spans its column), where left-aligned
+    // content would read off-balance. The label follows the absolute ink-centering
+    // standard (centered_text_y), so text and glyph sit on one visual midline.
+    float x = pmin.x + std::max(0.0f, (w - block_w) * 0.5f);
+    if (has_icon) {
+        const float gy = pmin.y + (frame_h - g) * 0.5f;
+        icons::draw(dl, ImVec2(x, gy), ImVec2(x + g, gy + g), icon,
+            theme::to_u32(faded(button_icon_tint(v))));
+        x += g + st.ItemInnerSpacing.x;
+    }
+    dl->AddText(ImVec2(x, centered_text_y(pmin.y, pmin.y + frame_h, lp.text, lp.text_end)),
+        theme::to_u32(faded(r.text)), lp.text, lp.text_end);
+
     if (pushed_vars) ImGui::PopStyleVar(pushed_vars);
     return clicked;
 }
