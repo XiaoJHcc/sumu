@@ -13,24 +13,32 @@
 </p>
 
 <p align="center">
-  Designed from the ground up for play-while-restoring — hardware decode, native D3D11 present, AI kept on the GPU end to end, pipeline always warm
+  Designed from the ground up for play-while-restore — hardware decode, native D3D11 present, AI kept on the GPU end to end, pipeline always warm
 </p>
 
 ---
 
 ## The Idea
 
+Mosaic-removal AI is heavy — real-time restoration is genuinely hard. Most tools settle for one of two workarounds: processing everything offline into an exported file, or simply sitting and waiting whenever the GPU can't keep up.
+
+Sumu flips the script:
+
 **Ship a real player first. Bolt AI onto it second.**
 
-Mosaic-removal AI is expensive. Trying to restore while the video plays usually means either falling behind or freezing the frame. Most tools either bake everything offline into an export, or simply wait whenever the GPU can't keep up.
+**Playback always comes first. AI does what it can in the background. The video never stops for AI.**
 
-Sumu inverts that priority stack:
+Above all, it has to be a player — with or without AI, the video must simply play smoothly. AI is attached second, as a background path that works ahead to restore the content: the decensored frame swaps in the moment it's ready, and the video falls back to the original when it isn't. **Playback is never interrupted.**
 
-**Playback always wins. AI does what it can in the background. Video never stalls for AI.**
+> You still need a powerful GPU, though — otherwise you'll keep falling back to the original.
 
-Get the player right first — with or without AI, video has to stay smooth and seeking has to stay snappy. Then hang AI off as a separate background path that tries to restore whatever is currently on screen. When a restored frame is ready, it swaps in; when it isn't, the original keeps playing. **Playback is never interrupted.**
 
-> You still need a powerful GPU — otherwise you'll fall back to the original a lot.
+## Features
+
+- **Real-time playback** — open a local video and it plays instantly. AI mosaic removal keeps working in the background: the moment a frame is processed, the decensored image is what you see.
+- **Network playback** — paste an HTTP video link and play it online directly, with no need to download the file first.
+- **Web streaming server** — stream decensored videos to phones and tablets on the same LAN and watch them right in a browser.
+- **Offline export** — export the decensored result as a video file, with custom quality presets and a batch queue for processing many videos.
 
 
 ## Hardware Requirements
@@ -68,7 +76,8 @@ These are non-negotiable for sumu (full design notes in [DESIGN.md](DESIGN.md)):
 - **Language**: **C++ (VS2022 BuildTools) + pybind11** — native core exposed to Python for orchestration.
 - **Decode**: baseline is **D3D11 hardware decode** (FFmpeg-d3d11va) → NV12 texture → shader → present, no CUDA on the baseline path; the AI path is NVDEC → torch, joined by **zero-copy D3D11↔CUDA interop**.
 - **Audio**: WASAPI, a **pure subordinate clock** driven by the QPC master — never disturbs present pacing.
-- **Split of labor**: native core (decode + present + interop + ready-map + audio) + Python-side AI orchestration (detect / restore / schedule).
+- **Transcode / streaming**: windowless headless D3D11 hardware decode → AI removal → **NVENC** (HLS / MP4). An NVENC-enabled `ffmpeg.exe` on PATH is a soft dependency for web streaming / offline export / thumbnails (`ffprobe.exe` already was).
+- **Split of labor**: native core (decode + present + interop + ready-map + audio) + Python-side orchestration (detect / restore / schedule) and transcode (`python/sumu/webstream`: headless decode + DecensorProcessor + encoder + server).
 
 
 ## Build & Run
@@ -84,6 +93,8 @@ These are non-negotiable for sumu (full design notes in [DESIGN.md](DESIGN.md)):
 4. **Model weights**: place the restore model (≈75MB) and detect model (≈6MB) under `model_weights/`.
 5. **Run**: VSCode task `sumu: run (dev)`, or `.venv\Scripts\python.exe scripts/play.py`.
 
+> Plain local real-time playback only needs steps 1–5; **Web streaming / offline export** additionally need an NVENC-enabled `ffmpeg.exe` on PATH (`ffprobe.exe` was already a soft dependency).
+
 ### Package for distribution (Windows onedir)
 
 ```powershell
@@ -98,7 +109,7 @@ Output lands in `dist/sumu/` (`sumu.exe` + `_internal/` + `model_weights/`, meas
 TRT engines are bound to GPU architecture + TensorRT version + precision + OS, so **they cannot be redistributed across machines**. The package therefore ships no prebuilt engines; each machine compiles its own on first use:
 
 - Until compilation finishes, mosaic removal falls back to eager PyTorch (works, ~3× slower);
-- On the first screen, under "Open file", a "Compile acceleration engine" prompt appears — click it to compile in the background (several minutes). When done, the engine hot-swaps in and is cached to disk for the next run;
+- On the first screen, under "Open file", a "Compile acceleration engine" prompt appears — click it to compile in the background (~2 min). When done, the engine hot-swaps in and is cached to disk for the next run;
 - Non-NVIDIA / non-fp16 machines never trigger compilation and always stay on eager.
 
 ## License
