@@ -33,29 +33,26 @@ os.environ.setdefault("YOLO_VERBOSE", "false")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "WARNING")
 
 # ── model weights directory ─────────────────────────────────────────────────────
-# Per the sumu port plan, weights are referenced from lada by path and NOT copied
-# into sumu (they are large + gitignored). Resolution order:
-#   1) SUMU_MODEL_WEIGHTS_DIR  2) LADA_MODEL_WEIGHTS_DIR
+# sumu is self-contained; weights live under a `model_weights/` directory. Resolution order:
+#   1) SUMU_MODEL_WEIGHTS_DIR  2) LADA_MODEL_WEIGHTS_DIR (legacy compat)
 #   3) (frozen only) <dir of the built exe>/model_weights
-#   4) lada-realtime/model_weights next to this checkout  5) "model_weights" (CWD-relative)
+#   4) "model_weights" (CWD-relative)
 # Override via env for other layouts.
 def _default_model_weights_dir() -> str:
     for var in ("SUMU_MODEL_WEIGHTS_DIR", "LADA_MODEL_WEIGHTS_DIR"):
         if var in os.environ and os.environ[var]:
             return os.environ[var]
     # Frozen (PyInstaller) builds: __file__ lives under the _MEIPASS bundle temp dir, so
-    # the sibling-repo computation below is meaningless. Packaging ships weights in a
-    # `model_weights/` folder next to the built executable instead (writable, since
-    # TensorRT engine caches get written under <weights_dir>/<stem>_sub_engines/). Return
-    # this path unconditionally when frozen -- it's the intended canonical location
-    # regardless of whether weights are placed there yet; callers already check per-file
-    # existence (ModelFiles._get_well_known_* guard with os.path.exists).
+    # CWD is meaningless. Packaging ships weights in a `model_weights/` folder next to
+    # the built executable instead (writable, since TensorRT engine caches get written
+    # under <weights_dir>/<stem>_sub_engines/). Return this path unconditionally when
+    # frozen -- it's the intended canonical location regardless of whether weights are
+    # placed there yet; callers already check per-file existence (ModelFiles._get_well_known_*
+    # guard with os.path.exists).
     if getattr(sys, "frozen", False):
         return os.path.join(os.path.dirname(sys.executable), "model_weights")
-    # <repo parent>/lada-realtime/model_weights (sumu and lada-realtime are siblings)
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    sibling = os.path.join(os.path.dirname(here), "lada-realtime", "model_weights")
-    return sibling if os.path.isdir(sibling) else "model_weights"
+    # Dev mode: CWD-relative "model_weights" (sumu is self-contained, no external sibling repo).
+    return "model_weights"
 
 MODEL_WEIGHTS_DIR = _default_model_weights_dir()
 

@@ -77,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1 -FastFreeze
   - `lada_mosaic_detection_model_v4_fast.pt`（≈6MB）
 - **TRT 引擎不随包分发**——`hardware_compatible=False` 的引擎只在编译它的那套 GPU 架构 / TRT 版本 / 精度 / OS 上能反序列化（文件名 tag 如 `sm89.trt1012.fp16.win`），预编译引擎只对同款硬件有用。故改为**每台机器首次运行自行编译**：启动 warmup 走 load-only（`build_models(..., allow_trt_compile=False)`，引擎在就用、不在就 eager），首屏「打开文件」按钮下方给出「编译加速引擎」提示，用户点击后后台编译（数分钟，进度条原位显示），编完**热切换立即生效**、且落盘缓存供下次 load-only 直接命中（届时提示不再出现）。编译流程见 `python/sumu/app.py` 的 compile 状态机 + `restorationpipeline.compile_and_activate_trt`。
 - 冒烟只验证 `== env == / == load_models == / (== player.open ==)` 三标记 + 无 Traceback；load-only 不再编译，`load_models` 很快，不再断言「引擎复用」时长。
-- **权重源目录解析顺序**（其他机器/团队成员构建时不用改脚本）：`-WeightsSrc` 显式参数 → `$env:SUMU_WEIGHTS_SRC` 环境变量（`setx SUMU_WEIGHTS_SRC "C:\path\to\model_weights"` 设一次，跨会话生效）→ 本仓库原开发机路径 `D:/Git/lada-realtime/model_weights` 兜底。缺文件时报错会指出具体缺哪个文件。
+- **权重源目录解析顺序**（其他机器/团队成员构建时不用改脚本）：`-WeightsSrc` 显式参数 → `$env:SUMU_WEIGHTS_SRC` 环境变量（`setx SUMU_WEIGHTS_SRC "C:\path\to\model_weights"` 设一次，跨会话生效）→ `$env:LADA_MODEL_WEIGHTS_DIR`（legacy 兼容）。三者均未设置时脚本直接报错退出——sumu 自包含，不假定任何外部仓库布局。缺文件时报错会指出具体缺哪个文件。
 
 ## AGPL-3.0 许可证随包
 

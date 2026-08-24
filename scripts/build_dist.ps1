@@ -18,9 +18,11 @@
 #   2. $env:SUMU_WEIGHTS_SRC if set (setx SUMU_WEIGHTS_SRC "C:\path\to\model_weights" once, persists
 #      across sessions) -- lets each machine/teammate configure this without editing the script or
 #      remembering a flag every run.
-#   3. the original dev machine's path, as a last-resort fallback for this repo's own history.
+#   3. $env:LADA_MODEL_WEIGHTS_DIR (legacy compat, same semantics as SUMU_WEIGHTS_SRC)
+# If none of the above resolves, the script fails with a clear message -- sumu is self-contained
+# and does not assume any external repo layout.
 param(
-    [string]$WeightsSrc = $(if ($env:SUMU_WEIGHTS_SRC) { $env:SUMU_WEIGHTS_SRC } else { "D:/Git/lada-realtime/model_weights" }),
+    [string]$WeightsSrc = $(if ($env:SUMU_WEIGHTS_SRC) { $env:SUMU_WEIGHTS_SRC } elseif ($env:LADA_MODEL_WEIGHTS_DIR) { $env:LADA_MODEL_WEIGHTS_DIR } else { "" }),
     [switch]$SkipNative,
     [switch]$SkipSmoke,
     [switch]$FastFreeze
@@ -145,6 +147,9 @@ if ($FastFreeze) {
 
 
 # --- 4. stage model weights next to the exe ---------------------------------
+if (-not $WeightsSrc) {
+    Fail "no weights source specified. Use -WeightsSrc <dir> or set `$env:SUMU_WEIGHTS_SRC (e.g. `"setx SUMU_WEIGHTS_SRC `"C:\path\to\model_weights`"`" once, then reopen the terminal)."
+}
 Write-Host "== [4/5] staging model weights from $WeightsSrc ==" -ForegroundColor Cyan
 $weightsDst = Join-Path $distDir "model_weights"
 if (-not (Test-Path $weightsDst)) {

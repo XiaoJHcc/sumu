@@ -36,8 +36,8 @@ python/sumu/ai/
     __init__.py torch_tensorrt_export.py   # 项5：底层 dynamo 编译/加载 helper（照搬）
 ```
 
-**权重不入库**：`sumu.ai.MODEL_WEIGHTS_DIR` 默认解析到同级 `../lada-realtime/model_weights`
-（可用 `SUMU_MODEL_WEIGHTS_DIR` / `LADA_MODEL_WEIGHTS_DIR` 覆盖）。本次用
+**权重不入库**：`sumu.ai.MODEL_WEIGHTS_DIR` 默认解析到 CWD 下 `model_weights/`
+（可用 `SUMU_MODEL_WEIGHTS_DIR` / `LADA_MODEL_WEIGHTS_DIR` 覆盖；frozen 态解析到 `<exe>/model_weights`）。本次用
 `lada_mosaic_restoration_model_generic_v1.2.pth` + `lada_mosaic_detection_model_v4_fast.pt`。
 
 ## 2. 依赖装配（步骤0，最大风险 —— 已解决）

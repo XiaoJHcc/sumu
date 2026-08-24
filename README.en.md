@@ -84,33 +84,19 @@ These are non-negotiable for sumu (full design notes in [DESIGN.md](DESIGN.md)):
 
 **Reference machine (the sole benchmark for all measurements)**: RTX 4080 · 16GB · Win11 · 4K@150Hz · driver 610.47 · Python 3.13.6 · torch 2.8.0+cu128 · VS2022 BuildTools · CUDA Toolkit 12.8.
 
-### Run from source (dev)
+### Build & Run
 
 1. **Native core**: `native/build.bat` (needs VS2022 BuildTools) → produces the pyd + FFmpeg DLLs.
 2. **Python deps**: set up `.venv`, with torch on cu128.
    > The developer uses Chinese mirrors (NJU for cu128, Tsinghua for PyPI) out of habit. Non-Chinese developers should switch back to the official PyPI / PyTorch indexes.
 3. **Third-party patches**: `bash scripts/apply_patches.sh` (runtime patches for ultralytics / mmengine).
-4. **Model weights**: place the restore model (≈75MB) and detect model (≈6MB) under `model_weights/`.
-5. **Run**: VSCode task `sumu: run (dev)`, or `.venv\Scripts\python.exe scripts/play.py`.
+4. **Model weights**: download `lada_mosaic_restoration_model_generic_v1.2.pth` and `lada_mosaic_detection_model_v4_fast.pt` from [lada HuggingFace](https://huggingface.co/ladaapp/lada) and place them under `model_weights/`.
+5. **Run**: VSCode task `sumu: run (dev)`, or `.venv\Scripts\python.exe scripts/play.py`. On the first run without TRT engines, falls back to eager; a compile prompt appears on the first screen.
+6. **Package for distribution**: `powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1`. Outputs `dist/sumu/` (≈6.9GB, without TRT engines). `-SkipNative` / `-FastFreeze` options are documented in [docs/packaging.md](docs/packaging.md).
 
 > Plain local real-time playback only needs steps 1–5; **Web streaming / offline export** additionally need an NVENC-enabled `ffmpeg.exe` on PATH (`ffprobe.exe` was already a soft dependency).
 
-### Package for distribution (Windows onedir)
-
-```powershell
-# One shot: native build -> third-party patches -> PyInstaller freeze -> assemble weights -> smoke test
-powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1
-```
-
-Output lands in `dist/sumu/` (`sumu.exe` + `_internal/` + `model_weights/`, measured ≈6.9GB without TRT engines). `-SkipNative` / `-FastFreeze` incremental options and known pitfalls are in [docs/packaging.md](docs/packaging.md).
-
-### TensorRT engines are not shipped
-
-TRT engines are bound to GPU architecture + TensorRT version + precision + OS, so **they cannot be redistributed across machines**. The package therefore ships no prebuilt engines; each machine compiles its own on first use:
-
-- Until compilation finishes, mosaic removal falls back to eager PyTorch (works, ~3× slower);
-- On the first screen, under "Open file", a "Compile acceleration engine" prompt appears — click it to compile in the background (~2 min). When done, the engine hot-swaps in and is cached to disk for the next run;
-- Non-NVIDIA / non-fp16 machines never trigger compilation and always stay on eager.
+> **TensorRT engines are not shipped**: engines are bound to GPU architecture + TRT version + precision + OS and cannot be redistributed across machines. The package ships no prebuilt engines; each machine compiles its own on first use — falls back to eager (~3× slower) until then, a "Compile acceleration engine" prompt appears on the first screen, hot-swaps in on completion and is cached to disk. Non-NVIDIA / non-fp16 machines never trigger compilation and always stay on eager.
 
 ## License
 

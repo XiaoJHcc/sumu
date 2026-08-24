@@ -3,8 +3,7 @@
 #
 # Proves both branches of sumu.ai._default_model_weights_dir() without importing torch:
 #   - frozen  : sys.frozen=True + sys.executable set -> <exe dir>/model_weights
-#   - dev     : sys.frozen absent -> sibling lada-realtime/model_weights (if it exists)
-#               else the CWD-relative "model_weights" fallback
+#   - dev     : sys.frozen absent -> CWD-relative "model_weights"
 # MODEL_WEIGHTS_DIR is cached at import time, so we call the resolver function directly
 # under each controlled sys/env state rather than re-importing the module.
 import importlib
@@ -55,10 +54,8 @@ finally:
 _clear_env()
 if hasattr(sys, "frozen"):
     del sys.frozen
-# Recompute the expected dev path the same way the resolver does, from the module file.
-_here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(ai.__file__)))))
-_sibling = os.path.join(os.path.dirname(_here), "lada-realtime", "model_weights")
-want_dev = _sibling if os.path.isdir(_sibling) else "model_weights"
+# Dev mode: CWD-relative "model_weights" (sumu is self-contained).
+want_dev = "model_weights"
 got_dev = resolve()
 if got_dev == want_dev:
     print(f"PASS dev: {got_dev}")

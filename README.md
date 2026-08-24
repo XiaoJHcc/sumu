@@ -109,32 +109,18 @@ Sumu 换了个顺序想这件事：
 
 **目标机器（所有实测唯一基准）**：RTX 4080 · 16GB · Win11 · 4K@150Hz · 驱动 610.47 · Python 3.13.6 · torch 2.8.0+cu128 · VS2022 BuildTools · CUDA Toolkit 12.8。
 
-### 从源码运行（开发）
+### 构建与运行
 
 1. **native 内核**：`native/build.bat`（需 VS2022 BuildTools），产出 pyd + FFmpeg DLL。
 2. **Python 依赖**：准备 `.venv`，torch 走 cu128（cu128 镜像用南大，PyPI 用清华）。
 3. **第三方补丁**：`bash scripts/apply_patches.sh`（ultralytics / mmengine 运行时补丁）。
-4. **模型权重**：把去码修复模型（≈75MB）与检测模型（≈6MB）放进 `model_weights/`。
-5. **运行**：VSCode task `sumu: run (dev)`，或 `.venv\Scripts\python.exe scripts/play.py`。
+4. **模型权重**：从 [lada HuggingFace](https://huggingface.co/ladaapp/lada) 下载 `lada_mosaic_restoration_model_generic_v1.2.pth` 与 `lada_mosaic_detection_model_v4_fast.pt` 放入 `model_weights/`。
+5. **运行**：VSCode task `sumu: run (dev)`，或 `.venv\Scripts\python.exe scripts/play.py`。首次运行无 TRT 引擎时走 eager 回退，首屏提示编译加速引擎。
+6. **打包分发**：`powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1`，产物 `dist/sumu/`（≈6.9GB，不含 TRT 引擎）。`-SkipNative` / `-FastFreeze` 等选项见 [docs/packaging.md](docs/packaging.md)。
 
 > 纯本地实时播放只需上面 1–5；**Web 串流 / 离线导出**还需把带 NVENC 的 `ffmpeg.exe` 放进 PATH（`ffprobe.exe` 已是既有软依赖）。
 
-### 打包分发（Windows onedir）
-
-```powershell
-# 一键：native 构建 -> 第三方补丁 -> PyInstaller 冻结 -> 装配权重 -> 冒烟
-powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1
-```
-
-产物 `dist/sumu/`（`sumu.exe` + `_internal/` + `model_weights/`，实测 ≈6.9GB，不含 TRT 引擎）。`-SkipNative` / `-FastFreeze` 增量选项与已知坑见 [docs/packaging.md](docs/packaging.md)。
-
-**TensorRT 引擎不进分发包**
-
-TRT 引擎绑定 GPU 架构 + TensorRT 版本 + 精度 + OS，**不能跨机分发**。分发包不含预编译引擎，**每台机器首次运行自行编译**：
-
-- 编译前去码走 eager PyTorch 回退（能用但约 3× 慢）；
-- 首屏「打开文件」下方给出「编译加速引擎」提示，点击后后台编译，编完热切换立即生效并落盘缓存，下次直接命中；
-- 非 Nvidia / 非 fp16 机器不触发编译，恒走 eager。
+> **TensorRT 引擎不进分发包**：引擎绑定 GPU 架构 + TRT 版本 + 精度 + OS，不能跨机分发。分发包不含预编译引擎，每台机器首次运行自行编译——编译前走 eager 回退（约 3× 慢），首屏提示「编译加速引擎」，编完热切换并落盘缓存，非 Nvidia / 非 fp16 机器恒走 eager。
 
 ## License
 
