@@ -53,8 +53,10 @@ PYBIND11_MODULE(sumu_core, m)
              py::arg("cold_start_s") = 1.0f, py::arg("target_fps") = 0,
              py::arg("ai_restore_fps") = -1.0f, py::arg("lead") = 180)
         .def("set_status_text", &Player::set_status_text, py::arg("text"))
+        .def("set_trt_engine_status", &Player::set_trt_engine_status, py::arg("status"))
         .def("set_compile_ui", &Player::set_compile_ui,
-             py::arg("state"), py::arg("progress"), py::arg("text")) // first-screen TRT compile prompt
+             py::arg("state"), py::arg("progress"), py::arg("text"),
+             py::arg("step") = 0, py::arg("total") = 0) // first-screen TRT compile prompt
         .def("set_ui_strings", &Player::set_ui_strings, py::arg("strings")) // i18n label table
 
         .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_

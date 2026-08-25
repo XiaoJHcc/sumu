@@ -1033,14 +1033,19 @@ void Player::set_ui_config(int clip_length, int max_regions, float cold_start_s,
 // tick (empty = hide), no lock needed since only the main thread ever touches it.
 void Player::set_status_text(const std::string& s) { status_text_ = s; }
 
+void Player::set_trt_engine_status(int status) { trt_engine_status_ = status; }
+
 // First-screen TRT-compile prompt state, pushed once per Python tick (same main-thread-only
 // publish pattern as set_status_text). state: 0 hidden / 1 idle (offer compile) / 2 running
 // (progress bar) / 3 failed (offer retry). progress in [0,1]; text is the line shown under
-// the button (idle/failed) or beside the bar (running). Rendered by build_open_prompt_overlay.
-void Player::set_compile_ui(int state, float progress, const std::string& text){
+// the button (idle/failed) or beside the bar (running). Rendered by build_open_prompt_overlay;
+// compile_ui_progress_ is also read by the settings-panel footer's Compiling progress bar.
+void Player::set_compile_ui(int state, float progress, const std::string& text, int step, int total){
     compile_ui_state_ = state;
     compile_ui_progress_ = progress;
     compile_ui_text_ = text;
+    compile_ui_step_ = step;
+    compile_ui_total_ = total;
 }
 
 // UI string table for ImGui labels / tooltips / open-file filter. Python owns catalogs
@@ -1069,6 +1074,14 @@ void Player::set_ui_strings(const py::dict& d){
     take("open_url_load_failed", ui_str_.open_url_load_failed);
     take("compile_retry", ui_str_.compile_retry);
     take("compile_engine", ui_str_.compile_engine);
+    take("compile_failed", ui_str_.compile_failed);
+    take("trt_ready", ui_str_.trt_ready);
+    take("trt_not_compiled", ui_str_.trt_not_compiled);
+    take("trt_not_applicable", ui_str_.trt_not_applicable);
+    take("trt_warming", ui_str_.trt_warming);
+    take("trt_compiling", ui_str_.trt_compiling);
+    take("trt_not_compiled_hint", ui_str_.trt_not_compiled_hint);
+    take("warmup_failed", ui_str_.warmup_failed);
     take("lead_label", ui_str_.lead_label);
     take("lead_tooltip", ui_str_.lead_tooltip);
     take("clip_length_label", ui_str_.clip_length_label);

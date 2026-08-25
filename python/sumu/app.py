@@ -695,27 +695,19 @@ def main():
                     pass  # still in flight
 
             now_mono = time.monotonic()
-            opening_now = open_state is not None
             if open_error_text and now_mono < open_error_until:
                 status_text = open_error_text
             elif open_error_text and now_mono >= open_error_until:
                 open_error_text = ""
                 status_text = ""
-            elif opening_now:
-                # CLI/network open without the URL modal still needs a visible loading cue;
-                # URL-popup opens show a spinner card (no status float needed there either,
-                # but this line is harmless if both fire).
-                status_text = i18n_mod.t("splash_loading")
             elif warm_error is not None:
                 status_text = i18n_mod.t("warmup_failed")
             elif scheduler is not None or warm_ready:
                 status_text = ""
             elif not opened:
                 # First screen (no file open yet): the middle compile-prompt region already
-                # conveys startup state and shows from frame 1 -- a separate bottom-left
-                # warmup float that appears then vanishes a few seconds later is exactly
-                # the startup flicker we're removing, so suppress it here. The float is kept only
-                # for the file-open-mid-warmup case below (and the warm_error case above).
+                # conveys startup state and shows from frame 1 -- a separate status float
+                # would be redundant, so suppress it here.
                 status_text = ""
             else:
                 status_text = i18n_mod.t("warmup_status")
@@ -760,8 +752,11 @@ def main():
             trt_applicable_eff = warm_trt_applicable if warm_ready else trt_applicable_guess
             trt_present_eff = warm_trt_active if warm_ready else trt_present_fast
 
-            if not trt_applicable_eff or trt_present_eff or trt_activated:
+            if warm_error is not None or not trt_applicable_eff or trt_present_eff or trt_activated:
+                # warm_error also hides the prompt: no models => nothing to compile, so a latched
+                # compile_requested must not strand the first screen on a forever "preparing" bar.
                 compile_ui_state, compile_progress, compile_ui_text = _COMPILE_UI_HIDDEN, 0.0, ""
+                compile_step, compile_total = 0, 0
             elif compile_state is not None and cs_running:
                 frac = (cs_step / cs_total) if cs_total else 0.0
                 compile_ui_state = _COMPILE_UI_RUNNING
@@ -769,10 +764,12 @@ def main():
                 compile_ui_text = i18n_mod.t(
                     "compile_running", step=cs_step, total=cs_total
                 )
+                compile_step, compile_total = cs_step, cs_total
             elif compile_state is not None and cs_done and not cs_ok:
                 compile_ui_state, compile_progress, compile_ui_text = (
                     _COMPILE_UI_FAILED, 0.0, i18n_mod.t("compile_failed")
                 )
+                compile_step, compile_total = 0, 0
             elif compile_requested:
                 # Latched click, waiting on warmup/model readiness before the compile thread can
                 # actually spawn (below) -- show the progress bar right away so the button
@@ -780,11 +777,37 @@ def main():
                 compile_ui_state = _COMPILE_UI_RUNNING
                 compile_progress = 0.0
                 compile_ui_text = i18n_mod.t("compile_preparing")
+                compile_step, compile_total = 0, 0  # no step data yet -> bar shows no "n/total"
             else:
                 compile_ui_state = _COMPILE_UI_IDLE
                 compile_progress = 0.0
                 compile_ui_text = i18n_mod.t("compile_prompt")
-            player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text)
+                compile_step, compile_total = 0, 0
+            player.set_compile_ui(compile_ui_state, compile_progress, compile_ui_text,
+                                  compile_step, compile_total)
+
+            # Push the engine-load status for the settings-panel footer and the clickable
+            # status float. One enum, fully resolved here so the native footer/float never
+            # re-derive state from status_text_ or compile_ui_state_.
+            #   0 Warming / 1 WarmupFailed / 2 Ready(active) / 3 NotApplicable /
+            #   4 NotCompiled(idle) / 5 Compiling(incl. queued "preparing") / 6 CompileFailed
+            if warm_error is not None:
+                trt_engine_status = 1
+            elif not warm_ready:
+                # A latched compile click before warmup reads as "compiling" so the settings
+                # panel surfaces the queued job (progress bar at 0%) instead of bare "warming".
+                trt_engine_status = 5 if compile_requested else 0
+            elif warm_trt_active or trt_activated:
+                trt_engine_status = 2
+            elif not trt_applicable_eff:
+                trt_engine_status = 3
+            elif compile_requested or (compile_state is not None and cs_running):
+                trt_engine_status = 5
+            elif compile_state is not None and cs_done and not cs_ok:
+                trt_engine_status = 6
+            else:
+                trt_engine_status = 4
+            player.set_trt_engine_status(trt_engine_status)
 
             ai_restore_fps = -1.0
             if scheduler is not None:

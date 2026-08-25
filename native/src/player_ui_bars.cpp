@@ -515,17 +515,103 @@ void Player::build_settings_panel(float top_bar_h){
         settings_tooltip(ui_str_.target_fps_tooltip.c_str());
     }
 
-    // Phase 6 M-D: instant native toggle -- each frame the local bool is re-seeded from the
-    // atomic present_loop() reads, and a change is stored straight back; see ai_enabled_'s
-    // member comment.
-    // bool local_ai = ai_enabled_.load(std::memory_order_relaxed);
-    // if (ImGui::Checkbox(u8"去码", &local_ai))
-    //     ai_enabled_.store(local_ai, std::memory_order_relaxed);
+    // ── Engine status + optional compile button / progress bar ──────────────────
+    // Driven by Python's set_trt_engine_status() and set_compile_ui().
+    // Net vertical gaps here are kSpaceL (12px), same as LineLabel. A spacer Dummy would
+    // attract ItemSpacing.y on BOTH sides (2x8=16px before any own height, already
+    // overshooting 12) and the separator is a non-item (spacing on one side only), so each
+    // gap is made by nudging the cursor with SetCursorPosY to land exactly kSpaceL.
+    const float is_px = ImGui::GetStyle().ItemSpacing.y;
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+        std::max(0.0f, ui_s(ui::theme::kSpaceL) - is_px));
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 cp = ImGui::GetCursorScreenPos();
+        float sep_w = ImGui::GetContentRegionAvail().x;
+        dl->AddLine(ImVec2(cp.x, cp.y + 2.0f), ImVec2(cp.x + sep_w, cp.y + 2.0f),
+            ui::theme::border_u32());
+        // Separator is not an item (no trailing ItemSpacing) -- land the status text
+        // kSpaceL below it directly.
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ui_s(ui::theme::kSpaceL));
+    }
+
+    ImGui::PushFont(nullptr, kFontSizeSm);
+    {
+        // Status line text + color, plus whether a compile control (button/progress/retry)
+        // follows. Driven solely by the Python-resolved engine status enum -- no re-derivation
+        // from status_text_ or compile_ui_state_ here.
+        const char* eng_text = nullptr;
+        ImVec4 eng_color = ui::theme::kTextSecondary; // gray default
+        int ctrl_kind = 0; // 0 none / 1 compile button / 2 progress bar / 3 retry button
+        switch (trt_engine_status_) {
+        case 0: // Warming
+            eng_text = ui_str_.trt_warming.c_str();
+            break;
+        case 1: // WarmupFailed
+            eng_text = ui_str_.warmup_failed.c_str();
+            eng_color = ui::theme::kError;
+            break;
+        case 2: // Ready (TRT active)
+            eng_text = ui_str_.trt_ready.c_str();
+            eng_color = ui::theme::kText;
+            break;
+        case 3: // NotApplicable (non-Nvidia / non-fp16)
+            eng_text = ui_str_.trt_not_applicable.c_str();
+            break;
+        case 4: // NotCompiled idle -> offer compile
+            eng_text = ui_str_.trt_not_compiled.c_str();
+            eng_color = ui::theme::kWarning;
+            ctrl_kind = 1;
+            break;
+        case 5: // Compiling (or queued "preparing") -> progress bar
+            eng_text = ui_str_.trt_compiling.c_str();
+            eng_color = ui::theme::kWarning;
+            ctrl_kind = 2;
+            break;
+        case 6: // CompileFailed -> offer retry
+            eng_text = ui_str_.compile_failed.c_str();
+            eng_color = ui::theme::kError;
+            ctrl_kind = 3;
+            break;
+        default:
+            break;
+        }
+
+        if (eng_text) {
+            ImGui::PushStyleColor(ImGuiCol_Text, eng_color);
+            ImGui::TextUnformatted(eng_text);
+            ImGui::PopStyleColor();
+        }
+
+        if (ctrl_kind != 0) {
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                std::max(0.0f, ui_s(ui::theme::kSpaceL) - is_px));
+            const float ctrl_w = ImGui::GetContentRegionAvail().x;
+            const float ctrl_h = ImGui::GetFrameHeight();
+            if (ctrl_kind == 2) {
+                // Center "step/total" on the bar once a real count exists (total <= 0 while
+                // queued/preparing -- leave the bar bare so we don't show a bogus "0/0").
+                std::string overlay;
+                if (compile_ui_total_ > 0)
+                    overlay = std::to_string(compile_ui_step_) + "/" +
+                        std::to_string(compile_ui_total_);
+                ui::ProgressBar(compile_ui_progress_, ctrl_w, ctrl_h, overlay.c_str());
+            } else {
+                const char* btn_label = (ctrl_kind == 3) ? ui_str_.compile_retry.c_str()
+                                                         : ui_str_.compile_engine.c_str();
+                if (ui::Button(btn_label, ui::ButtonVariant::Primary, ui::ControlSize::Regular,
+                        ctrl_w))
+                    record_compile_engine();
+            }
+        }
+    }
+    ImGui::PopFont();
 
     // Net BasicVSR restore throughput from Python Scheduler (restore_clip wall time only;
     // excludes frontier-gate sleeps). Pushed each tick via set_ui_config; <0 means no
     // restore has finished yet (or no scheduler).
-    ImGui::Dummy(ImVec2(0.0f, ui_s(ui::theme::kSpaceL)));
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+        std::max(0.0f, ui_s(ui::theme::kSpaceL) - is_px));
     ImGui::PushFont(nullptr, kFontSizeSm);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
     if (ui_cfg_ai_restore_fps_ >= 0.0f)

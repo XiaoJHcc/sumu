@@ -527,31 +527,73 @@ void Player::build_stream_popup(){
     ui::EndModal();
 }
 
-// Model-warmup status line (left-bottom float): built every build_ui() call (see its header
-// comment), regardless of which branch (open-prompt / splash / real UI) is active this
-// frame -- Python drives status_text_ via set_status_text() once per tick and clears it back
-// to "" the moment the scheduler is up, so this simply no-ops most of the time.
+// Model/engine status float (top-left, below the title bar). Shows only when the model
+// state is abnormal: warmup in progress (status_text_), warmup failed (status 1), or TRT
+// engines not compiled (status 4). Clicking the float opens the settings panel so the user
+// can inspect details or trigger an on-demand compile. Hidden when the settings panel is
+// already open (no duplicate info). The NotCompiled float auto-dismisses after 10 seconds
+// and is suppressed on the first screen.
+// Python drives status_text_ (warmup/open-error) and trt_engine_status_ (0..6 enum).
 void Player::build_status_float(){
-    if (status_text_.empty()) return;
+    if (ui_settings_open_) return;
+
+    const char* text = nullptr;
+    ImVec4 color = ui::theme::kTextSecondary; // default gray (warming)
+    bool auto_dismiss = false;
+
+    if (trt_engine_status_ == 1) {
+        // WarmupFailed: always surface, red, even on the first screen.
+        text = ui_str_.warmup_failed.c_str();
+        color = ui::theme::kError;
+    } else if (trt_engine_status_ == 4) {
+        // NotCompiled idle: one-shot nudge on a live session (first screen has its own
+        // compile region), auto-dismiss after 10s.
+        if (!session_active_.load(std::memory_order_relaxed)) return;
+        text = ui_str_.trt_not_compiled_hint.c_str();
+        color = ui::theme::kText; // white
+        auto_dismiss = true;
+    } else {
+        // Warming / open error ride status_text_ (Python). All other engine states
+        // (Ready / NotApplicable / Compiling / CompileFailed) stay silent here.
+        if (status_text_.empty()) return;
+        text = status_text_.c_str();
+    }
+    if (!text || !text[0]) return;
+
+    // Auto-dismiss timer: after 10 seconds the float hides. Reset when the state
+    // changes away from auto-dismiss (warmup states use 0 to indicate "no timer").
+    if (auto_dismiss) {
+        float now = (float)ImGui::GetTime();
+        if (status_float_shown_at_ == 0.0f) status_float_shown_at_ = now;
+        if (now - status_float_shown_at_ > 10.0f) return;
+    } else {
+        status_float_shown_at_ = 0.0f;
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs |
-        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
+    // Deliberately NOT NoInputs -- the float is clickable.
 
     const float margin = ui_s(12.0f);
-    // Nudge above the bottom bar (build_bottom_bar()'s bar_h == top_bar_h()) when a real
-    // session is active -- otherwise the float would sit under the auto-hidden bottom bar.
-    bool active = session_active_.load(std::memory_order_relaxed);
-    float bottom_clear = active ? top_bar_h() + margin : margin;
-
-    ImGui::SetNextWindowPos(ImVec2(margin, io.DisplaySize.y - bottom_clear), ImGuiCond_Always,
-        ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowPos(ImVec2(margin, top_bar_h() + margin), ImGuiCond_Always,
+        ImVec2(0.0f, 0.0f)); // top-left anchor
     ImGui::SetNextWindowBgAlpha(ui::theme::kOverlayBgAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(ui::theme::kRadiusControl));
     ImGui::Begin("##sumu_status_float", nullptr, flags);
-    ImGui::TextUnformatted(status_text_.c_str());
+
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+
+    // Click anywhere on the float → open settings panel.
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_None) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ui_settings_open_ = true;
+        if (ui_settings_open_) settings_edit_init_ = false;
+    }
+
     ImGui::End();
     ImGui::PopStyleVar(); // WindowRounding
 }

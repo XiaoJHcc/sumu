@@ -658,10 +658,11 @@ void EndCard(){
 
 // ---- text / feedback -------------------------------------------------------------------------
 
-void ProgressBar(float frac, float width, float height){
+void ProgressBar(float frac, float width, float height, const char* overlay){
     if (height == 0.0f) height = ImGui::GetFrameHeight();
     // -FLT_MIN = fill the content region (ImGui's ProgressBar reads size.x < 0 that way).
-    ImGui::ProgressBar(frac, ImVec2(width != 0.0f ? width : -FLT_MIN, height), "");
+    // A non-empty overlay is drawn centered on the bar (above the fill) -- e.g. "3/6".
+    ImGui::ProgressBar(frac, ImVec2(width != 0.0f ? width : -FLT_MIN, height), overlay);
 }
 
 void Spinner(const char* id){

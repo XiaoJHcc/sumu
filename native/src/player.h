@@ -500,7 +500,13 @@ public:
 
     void set_status_text(const std::string& s);
 
-    void set_compile_ui(int state, float progress, const std::string& text);
+    // Engine-load status for the settings-panel footer and the clickable status float.
+    // Pushed once per Python tick (see app.py), fully resolved there.
+    //   0 Warming / 1 WarmupFailed / 2 Ready(active) / 3 NotApplicable /
+    //   4 NotCompiled(idle) / 5 Compiling(incl. queued "preparing") / 6 CompileFailed
+    void set_trt_engine_status(int status);
+
+    void set_compile_ui(int state, float progress, const std::string& text, int step, int total);
 
     void set_ui_strings(const py::dict& d);
 
@@ -732,11 +738,25 @@ private:
     // build_status_float() entirely, non-empty text shown regardless of session_active_.
     std::string status_text_;
 
+    // Engine-load status pushed by Python each tick (see set_trt_engine_status). Fully
+    // resolved enum -- footer/float switch on it directly, no status_text_ re-derivation.
+    //   0 Warming / 1 WarmupFailed / 2 Ready(active) / 3 NotApplicable /
+    //   4 NotCompiled(idle) / 5 Compiling(incl. queued "preparing") / 6 CompileFailed
+    int trt_engine_status_ = 0;
+
+    // Auto-dismiss timer for the NotCompiled status float (seconds since first show).
+    // 0 = timer not started; after 10s the float hides. Reset when status changes.
+    float status_float_shown_at_ = 0.0f;
+
     // First-screen TRT-compile prompt, driven by set_compile_ui() (see its header comment).
     // Only consulted by build_open_prompt_overlay(); 0 == hidden, the default.
     int compile_ui_state_ = 0;
     float compile_ui_progress_ = 0.0f;
     std::string compile_ui_text_;
+    // Step/total of the in-flight TRT sub-engine compile, for a "3/6" overlay on the
+    // settings-panel progress bar. total <= 0 means no step data yet (hide the count).
+    int compile_ui_step_ = 0;
+    int compile_ui_total_ = 0;
     // ImGui / open-dialog labels. Empty until Python set_ui_strings() fills them
     // (daily path: apply_to_player right after Player ctor, before first ui_tick).
     // Copy lives only in python/sumu/locales/*.json -- no C++ text duplicates.
@@ -754,6 +774,14 @@ private:
         std::string open_url_load_failed;
         std::string compile_retry;
         std::string compile_engine;
+        std::string compile_failed;
+        std::string trt_ready;
+        std::string trt_not_compiled;
+        std::string trt_not_applicable;
+        std::string trt_warming;
+        std::string trt_compiling;
+        std::string trt_not_compiled_hint;
+        std::string warmup_failed;
         std::string lead_label;
         std::string lead_tooltip;
         std::string clip_length_label;
