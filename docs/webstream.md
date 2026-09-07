@@ -75,7 +75,7 @@ live 流的 hls.js 本地 seek 不可靠，故不采用。绝对播放位置 =
 还带 `_=<时间戳>` 作为 seek 代数，服务端据此**拒绝乱序的陈旧请求**（旧播放器销毁重载时仍在途的请求
 不会把转码倒退回旧位置）。暂停 → `/stop`，`pagehide` → `sendBeacon('/stop')`。每个 (re)start 写入独立
 位置目录 `p<ms>/`，分片用唯一 `s<nonce>.%05d.ts` 命名，seek 不会与上一位置的浏览器缓存 URL 冲突；
-完成的 HLS 落盘缓存复用（同 AI 路径），转码到 EOF 后（`ENDLIST`）再取 playlist 不再重启进程。
+完成的 HLS 落盘缓存复用（同 AI 路径，仅服务器存活期内），转码到 EOF 后（`ENDLIST`）再取 playlist 不再重启进程。
 
 ### passthrough 已知边界
 
@@ -115,7 +115,8 @@ blocker 的对齐方式（与直出同思路，映射到转码进程上）：
 ### AI 模式已知边界
 
 - **单路转码**：AI 模型共享、BasicVSR 吃 GPU，同时只转一个视频；忙时请求其它视频返回 503。
-  完成后的 HLS 落盘缓存复用。
+  完成后的 HLS 落盘缓存复用（仅本次服务器运行期内；`StreamingServer.stop()` 会整目录删除
+  `.sumu_stream_cache`，跨运行不复用、不堆积）。
 - 启动依赖 AI 预热：`stream_start` 在模型未预热完成前会提示稍后（app.py 的 warmup 闸门）。
 - seek 到新位置后，BasicVSR 需重新冷启动（首个 clip 需 `clip_length` 帧前瞻 + 去码 + 2s 分片，
   起播 ~3-5s，比直出的 ~1-2s 略慢）。
@@ -130,7 +131,8 @@ blocker 的对齐方式（与直出同思路，映射到转码进程上）：
 
 ## 通用限制
 
-- 目录仅列文件夹 + 视频（卡片缩略图按需 ffmpeg 生成）。
+- 目录仅列文件夹 + 视频（卡片缩略图按需 ffmpeg 生成，缓存在 `%TEMP%/sumu-thumbs`，
+  `StreamingServer.stop()` 时连同 `.sumu_stream_cache` 一起整目录清掉，跨运行不堆积）。
 - **桌面 Chrome/Firefox 不原生播 HLS**：由内置 hls.js（`/static/hls.min.js`）补齐，无需 CDN；
   iOS Safari 原生 HLS。
 - 4K 去码吞吐同播放器一样是 best-effort（BasicVSR 追不上 1x 时客户端在 live edge 缓冲）。

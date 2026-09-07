@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,12 @@ def thumb_cache_dir() -> str:
     d = os.path.join(tempfile.gettempdir(), "sumu-thumbs")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def wipe_thumb_cache() -> None:
+    """Delete the whole %TEMP%/sumu-thumbs dir. Called from StreamingServer.stop() so thumbnails
+    don't accumulate across runs (regenerating one is a single cheap ffmpeg frame extract)."""
+    shutil.rmtree(os.path.join(tempfile.gettempdir(), "sumu-thumbs"), ignore_errors=True)
 
 
 def ffmpeg_available() -> bool:

@@ -12,14 +12,15 @@
 #
 # Concurrency model: passthrough runs one independent ffmpeg per video (no gate); the AI path is
 # one transcode at a time (shared models, BasicVSR is GPU-bound). A finished video's HLS output is
-# cached on disk and re-served without re-transcoding; a request for a *different* video while the
-# AI path is busy returns 503.
+# cached on disk and re-served without re-transcoding for the life of the server (stop() wipes the
+# cache dir); a request for a *different* video while the AI path is busy returns 503.
 from __future__ import annotations
 
 import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -210,11 +211,18 @@ class StreamingServer:
 
     def stop(self):
         self._sweep_stop.set()
+        # cancel_all joins the workers/kills ffmpeg before we wipe, so no file handles survive.
         self.manager.cancel_all()
         if self.httpd is not None:
             self.httpd.shutdown()
             self.httpd.server_close()
             self.httpd = None
+        # Segments are a within-run cache only: delete the whole cache dir on shutdown so
+        # .sumu_stream_cache (which sits next to the user's videos) never accumulates.
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
+        # Same for the directory-index thumbnails under %TEMP%/sumu-thumbs (one jpg per browsed
+        # video, keyed by path+size+mtime, never evicted otherwise).
+        thumbnail.wipe_thumb_cache()
 
     def access_url(self) -> str:
         host = "127.0.0.1" if self.host == "0.0.0.0" else self.host

@@ -137,7 +137,12 @@ def main():
 
     # second session while busy: use a second video, but first session is done by now (fake fast)
     # -> should start a new session, not 503. (busy path is transient; just verify it serves.)
+    from sumu.webstream import thumbnail  # noqa: E402
+    thumb_file = os.path.join(thumbnail.thumb_cache_dir(), "dummy.jpg")
+    open(thumb_file, "w").close()
     srv.stop()
+    check("stop wipes cache dir", not os.path.exists(cache))
+    check("stop wipes thumb cache", not os.path.exists(thumb_file))
 
     # ---- pause regression (AI path, BlockingEngine) -------------------------------------
     # /stop (pause) then a live-sync poll re-sending the SAME `_` must NOT restart the producer;
