@@ -34,6 +34,7 @@
 
 #include "decoder.h"
 #include "headless_decode.h"
+#include "d3d_util.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -103,8 +104,10 @@ public:
     {
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         D3D_FEATURE_LEVEL got{};
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, &got, &context_);
+        // 与 Player 同一适配器选择策略（多 GPU 机器默认适配器可能是核显，CUDA 注册必炸），
+        // 见 d3d_util.h。此处没有 cuD3D11GetDevice 校验，选中核显会到 RegisterResource 才
+        // 报错且更难排查，所以高性能优先在这里同样必要。
+        HRESULT hr = create_d3d11_device_high_perf(levels, ARRAYSIZE(levels), &device_, &got, &context_);
         check_hr(hr, "D3D11CreateDevice");
 
         // CUDA primary context: the SAME primary context torch uses (torch's CUDA runtime also

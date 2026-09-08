@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
 #include "ui/theme.h"
+#include "d3d_util.h"
 
 namespace {
 
@@ -140,8 +141,10 @@ void Player::create_window(int width_hint, int height_hint, bool maximized){
 void Player::create_device_and_swapchain(){
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL got{};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, &got, &context_);
+    // 多 GPU 机器上默认适配器可能是核显（CUDA 互操作必炸）—— 优先高性能适配器，见
+    // d3d_util.h。下面的 adapter_ 仍从 device 反查（dxgi_device->GetAdapter），swapchain
+    // factory 由同一 adapter 的 GetParent 得到，天然不会跨适配器。
+    HRESULT hr = create_d3d11_device_high_perf(levels, ARRAYSIZE(levels), &device_, &got, &context_);
     check_hr(hr, "D3D11CreateDevice");
 
     // Present thread, decode thread, and the AI push thread (called from Python) all
