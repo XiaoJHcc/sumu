@@ -65,6 +65,12 @@ _DEFAULT_LEAD_FRAMES = 180
 # Leave margin under ai_ring_capacity so present can still hit the slot.
 _AI_PUSH_MARGIN = 8
 
+# H4: backoff between consecutive unexpected producer exceptions (e.g. CUDA OOM on one
+# pathological clip) so the playhead can advance past the failing region instead of
+# tight-looping the same exception.
+_ERROR_BACKOFF_BASE_S = 0.1
+_ERROR_BACKOFF_MAX_S = 1.0
+
 
 def clamp_cold_start_s(value) -> float:
     """UI / settings range: 0–3 seconds. Non-numeric / NaN → default 1.0."""
@@ -229,6 +235,11 @@ class Scheduler:
         self._stop_event = threading.Event()
         self._seek_lock = threading.Lock()
         self._pending_seek: Optional[int] = None
+        # Session generation (guarded by _seek_lock): bumped by every start(). The producer
+        # thread captures its own generation and re-validates it at every native push/query
+        # point -- a thread orphaned by a stop() join timeout must never push frames from the
+        # old timeline into a reopened session (H5).
+        self._generation = 0
 
         # Producer-thread-owned state (only ever mutated inside _run/_process_frame, which
         # both execute on the same single daemon thread - no lock needed for these).
@@ -260,7 +271,17 @@ class Scheduler:
         # first ~cold_start_s of content instead of racing the playhead from frame 0.
         self._anchor_at(self.player.current_frame())
         self.stats.started_at = time.monotonic()
-        self._thread = threading.Thread(target=self._run, name="sumu-ai-scheduler", daemon=True)
+        # New session: bump the generation so a still-running thread orphaned by a previous
+        # stop() join timeout can never push into this session, and clear the stop event so a
+        # same-instance restart actually runs (the orphaned thread's stale-generation check is
+        # what keeps it from coming back to life -- see _session_ok).
+        with self._seek_lock:
+            self._generation += 1
+            gen = self._generation
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(gen,), name="sumu-ai-scheduler", daemon=True
+        )
         self._thread.start()
 
     def stop(self, timeout: float = 2.0) -> None:
@@ -268,6 +289,16 @@ class Scheduler:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+
+    def _session_ok(self, gen: int) -> bool:
+        """True while this producer generation is still the live session: not stop()ed and no
+        newer start() has superseded it. Checked before every native push (and at the top of
+        every producer iteration) so an orphaned thread can never leak old-timeline frames
+        into a new session (H5)."""
+        if self._stop_event.is_set():
+            return False
+        with self._seek_lock:
+            return self._generation == gen
 
     def get_stats(self) -> dict:
         d = self.stats.as_dict()
@@ -372,76 +403,132 @@ class Scheduler:
         avoids any chance of colliding with a clip id already in flight through restore/blend)."""
         self._anchor_at(frame_num)
 
-    def _run(self) -> None:
-        cfg = self.config
+    def _run(self, gen: int) -> None:
+        """Producer thread body (H4): every iteration is wrapped so an unexpected exception
+        (CUDA OOM inside restore, native calls throwing under a half-closed session, ...) can
+        never kill the thread silently. Expected teardown exceptions (stop()/superseded
+        generation) exit quietly; anything else drops in-flight state and resyncs the
+        frontier to the present head, with backoff so a deterministic failure at one position
+        doesn't tight-loop."""
+        consecutive_errors = 0
         while not self._stop_event.is_set():
-            pending_seek = None
-            with self._seek_lock:
-                if self._pending_seek is not None:
-                    pending_seek = self._pending_seek
-                    self._pending_seek = None
-            if pending_seek is not None:
-                self._reset_state(pending_seek)
-                self.stats.seek_resets += 1
-                continue
+            if not self._session_ok(gen):
+                # Orphaned by a stop() join timeout + a newer start(): exit quietly and never
+                # touch the new session again (H5).
+                logger.info("scheduler: stale producer generation %d exiting", gen)
+                return
+            try:
+                self._run_iteration(gen)
+                consecutive_errors = 0
+            except Exception:  # noqa: BLE001 -- the producer thread must never die silently
+                if not self._session_ok(gen):
+                    # stop()/reopen tore the session down under us (e.g. player calls throwing
+                    # mid-teardown) - expected, exit quietly.
+                    logger.info("scheduler: producer exiting during session teardown")
+                    return
+                consecutive_errors += 1
+                logger.exception(
+                    "scheduler: producer iteration failed (%d in a row); dropping in-flight "
+                    "state and resyncing frontier to head",
+                    consecutive_errors,
+                )
+                self._resync_after_error()
+                time.sleep(
+                    min(_ERROR_BACKOFF_BASE_S * consecutive_errors, _ERROR_BACKOFF_MAX_S)
+                )
 
-            head = self.player.current_frame()
+    def _resync_after_error(self) -> None:
+        """H4 recovery: drop every piece of in-flight AI state and resync the frontier to the
+        present head (same degrade-don't-stall idea as the I9 backlog resync; no cold-start
+        re-skip). Also releases cached CUDA blocks once: the hot path deliberately never calls
+        empty_cache() (it stalls the torch allocator for everyone), but after e.g. a CUDA OOM
+        this recovery path is the one place where reclaiming cached blocks is worth it."""
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 -- recovery must never throw
+                pass
+        try:
+            head = int(self.player.current_frame())
+        except Exception:  # noqa: BLE001 -- session may be half-closed; use last known head
+            head = self._last_head
+        self.scenes = []
+        self.frame_cache.clear()
+        self.pending_regions.clear()
+        self.ai_frontier = head
+        self._last_head = head
+        self._eof_flushed_at = None
+        self.stats.backlog_resyncs += 1
 
-            # Backup discontinuity heuristic (see SchedulerConfig.seek_jump_threshold
-            # docstring) - only fires if the caller drove player.seek()/looped without going
-            # through notify_seek().
-            if head < self._last_head or (head - self._last_head) > cfg.seek_jump_threshold:
-                self._reset_state(head)
-                self.stats.seek_resets += 1
-                continue
-            self._last_head = head
+    def _run_iteration(self, gen: int) -> None:
+        cfg = self.config
+        pending_seek = None
+        with self._seek_lock:
+            if self._pending_seek is not None:
+                pending_seek = self._pending_seek
+                self._pending_seek = None
+        if pending_seek is not None:
+            self._reset_state(pending_seek)
+            self.stats.seek_resets += 1
+            return
 
-            if self.ai_frontier < head:
-                # Fell behind: don't try to catch up frame-by-frame (that would just dig the
-                # hole deeper while present has long since moved on) - jump straight to head
-                # and drop whatever was in flight (I9: degrade, don't stall). No cold-start
-                # re-skip here -- that only applies to explicit open/seek anchors.
-                self.scenes = []
-                self.ai_frontier = head
-                self.stats.backlog_resyncs += 1
-                # Still JIT-push any pending stockpile that is now in the near-head window.
-                self._flush_pending_to_native(head)
-                continue
+        head = self.player.current_frame()
 
-            # Push stockpiled restorations that have entered the short AI display window.
-            self._flush_pending_to_native(head)
+        # Backup discontinuity heuristic (see SchedulerConfig.seek_jump_threshold
+        # docstring) - only fires if the caller drove player.seek()/looped without going
+        # through notify_seek().
+        if head < self._last_head or (head - self._last_head) > cfg.seek_jump_threshold:
+            self._reset_state(head)
+            self.stats.seek_resets += 1
+            return
+        self._last_head = head
 
-            if self.ai_frontier > head + self._effective_lead():
-                time.sleep(cfg.sleep_step_s)
-                continue
+        if self.ai_frontier < head:
+            # Fell behind: don't try to catch up frame-by-frame (that would just dig the
+            # hole deeper while present has long since moved on) - jump straight to head
+            # and drop whatever was in flight (I9: degrade, don't stall). No cold-start
+            # re-skip here -- that only applies to explicit open/seek anchors.
+            self.scenes = []
+            self.ai_frontier = head
+            self.stats.backlog_resyncs += 1
+            # Still JIT-push any pending stockpile that is now in the near-head window.
+            self._flush_pending_to_native(head, gen)
+            return
 
-            n = self.ai_frontier
-            frame_count = self.player.frame_count()
+        # Push stockpiled restorations that have entered the short AI display window.
+        self._flush_pending_to_native(head, gen)
 
-            g = self.player.get_cuda_nv12_by_frame(n)
-            if not g["ready"]:
-                # Decode head hasn't reached n yet (or it was overwritten - see
-                # docs/native_ai_input.md's ring-overwrite caveat). Never block: just retry
-                # next iteration. Note: frame numbers are monotonically increasing across
-                # content loops (I5) - there is no "n >= frame_count -> stop producing" state;
-                # the decode head keeps advancing past frame_count on every loop and n must
-                # keep following it, forever.
-                time.sleep(cfg.sleep_step_s)
-                continue
+        if self.ai_frontier > head + self._effective_lead():
+            time.sleep(cfg.sleep_step_s)
+            return
 
-            # Content-position eof: n's position *within the current loop* (n % frame_count),
-            # not n itself, marks the loop boundary. This fires once per loop (every
-            # frame_count frames) instead of only once at first-pass end, so scenes get
-            # flushed at every content discontinuity - the tail of one loop and the head of
-            # the next are not temporally continuous, so Scene/BasicVSR++ state must not
-            # bridge across it. Only the eof flag/materialize call uses the wrapped position;
-            # get_cuda_nv12_by_frame/push_ai_frame above and ai_frontier below still use the
-            # raw monotonic n, matching present/ring's own frame numbering.
-            eof = bool(frame_count > 0 and (n % frame_count) == frame_count - 1)
-            self._process_frame(n, g, eof)
-            self.ai_frontier = n + 1
+        n = self.ai_frontier
+        frame_count = self.player.frame_count()
 
-    def _process_frame(self, n: int, g: dict, eof: bool) -> None:
+        g = self.player.get_cuda_nv12_by_frame(n)
+        if not g["ready"]:
+            # Decode head hasn't reached n yet (or it was overwritten - see
+            # docs/native_ai_input.md's ring-overwrite caveat). Never block: just retry
+            # next iteration. Note: frame numbers are monotonically increasing across
+            # content loops (I5) - there is no "n >= frame_count -> stop producing" state;
+            # the decode head keeps advancing past frame_count on every loop and n must
+            # keep following it, forever.
+            time.sleep(cfg.sleep_step_s)
+            return
+
+        # Content-position eof: n's position *within the current loop* (n % frame_count),
+        # not n itself, marks the loop boundary. This fires once per loop (every
+        # frame_count frames) instead of only once at first-pass end, so scenes get
+        # flushed at every content discontinuity - the tail of one loop and the head of
+        # the next are not temporally continuous, so Scene/BasicVSR++ state must not
+        # bridge across it. Only the eof flag/materialize call uses the wrapped position;
+        # get_cuda_nv12_by_frame/push_ai_frame above and ai_frontier below still use the
+        # raw monotonic n, matching present/ring's own frame numbering.
+        eof = bool(frame_count > 0 and (n % frame_count) == frame_count - 1)
+        self._process_frame(n, g, eof, gen)
+        self.ai_frontier = n + 1
+
+    def _process_frame(self, n: int, g: dict, eof: bool, gen: int) -> None:
         cfg = self.config
 
         nv12 = wrap_nv12_cuda_buffer_as_tensor(g["dev_ptr"], g["width"], g["height"], g["pitch_bytes"])
@@ -463,7 +550,7 @@ class Scheduler:
             self.scenes, n, False, cfg.clip_length, cfg.clip_size, self.pad_mode, self.clip_counter
         )
         for clip in clips:
-            self._restore_and_push(clip)
+            self._restore_and_push(clip, gen)
 
         if eof and self._eof_flushed_at != n:
             self._eof_flushed_at = n
@@ -471,9 +558,9 @@ class Scheduler:
                 self.scenes, n, True, cfg.clip_length, cfg.clip_size, self.pad_mode, self.clip_counter
             )
             for clip in clips:
-                self._restore_and_push(clip)
+                self._restore_and_push(clip, gen)
 
-    def _restore_and_push(self, clip: Clip) -> None:
+    def _restore_and_push(self, clip: Clip, gen: int) -> None:
         frame_start, frame_end = clip.frame_start, clip.frame_end  # Clip.pop() mutates these
         n_frames = frame_end - frame_start + 1
         # Net BasicVSR wall time only (no gate wait). Synchronize so async GPU work is fully
@@ -489,6 +576,12 @@ class Scheduler:
             self.stats.restore_frames += n_frames
             self.stats.restore_seconds += dt
         self.stats.clips_restored += 1
+
+        # The restore above can easily outlive a stop() join timeout (4K/long clips): if this
+        # generation is no longer the live session, drop the whole clip right here instead of
+        # draining old-timeline regions into a reopened session's ready-map (H5).
+        if not self._session_ok(gen):
+            return
 
         # Drain clip into sparse pending (not full-frame RGBA in the native AI ring yet).
         # Multi-region: multiple clips may contribute regions to the same fnum; JIT flush
@@ -521,14 +614,20 @@ class Scheduler:
             head = int(self.player.current_frame())
         except Exception:  # noqa: BLE001
             head = 0
-        self._flush_pending_to_native(head)
+        self._flush_pending_to_native(head, gen)
 
-    def _flush_pending_to_native(self, head: int) -> None:
+    def _flush_pending_to_native(self, head: int, gen: int) -> None:
         """Blend pending sparse regions for frames in [head, head+ai_push_window] and push.
 
         Frames behind head are dropped (present already passed). Frames beyond the AI display
         window stay in pending until the playhead approaches (4K short AI ring).
+
+        Every push is gated on this generation still being the live session: after a stop()
+        join timeout the orphaned thread may still finish its current iteration, but it must
+        never land old-timeline frames in a reopened session's ready-map (H5).
         """
+        if not self._session_ok(gen):
+            return
         if not self.pending_regions:
             return
         window = self._ai_push_window()
@@ -545,6 +644,8 @@ class Scheduler:
         to_push = [f for f in self.pending_regions if f <= hi]
         to_push.sort()
         for fnum in to_push:
+            if not self._session_ok(gen):
+                return
             regions = self.pending_regions.pop(fnum, None)
             if not regions:
                 continue

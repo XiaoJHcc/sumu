@@ -95,9 +95,21 @@
 - 验证（2026-09-08，RTX 4080）：hover 进度条（缩略图烘入快照）→ reopen 1080p↔4K ×20 轮 +
   hover 中 `close_current_session` + 再 open，present 不 stall、不崩；`smoke_player.py seek` 回归全绿。
 
-### S3 — H4+H5：scheduler 健壮性 ✅/⬜
-- `_run` 包 try/except：异常时记日志 + 按 backlog-resync 重置前沿，线程不死。
-- 引入会话生成号：`push_ai_frame` 前校验，过期线程的推送直接丢弃。
+### S3 — H4+H5：scheduler 健壮性 ✅
+- `_run` 拆为外壳 + `_run_iteration`：每轮包 try/except。stop/会话失效导致的异常安静退出；
+  意外异常（如 CUDA OOM）记 `logger.exception` → `_resync_after_error`（清 scenes/frame_cache/
+  pending_regions、frontier 按 backlog-resync 思路拉到 head、仅在恢复路径调一次
+  `torch.cuda.empty_cache()`）→ 线性退避（0.1s×n，封顶 1s）后继续循环，线程不死。
+- 会话生成号（`_generation`，`_seek_lock` 保护）：`start()` 自增并 `stop_event.clear()`；
+  producer 捕获启动时 gen，`_session_ok()` 在循环顶部、`_restore_and_push` restore 完成后、
+  `_flush_pending_to_native` 入口及每次 `push_ai_frame` 前校验——stop() join 超时后孤儿线程
+  跑完当前迭代也绝不会把旧时间线帧推进新会话（同实例重启与新实例同 player 两条路径都覆盖）。
+- 验证（2026-09-08，RTX 4080）：临时脚本（已删）12 项断言全过——孤儿线程在 stop 超时 +
+  reopen 后 push_ai_frame 零落入（同实例/新实例两路径）、注入 `RuntimeError("CUDA out of
+  memory")` ×3 后线程存活、backlog_resyncs=3、恢复后继续推进、stop 时干净退出；
+  `run_player.py --seconds 30 --seek-test`：seek 1788/1788 精确、恢复窗 ai_hit_rate=0.950、
+  present median=33.36ms/p99=33.82ms、frame_cache_misses=0、seek_resets=1，与
+  docs/scheduler.md 基线无回归。
 
 ### S4 — H3+M1+M2+L1：CUDA RAII 与杂项原生修复 ✅/⬜
 - Map/Unmap 上 RAII guard（三处）；`close()` 开头先 `session_active_.store(false)`；seek 加 `gil_scoped_release`；HeadlessDecode 配对 `cuDevicePrimaryCtxRelease`。
