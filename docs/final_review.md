@@ -76,9 +76,12 @@
 
 > 每阶段 = 一个 commit（`fix(...)`/`perf(...)` 风格）。native 改动须 `cmd /c "native\build.bat"` 编译通过 + `native\smoke_player.py` 相关项验证；Python 改动跑对应 verify/run_player 脚本。若 sandbox 阻止构建，如实记录由用户本机验证。
 
-### S1 — H1：open_session 异常清理 + 短视频合法打开 ✅/⬜
+### S1 — H1：open_session 异常清理 + 短视频合法打开 ✅
 - 线程启动后的所有 throw 点包 try/catch：置 `session_stop_` + join + 清理 CUDA 注册再 rethrow。
 - 起始缓冲等待区分 EOF：流自然结束（帧数 < 阈值）应合法打开而不是超时。
+- 验证（2026-09-08，RTX 4080）：3 帧视频 0.05s 打开（原 10s 超时 throw）、播至末帧自动暂停；
+  截断 mp4（线程启动后 EOF 零帧）throw 后再 open 正常视频不崩（原 use-after-free/terminate 路径）；
+  假文件失败后 open 正常；`smoke_player.py all` 与 `stress_reopen.py --rounds 12` 全绿。
 
 ### S2 — H2：缩略图 SRV 悬空 ✅/⬜
 - `close_session` 拆 scrub 资源前清空/替换 `ui_pending_`/`ui_active_`（或 SRV 生命周期延长到下一次快照发布）。

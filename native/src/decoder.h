@@ -71,6 +71,12 @@ public:
     // "in flight" to bound VRAM use / decoder pool pressure).
     bool next_frame(DecodedFrame& out);
 
+    // EOF 状态：next_frame() 解到流末尾（pump 返回 0，即真实 EOF，不含解码错误）时置位，
+    // seek_to_frame()/close() 复位。原子 —— 由 decode 线程写、Player::open_session() 的
+    // 起始缓冲等待在另一线程读，用于区分「缓冲还没填满」与「流本来就短、已经解完了」
+    // （短视频总帧数可能低于起始缓冲高水位，不能用 frame_count_ 判 —— 裸流时它为 0）。
+    bool at_eof() const { return at_eof_.load(std::memory_order_relaxed); }
+
     // I6: seek = reposition, not teardown. Does NOT touch fmt_ctx_/codec_ctx_/hw_device_ref_
     // lifetime at all -- av_seek_frame + AVSEEK_FLAG_BACKWARD to the nearest keyframe at or
     // before target_frame, avcodec_flush_buffers, then decodes forward until the real decoded
@@ -175,6 +181,7 @@ private:
     // every existing read/write site unchanged).
     std::atomic<bool> have_first_pts_{ false };
     std::atomic<double> first_pts_seconds_{ 0.0 };
+    std::atomic<bool> at_eof_{ false }; // 见 at_eof() 注释；next_frame 置位、seek/close 复位
     double loop_offset_seconds_ = 0.0; // stays 0 (pause-on-last-frame); kept for pts formula
     double last_out_pts_seconds_ = -1.0;
 

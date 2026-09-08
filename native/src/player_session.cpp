@@ -182,87 +182,114 @@ void Player::open_session(const std::string& video_path){
     // default-false on a first open()) -- see decode_loop()/audio_loop()'s exit conditions.
     decode_thread_ = std::thread(&Player::decode_loop, this);
 
-    // M4: independent scrub-decode path for seekbar hover thumbnails. Best-effort -- failing
-    // to open the second decoder just means no hover previews (the player is fully functional
-    // without them), never a failed session. Its GPU resources were already built above by
-    // create_ring_resources() -> create_scrub_resources().
-    // Network profile: SKIP the second open entirely. A parallel scrub Decoder means a
-    // second HTTP connection + open-time full-timeline keyframe grid seeks -- the single
-    // worst remote-IO pattern this player has. Local disk keeps scrub as before.
-    if (!network) {
-        std::string scrub_err;
-        if (scrub_decoder_.open(video_path, device_.Get(), scrub_err))
-            scrub_thread_ = std::thread(&Player::scrub_loop, this);
-        else
-            fprintf(stderr, "[sumu] scrub decoder open failed (%s) -- hover thumbnails disabled\n",
-                scrub_err.c_str());
-    } else {
-        fprintf(stderr, "[sumu] network source: scrub decoder disabled (no second open / no grid prefetch)\n");
-    }
+    // H1 修复：decode 线程已启动、CUDA 注册与 ring 资源已建 —— 从这里到函数末尾的任何
+    // throw（起始缓冲等待超时，或该区域内未来新增的失败点）都不能再裸抛。裸抛会留下孤儿
+    // decode/scrub 线程继续对 fmt_ctx_ 跑 av_read_frame：Python 侧 open 失败后用户再选文件
+    // → 再次 open_session() → decoder_.open() 内部 close() 释放 fmt_ctx_，旧线程仍在用 →
+    // use-after-free；且对已 joinable 的 std::thread 再赋值会直接 std::terminate 崩进程。
+    // 统一走 close_session() 拆除：它对未启动的线程（joinable 检查）、未建的资源（nullptr
+    // 检查）、未分配的 audio_codec_ctx_ 全部有防护，「本次 open 建到哪算哪」的部分状态也能
+    // 安全清理；它还会把 session_stop_ 复位、session_active_ 保持 false，下一次
+    // open_session() 才能干净启动（reopen() 的 catch 语义不变：opened_=false 后可再 open）。
+    try {
+        // M4: independent scrub-decode path for seekbar hover thumbnails. Best-effort -- failing
+        // to open the second decoder just means no hover previews (the player is fully functional
+        // without them), never a failed session. Its GPU resources were already built above by
+        // create_ring_resources() -> create_scrub_resources().
+        // Network profile: SKIP the second open entirely. A parallel scrub Decoder means a
+        // second HTTP connection + open-time full-timeline keyframe grid seeks -- the single
+        // worst remote-IO pattern this player has. Local disk keeps scrub as before.
+        if (!network) {
+            std::string scrub_err;
+            if (scrub_decoder_.open(video_path, device_.Get(), scrub_err))
+                scrub_thread_ = std::thread(&Player::scrub_loop, this);
+            else
+                fprintf(stderr, "[sumu] scrub decoder open failed (%s) -- hover thumbnails disabled\n",
+                    scrub_err.c_str());
+        } else {
+            fprintf(stderr, "[sumu] network source: scrub decoder disabled (no second open / no grid prefetch)\n");
+        }
 
-    // Network: wait for fewer initial frames and allow a longer open timeout (RTT + probe).
-    const int64_t start_buf = network ? kNetworkStartBufferFrames : kStartBufferFrames;
-    const double start_timeout_s = network ? 30.0 : 10.0;
-    LARGE_INTEGER t0;
-    QueryPerformanceCounter(&t0);
-    for (;;) {
-        if (pt_high_water_.load(std::memory_order_relaxed) >= start_buf - 1)
-            break;
+        // Network: wait for fewer initial frames and allow a longer open timeout (RTT + probe).
+        const int64_t start_buf = network ? kNetworkStartBufferFrames : kStartBufferFrames;
+        const double start_timeout_s = network ? 30.0 : 10.0;
+        LARGE_INTEGER t0;
+        QueryPerformanceCounter(&t0);
+        for (;;) {
+            if (pt_high_water_.load(std::memory_order_relaxed) >= start_buf - 1)
+                break;
+            // H1 修复（短视频）：流的总帧数可能不到 start_buf（本地阈值 5、网络 2），此时
+            // 解码线程很快走到 EOF，高水位永远到不了阈值 —— 旧逻辑只能干等满 10s/30s 超时再
+            // throw，任何少于 5 帧的视频永远无法打开。解码线程已到 EOF 即「不会再有更多帧」，
+            // 视为缓冲完成、合法打开。判定用解码线程的 EOF 状态而不是 frame_count_：裸流
+            // 时长未知时 frame_count_ 为 0，不可靠。EOF 且一帧未出 = 文件能 open 但无可用
+            // 画面，按失败处理（与旧超时同等语义，只是报得更快）；走上面统一的 catch 清理。
+            if (decoder_.at_eof()) {
+                if (pt_high_water_.load(std::memory_order_relaxed) < 0)
+                    throw std::runtime_error("decoder reached EOF without producing any frame");
+                break;
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double waited_s = static_cast<double>(now.QuadPart - t0.QuadPart) / qpc_freq_d();
+            if (waited_s > start_timeout_s)
+                throw std::runtime_error("decode thread failed to buffer initial frames within timeout");
+            Sleep(1);
+        }
+
+        // Start paused at frame 0 -- caller must call play() to start the wall clock.
+        // (Clock / playing_ / seek_version_ already zeroed above before decode started.)
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        double waited_s = static_cast<double>(now.QuadPart - t0.QuadPart) / qpc_freq_d();
-        if (waited_s > start_timeout_s)
-            throw std::runtime_error("decode thread failed to buffer initial frames within timeout");
-        Sleep(1);
+        anchor_qpc_ticks_.store(now.QuadPart, std::memory_order_relaxed);
+        // Re-assert frame 0 after the start-buffer wait: present was in splash the whole time
+        // and must not inherit the previous file's head when session_active_ flips true.
+        anchor_frame_.store(0, std::memory_order_relaxed);
+        clock_frame_.store(0, std::memory_order_relaxed);
+        present_head_frame_.store(0, std::memory_order_relaxed);
+        playing_.store(false, std::memory_order_relaxed);
+        seek_slot_hint_.store(0, std::memory_order_relaxed);
+        seek_version_.fetch_add(1, std::memory_order_relaxed);
+
+        if (has_audio_)
+            audio_thread_ = std::thread(&Player::audio_loop, this);
+
+        opened_ = true;
+        // Last step, once every session resource above is fully built: present_loop()'s
+        // splash branch only stops drawing the splash and starts picking/presenting real
+        // frames once this flips true (see present_loop()).
+        session_active_.store(true, std::memory_order_relaxed);
+
+        // Arm the coarse-grid prefetch immediately (the player opens paused, so scrub_loop() starts
+        // filling right away using the idle NVDEC) rather than lazily on first hover -- seekbar
+        // dragging is a high-frequency action and we want coverage ready before the user reaches
+        // for it. The fill self-suspends the moment playback starts (see scrub_loop()).
+        // Network: scrub thread was never started -- do not request grid fill.
+        if (!network) {
+            scrub_grid_wanted_.store(true, std::memory_order_relaxed);
+            scrub_cv_.notify_one();
+        }
+
+        // Auto-size the window to this video (1:1 point-for-point, capped/on-screen -- see the
+        // method). Deferred to ui_tick() on the main thread: open_session may run on a worker
+        // (async URL open), and SetWindowPos -> synchronous WM_SIZE -> ui_tick re-entrancy from
+        // a non-main thread is unsafe. Main applies the flag on the next tick after session_active_.
+        pending_resize_for_video_.store(true, std::memory_order_release);
+    } catch (...) {
+        close_session(); // 见上方 H1 注释；自身全防护，重复调用也安全
+        throw;
     }
-
-    // Start paused at frame 0 -- caller must call play() to start the wall clock.
-    // (Clock / playing_ / seek_version_ already zeroed above before decode started.)
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    anchor_qpc_ticks_.store(now.QuadPart, std::memory_order_relaxed);
-    // Re-assert frame 0 after the start-buffer wait: present was in splash the whole time
-    // and must not inherit the previous file's head when session_active_ flips true.
-    anchor_frame_.store(0, std::memory_order_relaxed);
-    clock_frame_.store(0, std::memory_order_relaxed);
-    present_head_frame_.store(0, std::memory_order_relaxed);
-    playing_.store(false, std::memory_order_relaxed);
-    seek_slot_hint_.store(0, std::memory_order_relaxed);
-    seek_version_.fetch_add(1, std::memory_order_relaxed);
-
-    if (has_audio_)
-        audio_thread_ = std::thread(&Player::audio_loop, this);
-
-    opened_ = true;
-    // Last step, once every session resource above is fully built: present_loop()'s
-    // splash branch only stops drawing the splash and starts picking/presenting real
-    // frames once this flips true (see present_loop()).
-    session_active_.store(true, std::memory_order_relaxed);
-
-    // Arm the coarse-grid prefetch immediately (the player opens paused, so scrub_loop() starts
-    // filling right away using the idle NVDEC) rather than lazily on first hover -- seekbar
-    // dragging is a high-frequency action and we want coverage ready before the user reaches
-    // for it. The fill self-suspends the moment playback starts (see scrub_loop()).
-    // Network: scrub thread was never started -- do not request grid fill.
-    if (!network) {
-        scrub_grid_wanted_.store(true, std::memory_order_relaxed);
-        scrub_cv_.notify_one();
-    }
-
-    // Auto-size the window to this video (1:1 point-for-point, capped/on-screen -- see the
-    // method). Deferred to ui_tick() on the main thread: open_session may run on a worker
-    // (async URL open), and SetWindowPos -> synchronous WM_SIZE -> ui_tick re-entrancy from
-    // a non-main thread is unsafe. Main applies the flag on the next tick after session_active_.
-    pending_resize_for_video_.store(true, std::memory_order_release);
 }
 
 // M-C1: joins/tears down only the session-scoped state (decode/audio threads, the D3D11
 // session textures/SRVs/tags, the session's CUDA registrations, the audio codec ctx, the
 // decoder itself) -- leaves the device layer (device_/context_/swapchain_/shader pipeline/
 // ImGui/cu_ctx_) fully intact, since present_thread_ keeps running across this (drawing the
-// splash again immediately after). Only ever called from close() in this milestone, always
-// with present_thread_ already joined (see close() below) -- so there is no present-detach
-// handshake to do here yet; that's an M-C2 concern for a live (running-present) reopen.
+// splash again immediately after). Callers: close() (with present_thread_ already joined),
+// reopen()/close_current_session() (after the present-detach handshake), and open_session()'s
+// own failure catch (H1: threads already started, resources partially built -- every teardown
+// step below is guarded by joinable()/nullptr checks, so it doubles as the "clean up however
+// far this open got" path; see open_session()'s H1 comment).
 void Player::close_session(){
     if (cu_ctx_)
         check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (close_session)");

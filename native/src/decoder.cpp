@@ -48,6 +48,7 @@ void Decoder::close()
     frame_count_ = 0;
     have_first_pts_.store(false, std::memory_order_relaxed);
     first_pts_seconds_.store(0.0, std::memory_order_relaxed);
+    at_eof_.store(false, std::memory_order_relaxed);
     loop_offset_seconds_ = 0.0;
     last_out_pts_seconds_ = -1.0;
     d3d_device_ = nullptr;
@@ -370,7 +371,9 @@ bool Decoder::next_frame(DecodedFrame& out)
         // clamps the clock and clears playing_); decode_loop treats false as "idle until seek
         // repositions". Loop-on-EOF used to bump loop_offset_seconds_ past the real timeline,
         // so the seekbar clock ran past frame_count and seek targets mapped into the wrong
-        // PTS domain.
+        // PTS domain. at_eof_ 只在此（真实 EOF）置位 —— r<0 的解码错误不算，open_session 的
+        // 起始缓冲等待靠它识别「短视频已解完」而不是干等超时。
+        at_eof_.store(true, std::memory_order_relaxed);
         return false;
     }
 
@@ -392,6 +395,11 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
         return false;
     }
     if (target_frame < 0) target_frame = 0;
+
+    // seek = reposition：离开 EOF 状态，之后 next_frame() 会重新产帧（或再次走到 EOF 时
+    // 重新置位）。即便下面 av_seek_frame 失败，flush 后的位置也已不再是「确定的 EOF」，
+    // 清掉仍是正确信号。
+    at_eof_.store(false, std::memory_order_relaxed);
 
     // Map the requested content frame number back into the raw stream PTS domain using the
     // ORIGINAL first_pts_seconds_/loop_offset_ established at open() -- frame numbers stay
