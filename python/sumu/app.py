@@ -543,9 +543,17 @@ def main():
         unsupported containers land here (native decoder.open throws RuntimeError)."""
         nonlocal open_error_text, open_error_until
         name = os.path.basename(path) if path else ""
-        open_error_text = (
-            i18n_mod.t("open_failed_named", name=name) if name else i18n_mod.t("open_failed")
-        )
+        err_s = str(err)
+        # S7: native decoder 的像素格式防线（decoder.cpp）在错误串里带机器可识别前缀
+        # "unsupported_pix_fmt:<fmt>" —— 识别出来走专属 i18n 提示，让用户看到
+        # 「不支持的视频格式：p010le」而不是泛泛的打开失败。
+        if "unsupported_pix_fmt:" in err_s:
+            fmt = err_s.split("unsupported_pix_fmt:", 1)[1].split()[0]
+            open_error_text = i18n_mod.t("open_failed_unsupported_pix_fmt", name=name, fmt=fmt)
+        else:
+            open_error_text = (
+                i18n_mod.t("open_failed_named", name=name) if name else i18n_mod.t("open_failed")
+            )
         open_error_until = time.monotonic() + _OPEN_ERROR_HOLD_S
         print(f"== open failed == {path!r}: {err}", file=sys.stderr)
 

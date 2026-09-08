@@ -11,6 +11,7 @@
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 }
 
 Decoder::~Decoder()
@@ -188,6 +189,32 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     width_ = stream->codecpar->width;
     height_ = stream->codecpar->height;
 
+    // S7 像素格式防线：全链路硬编码 NV12 —— 环缓冲/scrub/headless 纹理都是
+    // DXGI_FORMAT_NV12、SRV 固定 R8_UNORM/R8G8_UNORM、present shader 与 AI 侧色转写死
+    // BT.709 limited。d3d11va 解出非 NV12（10-bit HEVC 的 P010、4:2:2、HDR…）时
+    // decode_loop 的 CopySubresourceRegion 不做格式转换、返回 void、无错误检查 →
+    // 静默黑屏/定格旧帧，用户毫无提示。这里在 open 路径显式拒绝，错误串带
+    // 机器可识别前缀 "unsupported_pix_fmt:"（Python 侧据此映射 i18n 提示）。
+    // 判定用 codecpar->format（parser 已从 SPS 解析出位深/色度格式，avformat_find_
+    // stream_info 后即可靠；codec_ctx_->sw_pix_fmt 此时还是 NONE —— 实测 avcodec_open2
+    // 后它仍可能未确定，不能用作门禁）。d3d11va 对 8-bit 4:2:0 恒输出 NV12，而 8-bit
+    // 片通常声明 yuv420p（H.264/HEVC 码流不区分 yuv420p/nv12 内存布局）、full-range
+    // 片声明 yuvj420p（同码流、只是 range tag 不同，走 open 后的 full-range warning）
+    // —— 三种都接受；其余（yuv420p10le/p010/yuv422p/yuv444p/NONE…）一律拒绝。
+    // 未来 P010 支持的落点：环缓冲/scrub/AI 桥纹理改 P010 + R16/R16G16 SRV +
+    // present shader 分支 + headless 16-bit 路径。
+    {
+        const AVPixelFormat coded_fmt = static_cast<AVPixelFormat>(stream->codecpar->format);
+        if (coded_fmt != AV_PIX_FMT_NV12 &&
+            coded_fmt != AV_PIX_FMT_YUV420P &&
+            coded_fmt != AV_PIX_FMT_YUVJ420P) {
+            const char* fmt_name = av_get_pix_fmt_name(coded_fmt);
+            error = "unsupported_pix_fmt:" + std::string(fmt_name ? fmt_name : "unknown");
+            close();
+            return false;
+        }
+    }
+
     // Audio (spike, additive): demux-only, best-effort. related_stream=idx nudges FFmpeg to
     // prefer an audio stream muxed alongside the chosen video stream when a container has
     // several. No audio track is a legitimate, silent result (-1), not an error -- callers
@@ -259,6 +286,18 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
         return false;
     }
     av_dict_free(&opts);
+
+    // S7 顺带：NV12 但色彩 tag 非 BT.709 limited（BT.601 / full-range / BT.2020）只埋
+    // warning —— present shader 写死 BT.709 limited，会色偏但不黑屏；从流 tag 派生
+    // 色彩参数是后续方向（docs/final_review.md「后续方向」）。tag 未指定
+    // （UNSPECIFIED）是常态，不 warn。像素格式门禁本身在上方 codecpar 处。
+    if (codec_ctx_->colorspace != AVCOL_SPC_BT709 &&
+        codec_ctx_->colorspace != AVCOL_SPC_UNSPECIFIED)
+        fprintf(stderr, "[sumu] warning: color space tag '%s' is not BT.709; presentation "
+            "assumes BT.709 (color shift likely)\n", av_color_space_name(codec_ctx_->colorspace));
+    if (codec_ctx_->color_range == AVCOL_RANGE_JPEG)
+        fprintf(stderr, "[sumu] warning: full-range (JPEG) color tag; presentation assumes "
+            "limited range (levels will look off)\n");
 
     pkt_ = av_packet_alloc();
     frame_ = av_frame_alloc();

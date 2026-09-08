@@ -30,6 +30,7 @@
   "dialog_all_files": "すべてのファイル",
   "open_failed": "この動画を開けませんでした",
   "open_failed_named": "開けませんでした：{name}",
+  "open_failed_unsupported_pix_fmt": "未対応の映像フォーマット：{fmt}（{name}）——現在 8-bit 映像のみ対応、10-bit/HDR は未対応です",
   "warmup_failed": "ウォームアップ失敗",
   "warmup_status": "モデルをウォームアップ中…",
   "compile_running": "加速エンジンをコンパイル中 {step}/{total}…（初回は数分かかることがあります）",

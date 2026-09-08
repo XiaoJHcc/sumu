@@ -160,9 +160,19 @@
   远低于 1ms 显著性阈值与 vblank 周期。**P2 不实施**，维持同步 cuMemcpy2D 与现有 Flush()；
   临时埋点已还原，仅本文档留量测数据。
 
-### S7 — 像素格式防线：非 NV12 显式检测 ✅/⬜
+### S7 — 像素格式防线：非 NV12 显式检测 ✅
 - decoder 打开后检查 `sw_pix_fmt`/色彩 tag：非 NV12（P010、4:2:2、HDR 等）给出明确错误提示（i18n），不再静默黑屏/色偏。
 - 完整 P010/HDR 支持、软解 fallback、旋转元数据列为后续方向，记入本文档「后续方向」。
+- 实施备注：门禁实际落在 `codecpar->format`（实测 `avcodec_open2` 后 `sw_pix_fmt` 仍可能
+  未确定，不能用作门禁）；接受集为 NV12/YUV420P/YUVJ420P（d3d11va 对 8-bit 4:2:0 恒输出
+  NV12，后两种声明会被字面 NV12 检查误杀），错误串带 `unsupported_pix_fmt:<fmt>` 前缀，
+  Python `_report_open_failed` 识别后映射新增 i18n 键 `open_failed_unsupported_pix_fmt`
+  （三语言）；HeadlessDecode 共用同一 Decoder 自动覆盖。BT.601/full-range/BT.2020 tag 只
+  埋 warning 日志（播放继续）。
+- 验证（2026-09-08，RTX 4080）：hevc_nvenc 生成的 yuv420p10le 测试片 open 明确报错含格式名
+  （Player 与 HeadlessDecode 两路径），报错后 open 正常视频不崩；full-range(yuvj420p)/bt601
+  (bt470bg) 测试片正常打开并打出对应 warning；test_video.mp4 NV12 回归无影响；i18n 三语言
+  键对齐 + 插值实测、`verify_i18n.py` 全过；`smoke_player.py pause` 通过。
 
 ### S8 — 低危杂项打包 ✅/⬜
 - i18n 两处硬编码中文改走 `set_ui_strings`；`settings.positions` 加 LRU cap；named pipe payload 加 64KB 上限；`ExportQueue.remove/cancel` 判 None；present trace 换定长 ring。

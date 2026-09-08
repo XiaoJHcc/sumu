@@ -30,6 +30,7 @@
   "dialog_all_files": "所有文件",
   "open_failed": "无法打开该视频",
   "open_failed_named": "无法打开：{name}",
+  "open_failed_unsupported_pix_fmt": "不支持的视频格式：{fmt}（{name}）——目前仅支持 8-bit 视频，10-bit/HDR 暂不支持",
   "warmup_failed": "预热失败",
   "warmup_status": "正在预热模型…",
   "compile_running": "正在编译加速引擎 {step}/{total}…（首次，需数分钟）",

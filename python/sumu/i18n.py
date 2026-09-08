@@ -60,6 +60,7 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "dialog_all_files",
     "open_failed",
     "open_failed_named",
+    "open_failed_unsupported_pix_fmt",
     "warmup_failed",
     "warmup_status",
     "compile_running",

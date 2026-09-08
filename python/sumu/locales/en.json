@@ -30,6 +30,7 @@
   "dialog_all_files": "All Files",
   "open_failed": "Could not open this video",
   "open_failed_named": "Could not open: {name}",
+  "open_failed_unsupported_pix_fmt": "Unsupported video format: {fmt} ({name}) — only 8-bit video is supported; 10-bit/HDR is not yet supported",
   "warmup_failed": "Warmup failed",
   "warmup_status": "Warming up models…",
   "compile_running": "Compiling acceleration engines {step}/{total}… (first time, may take minutes)",
