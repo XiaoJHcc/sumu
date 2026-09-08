@@ -183,8 +183,25 @@
   present_stats 正常（n=451 median=33.36ms）；`smoke_player.py pause` 通过。present trace
   上限取「超 64K 条丢最旧一半」（非环形缓冲，erase memmove ~18 分钟一次，热路径可忽略）。
 
-### S9 — 收尾回归与文档 ✅/⬜
+### S9 — 收尾回归与文档 ✅
 - `native\smoke_player.py all`、`scripts\run_player.py --seconds 60 --seek-test`、相关 verify 脚本全跑；更新本文档勾选与验证记录；AGENTS.md docs 索引补本文件。
+- 回归结果（2026-09-08，RTX 4080，修复链 2306c7f→3431880 全部在树）：
+
+  | 项 | 结果 | 关键数字 |
+  |---|---|---|
+  | smoke_player all：4K60 流畅度 | PASS | 50s 跑满 present=3001（≈60/s），无 stall |
+  | smoke_player all：pause | PASS | frozen_ok/resumed_ok=true |
+  | smoke_player all：seek 风暴 | PASS* | `all` 序列内 seek 窗口在第 1 次 seek 后被外部关闭（quit_early，两次 `all` 均复现；standalone `seek --rounds 4` 20/20 无崩溃无冻结）——判定为用户桌面环境关窗，非本次修复链回归 |
+  | run_player --seconds 60 --seek-test | PASS | seek 1788/1788 精确、恢复窗 ai_hit_rate=0.969、present median=33.37/p99=33.71ms、restore_fps=202、frame_cache_misses=0（S3 基线 0.950/33.36/33.82，无回归） |
+  | run_player --correctness --seconds 20 | PASS | 5/5 采样 channel_order_ok + mosaic_fix_detected（S4 动过的 push/pull 桥画面正确性交叉校验） |
+  | verify_i18n / verify_settings / verify_weights_resolve | PASS | 全过 |
+  | stress_reopen --rounds 8 | PASS | 8/8 reopen、双方向分辨率正确、crashed/stalled=False |
+  | stress_seek_ai --rounds 2 | PASS | 10/10 seek 精确落帧、无崩溃无冻结、seek_resets=28 |
+  | verify_transcode（--frames 90） | PASS | HLS 输出正常（S4 HeadlessDecode ctx / S7 decoder 门禁路径） |
+  | verify_transcode_ai（--seconds 8） | PASS | RESULT==PASS，AI 去码管线 e2e |
+  | 场景抽查：3 帧短视频（S1） | PASS | 0.04s 打开、播至末帧自动暂停 |
+  | 场景抽查：10-bit 片（S7） | PASS | open 报 `unsupported_pix_fmt:yuv420p10le`，i18n 映射正确，拒绝后再 open 正常视频不崩 |
+
 
 ## 后续方向（本次不做，记录在案）
 
