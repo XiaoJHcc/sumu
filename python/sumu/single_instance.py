@@ -33,6 +33,9 @@ _PIPE_WAIT = 0x00000000
 _PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
 _ERROR_PIPE_CONNECTED = 535
 _ERROR_FILE_NOT_FOUND = 2
+
+# L4: 单条转发消息（换行终止的 UTF-8 路径）的 payload 上限，超限断开连接。
+_MAX_PAYLOAD_BYTES = 64 * 1024
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 _kernel32.CreateNamedPipeW.restype = wintypes.HANDLE
@@ -146,12 +149,23 @@ class PipeListener(threading.Thread):
                     return
             payload = bytearray()
             chunk = ctypes.create_string_buffer(4096)
-            while b"\n" not in payload:
+            scanned = 0  # L4: find 起点 —— 已扫过的前缀不可能新出现 '\n'，避免每次全量重扫（O(n²)）
+            while True:
+                if payload.find(b"\n", scanned) >= 0:
+                    break
+                scanned = len(payload)
                 n = wintypes.DWORD(0)
                 if (not _kernel32.ReadFile(h, chunk, len(chunk), ctypes.byref(n), None)
                         or n.value == 0):
                     return  # client vanished before finishing its line -- ignore it
                 payload += chunk.raw[: n.value]
+                # L4: payload 上限 —— 此前无上限，恶意/异常客户端永不发 '\n' 就无限累积。
+                # 超限直接断开（finally 里 Disconnect/Close），不投递、不 ack，listener
+                # 本身不受影响（路径转发正常 payload 远小于此 —— MAX_PATH 级）。
+                if len(payload) > _MAX_PAYLOAD_BYTES:
+                    print(f"== single-instance == payload over {_MAX_PAYLOAD_BYTES} bytes "
+                          "without newline, dropping connection", file=sys.stderr)
+                    return
             self.incoming.put(payload.rstrip(b"\r\n").decode("utf-8", "replace"))
             n = wintypes.DWORD(0)
             _kernel32.WriteFile(h, b"1", 1, ctypes.byref(n), None)

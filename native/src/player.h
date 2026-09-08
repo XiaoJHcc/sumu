@@ -834,10 +834,13 @@ private:
         std::string export_preset_name_label;
         std::string export_preset_codec_label;
         std::string export_preset_cq_label;
+        std::string export_preset_cq_end_quality;
+        std::string export_preset_cq_end_size;
         std::string export_preset_bitrate_label;
         std::string export_preset_maxrate_label;
         std::string export_preset_vbr_label;
         std::string export_preset_quality_label;
+        std::string export_preset_quality_highest;
         std::string export_preset_audio_label;
         std::string export_preset_audio_copy;
         std::string export_preset_audio_encode;

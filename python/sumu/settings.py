@@ -25,6 +25,12 @@ from typing import Optional
 
 RECENT_CAP = 10
 
+# positions（续播进度）LRU 上限：此前每播放过一个文件永久新增一条、settings.json
+# 无限变大（L3）。dict 保序 = 插入序，set_position 把命中键移到末尾（MRU），
+# 超限从头淘汰最旧。只在写路径淘汰，读路径/加载路径不动（旧文件里超量的条目
+# 随下一次写入自然收敛）。
+POSITIONS_CAP = 500
+
 # UI language preference: "auto" follows the OS; otherwise a supported catalog code.
 # Keep the allowed set in sync with sumu.i18n.SUPPORTED_LANGS (settings stays stdlib-only
 # and must not import i18n, so the list is duplicated here as a clamp table).
@@ -167,7 +173,11 @@ class Settings:
         del self.recent[RECENT_CAP:]
 
     def set_position(self, path: str, frame: int) -> None:
-        self.positions[_norm_key(path)] = int(frame)
+        key = _norm_key(path)
+        self.positions.pop(key, None)  # 移到末尾 = MRU；不存在则纯新增
+        self.positions[key] = int(frame)
+        while len(self.positions) > POSITIONS_CAP:
+            self.positions.pop(next(iter(self.positions)))  # 淘汰最旧（LRU）
 
     def get_position(self, path: str) -> Optional[int]:
         return self.positions.get(_norm_key(path))

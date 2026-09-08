@@ -760,7 +760,7 @@ void Player::build_export_preset_editor(){
     ui::InlineLabel(ui_str_.export_preset_cq_label.c_str(), mix_label_w);
     if (export_preset_cq_enabled_)
         ui::SliderIntEnds("##ep_cq", &export_preset_cq_, 0, 51,
-            u8"高质量", u8"小体积");
+            ui_str_.export_preset_cq_end_quality.c_str(), ui_str_.export_preset_cq_end_size.c_str());
     else
         ImGui::NewLine();
 
@@ -783,7 +783,9 @@ void Player::build_export_preset_editor(){
 
     const float combo_w = ui_s(160.0f);
 
-    const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", "p7（最高）" };
+    // p7 带「最高」后缀，文案走 i18n（此前硬编码中文，任何 UI 语言都显示中文）。
+    const std::string quality_p7 = std::string("p7") + ui_str_.export_preset_quality_highest;
+    const char* quality_items[] = { "p1", "p2", "p3", "p4", "p5", "p6", quality_p7.c_str() };
     ui::InlineLabel(ui_str_.export_preset_quality_label.c_str(), label_w);
     ui::Combo("##ep_quality", quality_items, 7, &export_preset_quality_idx_, combo_w);
 

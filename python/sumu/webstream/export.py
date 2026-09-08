@@ -103,7 +103,8 @@ class ExportQueue:
                 return
             if item.status == "running":
                 self._cancel_requested = True
-                self.engine.cancel()
+                if self.engine is not None:  # None until model warmup wires the engine in
+                    self.engine.cancel()
             self.items = [it for it in self.items if it.id != item_id]
 
     def cancel(self, item_id: int) -> None:
@@ -114,7 +115,8 @@ class ExportQueue:
                 return
             if item.status == "running":
                 self._cancel_requested = True
-                self.engine.cancel()
+                if self.engine is not None:  # None until model warmup wires the engine in
+                    self.engine.cancel()
             elif item.status == "pending":
                 item.status = "cancelled"
 

@@ -174,8 +174,14 @@
   (bt470bg) 测试片正常打开并打出对应 warning；test_video.mp4 NV12 回归无影响；i18n 三语言
   键对齐 + 插值实测、`verify_i18n.py` 全过；`smoke_player.py pause` 通过。
 
-### S8 — 低危杂项打包 ✅/⬜
+### S8 — 低危杂项打包 ✅
 - i18n 两处硬编码中文改走 `set_ui_strings`；`settings.positions` 加 LRU cap；named pipe payload 加 64KB 上限；`ExportQueue.remove/cancel` 判 None；present trace 换定长 ring。
+- 验证（2026-09-08，RTX 4080）：`verify_i18n.py` / `verify_settings.py` 全过；预设编辑器截图
+  目检 zh（高质量/小体积、p7（最高））与 en（Quality/Size、p7 (highest)）双语渲染正确；
+  临时脚本断言 positions LRU 500 上限/淘汰/MRU 刷新、pipe 正常转发 + 256KB 无换行超限断开
+  后 listener 存活可再转发、engine=None 的 remove/cancel 不崩；`run_player.py --seconds 15`
+  present_stats 正常（n=451 median=33.36ms）；`smoke_player.py pause` 通过。present trace
+  上限取「超 64K 条丢最旧一半」（非环形缓冲，erase memmove ~18 分钟一次，热路径可忽略）。
 
 ### S9 — 收尾回归与文档 ✅/⬜
 - `native\smoke_player.py all`、`scripts\run_player.py --seconds 60 --seek-test`、相关 verify 脚本全跑；更新本文档勾选与验证记录；AGENTS.md docs 索引补本文件。

@@ -1183,10 +1183,13 @@ void Player::set_ui_strings(const py::dict& d){
     take("export_preset_name_label", ui_str_.export_preset_name_label);
     take("export_preset_codec_label", ui_str_.export_preset_codec_label);
     take("export_preset_cq_label", ui_str_.export_preset_cq_label);
+    take("export_preset_cq_end_quality", ui_str_.export_preset_cq_end_quality);
+    take("export_preset_cq_end_size", ui_str_.export_preset_cq_end_size);
     take("export_preset_bitrate_label", ui_str_.export_preset_bitrate_label);
     take("export_preset_maxrate_label", ui_str_.export_preset_maxrate_label);
     take("export_preset_vbr_label", ui_str_.export_preset_vbr_label);
     take("export_preset_quality_label", ui_str_.export_preset_quality_label);
+    take("export_preset_quality_highest", ui_str_.export_preset_quality_highest);
     take("export_preset_audio_label", ui_str_.export_preset_audio_label);
     take("export_preset_audio_copy", ui_str_.export_preset_audio_copy);
     take("export_preset_audio_encode", ui_str_.export_preset_audio_encode);

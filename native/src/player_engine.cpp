@@ -1219,6 +1219,17 @@ void Player::present_loop(){
             present_qpc_ns_.push_back(qpc_to_ns(pres_now));
             present_source_.push_back(static_cast<int8_t>(source));
             present_frame_num_.push_back(frame);
+            // L2 修复：trace vector 全生命周期只增不清（~5-10MB/h）。超过上限丢弃最旧
+            // 一半 —— trace 只在调试/分析时读取（dump_present_trace/present_stats），
+            // 保留最近窗口足够。erase 前半段是 O(n) memmove，但每 64K tick（60fps 下
+            // ~18 分钟）才发生一次、单次移动 <2MB，热路径开销可忽略。
+            constexpr size_t kPresentTraceCap = 1u << 16;
+            if (present_qpc_ns_.size() > kPresentTraceCap) {
+                const size_t drop = kPresentTraceCap / 2;
+                present_qpc_ns_.erase(present_qpc_ns_.begin(), present_qpc_ns_.begin() + drop);
+                present_source_.erase(present_source_.begin(), present_source_.begin() + drop);
+                present_frame_num_.erase(present_frame_num_.begin(), present_frame_num_.begin() + drop);
+            }
         }
         present_count_.fetch_add(1, std::memory_order_relaxed);
         switch (source) {
