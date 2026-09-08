@@ -111,8 +111,12 @@
   present median=33.36ms/p99=33.82ms、frame_cache_misses=0、seek_resets=1，与
   docs/scheduler.md 基线无回归。
 
-### S4 — H3+M1+M2+L1：CUDA RAII 与杂项原生修复 ✅/⬜
+### S4 — H3+M1+M2+L1：CUDA RAII 与杂项原生修复 ✅
 - Map/Unmap 上 RAII guard（三处）；`close()` 开头先 `session_active_.store(false)`；seek 加 `gil_scoped_release`；HeadlessDecode 配对 `cuDevicePrimaryCtxRelease`。
+- 验证（2026-09-08，RTX 4080）：`run_player.py --seconds 15` AI 会话正常（ai_push 567，覆盖
+  guard 正常路径）；HeadlessDecode 50× new/open/decode/close 无泄漏报错，同实例 open→close→open
+  （re-retain 分支）与 double close 幂等通过；`smoke_player.py pause` + `seek --rounds 2` 全绿；
+  seek GIL 修复为静态确认（与 open/reopen 同款 call_guard）。
 
 ### S5 — P1+P3：scheduler 性能与 VRAM ✅/⬜
 - `torch.cuda.synchronize()` ×2 改 CUDA event 计时；frame_cache 按字节预算（分辨率感知）反推帧数上限。

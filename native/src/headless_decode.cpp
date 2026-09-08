@@ -35,6 +35,7 @@
 #include "decoder.h"
 #include "headless_decode.h"
 #include "d3d_util.h"
+#include "cuda_util.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -113,10 +114,10 @@ public:
         // CUDA primary context: the SAME primary context torch uses (torch's CUDA runtime also
         // retains it), so the returned dev_ptr is directly wrap-able by torch's DLPack / usable
         // by the AI kernels -- no cross-context copy. Mirrors player.cpp's open() init.
+        // cu_dev_ 存成成员：close() 要配对 Release 这次 Retain（L1）。
         check_cu(cuInit(0), "cuInit");
-        CUdevice dev;
-        check_cu(cuDeviceGet(&dev, 0), "cuDeviceGet");
-        check_cu(cuDevicePrimaryCtxRetain(&cu_ctx_, dev), "cuDevicePrimaryCtxRetain");
+        check_cu(cuDeviceGet(&cu_dev_, 0), "cuDeviceGet");
+        check_cu(cuDevicePrimaryCtxRetain(&cu_ctx_, cu_dev_), "cuDevicePrimaryCtxRetain");
         check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent");
 
         compile_blit_shaders();
@@ -127,6 +128,13 @@ public:
     void open(const std::string& path)
     {
         close(); // idempotent reset (mirrors Decoder::open)
+        // close() 现在会配对 Release 掉 primary ctx（L1）—— 同一实例再次 open 时必须重新
+        // Retain，否则下面 create_bridge_resources() 的 Register 没有 current ctx。
+        if (!cu_ctx_) {
+            check_cu(cuDevicePrimaryCtxRetain(&cu_ctx_, cu_dev_),
+                "cuDevicePrimaryCtxRetain (re-open)");
+            check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (re-open)");
+        }
         std::string err;
         if (!decoder_.open(path, device_.Get(), err))
             throw std::runtime_error("HeadlessDecode.open: " + err);
@@ -197,6 +205,9 @@ public:
                 check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (next_frame)");
                 CUgraphicsResource res[2] = { cu_res_y_, cu_res_uv_ };
                 check_cu(cuGraphicsMapResources(2, res, 0), "cuGraphicsMapResources");
+                // H3: Map 之后任一 throw 由 guard 析构 best-effort Unmap（此前资源留
+                // mapped 状态，后续 Register/Unregister 行为未定义）。正常路径 dismiss。
+                CuGraphicsUnmapGuard unmap_guard(res, 2);
 
                 CUarray cu_arr_y = nullptr, cu_arr_uv = nullptr;
                 check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_y, cu_res_y_, 0, 0),
@@ -225,6 +236,7 @@ public:
                 check_cu(cuMemcpy2D(&cp_uv), "cuMemcpy2D(UV: array -> device)");
 
                 check_cu(cuGraphicsUnmapResources(2, res, 0), "cuGraphicsUnmapResources");
+                unmap_guard.dismiss();
 
                 dev_ptr = static_cast<uint64_t>(cu_buf_);
                 pitch = static_cast<size_t>(width_);
@@ -288,6 +300,18 @@ public:
         decoder_.close();
         width_ = 0; height_ = 0; fps_ = 60.0; frame_count_ = 0;
         opened_ = false;
+        // L1 修复：配对构造函数的 cuDevicePrimaryCtxRetain —— 此前 dev 是构造函数局部
+        // 变量，retain 计数只增不减（每次转码任务 new 一个实例就 +1）。放在最后（上面的
+        // Unregister/MemFree 仍需 ctx）。幂等：cu_ctx_ 置空后重复 close() 不再 Release；
+        // Release 失败不 throw（close 会从 ~HeadlessDecode 里跑），只留诊断日志。
+        if (cu_ctx_) {
+            cuCtxSetCurrent(nullptr);
+            CUresult r = cuDevicePrimaryCtxRelease(cu_dev_);
+            if (r != CUDA_SUCCESS)
+                fprintf(stderr, "[sumu] HeadlessDecode: cuDevicePrimaryCtxRelease failed "
+                    "(CUresult=%d)\n", static_cast<int>(r));
+            cu_ctx_ = nullptr;
+        }
     }
 
 private:
@@ -382,6 +406,7 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     CUcontext cu_ctx_ = nullptr;
+    CUdevice cu_dev_ = 0; // L1: 构造函数 Retain 的设备，close() 配对 Release 用
 
     Decoder decoder_;
 

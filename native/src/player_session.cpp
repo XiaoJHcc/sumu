@@ -517,6 +517,12 @@ void Player::close(){
     set_quit(); // this Player is on its way out -- keep should_quit() consistent even if
                 // close() is reached by a path other than WM_DESTROY/ESC (e.g. play.py's
                 // no-file-selected early exit).
+    // M1 修复：先翻 session_active_ 再拆。reopen 路径有这个防护，close 路径此前没有 ——
+    // Python 侧 Scheduler.stop() 的 join 超时后 AI 线程可能还活着，在 close_session()
+    // 拆除过程中穿过防护索引已 .clear() 的 vector（UB）。push_ai_frame()/
+    // get_cuda_nv12_by_frame() 的 acquire 检查读到 false 即 no-op/miss 退出（退出路径
+    // 不碰任何会话资源），与 reopen() 的 release 同款配对。
+    session_active_.store(false, std::memory_order_release);
     stop_.store(true, std::memory_order_relaxed);
     if (present_thread_.joinable()) present_thread_.join(); // barrier: present is now fully
                                                               // stopped before anything below

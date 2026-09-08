@@ -60,7 +60,11 @@ PYBIND11_MODULE(sumu_core, m)
         .def("set_ui_strings", &Player::set_ui_strings, py::arg("strings")) // i18n label table
 
         .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_
-        .def("seek", &Player::seek, py::arg("frame_num"))
+        // gil_scoped_release: seek 要等 decoder_mutex_，decode 线程持锁可跨 15s 网络读
+        // （rw_timeout）—— 不释放 GIL 会冻结整个 Python 主线程（窗口"未响应"）。与
+        // open/reopen/close_current_session 同款。
+        .def("seek", &Player::seek, py::arg("frame_num"),
+            py::call_guard<py::gil_scoped_release>())
         .def("push_ai_frame", &Player::push_ai_frame,
             py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"), py::arg("pitch_bytes"))
         .def("get_cuda_nv12_by_frame", &Player::get_cuda_nv12_by_frame, py::arg("frame_num"))

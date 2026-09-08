@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
+#include "cuda_util.h"
 
 namespace {
 
@@ -188,6 +189,9 @@ void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int 
 
     try {
         check_cu(cuGraphicsMapResources(1, &cu_res_, 0), "cuGraphicsMapResources");
+        // H3: Map 之后任一 throw 都由 guard 析构 best-effort Unmap（此前 catch 只 rethrow，
+        // 资源留 mapped 状态）。正常路径显式 Unmap 后 dismiss。
+        CuGraphicsUnmapGuard unmap_guard(&cu_res_, 1);
         CUarray cu_arr = nullptr;
         check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr, cu_res_, 0, 0),
             "cuGraphicsSubResourceGetMappedArray");
@@ -203,6 +207,7 @@ void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int 
         check_cu(cuMemcpy2D(&cp), "cuMemcpy2D (device -> mapped landing array)");
 
         check_cu(cuGraphicsUnmapResources(1, &cu_res_, 0), "cuGraphicsUnmapResources");
+        unmap_guard.dismiss();
 
         UINT slot = wrap_ai_slot(frame_num);
         context_->CopySubresourceRegion(ai_ring_tex_.Get(), slot, 0, 0, 0,
@@ -349,6 +354,8 @@ py::dict Player::get_cuda_nv12_by_frame(int64_t frame_num){
 
         CUgraphicsResource res[2] = { ai_in_cu_res_y_, ai_in_cu_res_uv_ };
         check_cu(cuGraphicsMapResources(2, res, 0), "cuGraphicsMapResources(ai_in)");
+        // H3: 同 push_ai_frame —— 异常路径由 guard 析构 best-effort Unmap。
+        CuGraphicsUnmapGuard unmap_guard(res, 2);
 
         CUarray cu_arr_y = nullptr, cu_arr_uv = nullptr;
         check_cu(cuGraphicsSubResourceGetMappedArray(&cu_arr_y, ai_in_cu_res_y_, 0, 0),
@@ -380,6 +387,7 @@ py::dict Player::get_cuda_nv12_by_frame(int64_t frame_num){
         check_cu(cuMemcpy2D(&cp_uv), "cuMemcpy2D (ai_in UV: array -> device)");
 
         check_cu(cuGraphicsUnmapResources(2, res, 0), "cuGraphicsUnmapResources(ai_in)");
+        unmap_guard.dismiss();
     } catch (const std::exception& e) {
         HRESULT removed = device_ ? device_->GetDeviceRemovedReason() : S_OK;
         char buf[768];
