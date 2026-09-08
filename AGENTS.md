@@ -124,6 +124,7 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `docs/ui_design.md` | UI 设计规范：色板 / 尺寸刻度 / 控件 API / 页面布局 / Dos&Don'ts |
 | `docs/webstream.md` | Web 流媒体服务器 / 离线导出：passthrough 与 AI 去码两种模式、路由、边界 |
 | `docs/packaging.md` | PyInstaller onedir 打包管线、spec 要点、验证边界、已知坑 |
+| `docs/final_review.md` | 收尾全量审查台账：发现清单（H/M/L/性能/格式缺口）+ 分阶段修复计划与验证记录 |
 
 ### 其它要点
 
