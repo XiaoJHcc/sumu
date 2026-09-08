@@ -48,13 +48,19 @@ D「重写」清单），但它调用的每一个计算函数（`scene_clip.py` 
 `OrderedDict`（FIFO，超容量从最旧的开始淘汰），供该帧所属 clip 完成后 `blend_back_frame`
 使用。
 
-容量 = `lead + clip_length + frame_cache_margin`（默认 `180 + 30 + 16 = 226`
-帧）——推导依据：一个 clip 最坏情况在 frontier 的末尾才刚开始，其 `frame_start` 也不会早于
+容量 = `min(lead + clip_length + frame_cache_margin, 字节预算 // 每帧字节数)`（帧数上限默认
+`180 + 30 + 16 = 226` 帧；字节预算 `_FRAME_CACHE_BUDGET_BYTES = 2 GiB`，S5/P3 引入）——帧数
+推导依据：一个 clip 最坏情况在 frontier 的末尾才刚开始，其 `frame_start` 也不会早于
 `head`（否则早被 frontier 闸门追上/重置），所以只要缓存跨度覆盖 `lead + clip_length`，任何
-仍在 in-flight 状态的 clip 所需的原始帧就不会被淘汰。两次真实运行（10s、45s+seek）里
-`frame_cache_misses` 均为 **0**，验证了这个容量公式在实测下是足够的（miss 分支仍然写了防御性
-代码：跳过 push、记录一次 miss、调用 `clip.pop()` 保持 clip 内部 bookkeeping 一致，而不是
-desync 或抛异常）。
+仍在 in-flight 状态的 clip 所需的原始帧就不会被淘汰。字节预算是 I8「VRAM 是一等约束」的
+分辨率感知钳制：缓存的是全分辨率 BGR HWC uint8（1080p ≈6.2MB/帧 → 226 帧 ≈1.4GB 不超预算，
+行为不变；4K ≈24.9MB/帧 → 226 帧 ≈5.6GB 超预算，clamp 到 ~86 帧并记一次性 warning），下限
+保底 `clip_length + frame_cache_margin`（46 帧，即使超预算也保证一个完整在飞 clip 放得下）。
+4K 被 clamp 后，远端 clip 的早期帧可能在 blend 前被淘汰（计 `frame_cache_misses`、丢 region）
+——4K 去码本来就是 best-effort，这是可接受的降级。两次真实运行（10s、45s+seek）里
+`frame_cache_misses` 均为 **0**，验证了 1080p 下这个容量公式在实测下是足够的（miss 分支仍然
+写了防御性代码：跳过 push、记录一次 miss、调用 `clip.pop()` 保持 clip 内部 bookkeeping
+一致，而不是 desync 或抛异常）。
 
 ### RGBA 通道序
 
@@ -71,7 +77,7 @@ desync 或抛异常）。
 | `clip_size` | 256 | 送入 BasicVSR++ 的方形 crop/resize 尺寸。**锁死 256，非可调降级旋钮**——烧进 TRT 引擎编译 shape（`INPUT_SIZE`），改动需重新编译引擎 |
 | `max_regions_per_frame` | 1 | 同帧最多同时去码的马赛克区块数（UI：同帧最多区块数） |
 | `lead` | 默认 180（UI：缓冲窗口） | frontier 闸门上界：`ai_frontier ∈ [head, head+lead]`，运行时钳到 native `decode_ahead_max`（PT 环，约 170；4K 与 1080p 同深） |
-| `frame_cache_capacity` | `lead+clip_length+frame_cache_margin` = 226 | 见上「frame_cache」 |
+| `frame_cache_capacity` | `lead+clip_length+frame_cache_margin` = 226（帧数上限，另受 2 GiB 字节预算钳制） | 见上「frame_cache」 |
 | `frame_cache_margin` | 16 | 容量公式的安全余量 |
 | `sleep_step_s` | 0.0015 | 无事可做（decode 未到/frontier 太超前）时的节流 sleep |
 | `seek_jump_threshold` | 500 帧 | 兜底 discontinuity 启发式的前跳阈值 |

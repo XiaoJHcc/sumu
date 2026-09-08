@@ -71,6 +71,13 @@ _AI_PUSH_MARGIN = 8
 _ERROR_BACKOFF_BASE_S = 0.1
 _ERROR_BACKOFF_MAX_S = 1.0
 
+# DESIGN.md I8 (VRAM is a first-class constraint): frame_cache holds full-resolution BGR HWC
+# uint8 CUDA tensors (~6.2MB/frame at 1080p, ~24.9MB/frame at 4K). The frame-count cap
+# (lead + clip_length + margin ~= 226 frames) is resolution-blind: ~1.4GB at 1080p but
+# ~5.6GB at 4K. So the cap is additionally clamped by this byte budget once the real
+# per-frame size is known from the first cached frame (see _frame_cache_cap).
+_FRAME_CACHE_BUDGET_BYTES = 2 * 1024**3
+
 
 def clamp_cold_start_s(value) -> float:
     """UI / settings range: 0–3 seconds. Non-numeric / NaN → default 1.0."""
@@ -252,6 +259,18 @@ class Scheduler:
         self.ai_frontier = 0
         self._last_head = 0
         self._eof_flushed_at: Optional[int] = None
+        # P1: restore timing via CUDA event pairs instead of torch.cuda.synchronize()
+        # (a device-wide sync per clip serializes YOLO/blend/push/next-clip submission and
+        # breaks the GPU pipeline). One pair is in flight at a time; settled (read) lazily on
+        # the next _restore_and_push once the end event has completed - elapsed_time() before
+        # completion raises, so it is only ever called after query() says True. Events are
+        # recycled through this pool to avoid re-creation churn.
+        self._restore_ev_pair: list = []  # FIFO of (start_ev, end_ev, n_frames) awaiting settle
+        self._restore_ev_pool: list = []
+        # P3: per-frame byte size of cached tensors, learned from the first _cache_put (the
+        # byte-budget clamp in _frame_cache_cap only kicks in afterwards).
+        self._frame_bytes = 0
+        self._frame_cache_cap_warned = False
 
     # ---- public control surface --------------------------------------------------------
 
@@ -374,10 +393,33 @@ class Scheduler:
 
     def _frame_cache_cap(self) -> int:
         cfg = self.config
-        return max(
+        frames_cap = max(
             int(cfg.frame_cache_capacity or 0),
             self._effective_lead() + cfg.clip_length + cfg.frame_cache_margin,
         )
+        # P3 / I8: clamp by the VRAM byte budget once the real per-frame size is known (first
+        # _cache_put). The frame-count cap alone is resolution-blind: ~1.4GB at 1080p but
+        # ~5.6GB at 4K. Behaviour change: at 4K the cache now holds fewer frames than the lead
+        # span, so long clips far ahead of the head may find their early frames evicted before
+        # blend (counted as frame_cache_misses, regions dropped) - accepted trade-off: VRAM is
+        # a first-class constraint and 4K AI is best-effort anyway.
+        if self._frame_bytes > 0:
+            budget_frames = _FRAME_CACHE_BUDGET_BYTES // self._frame_bytes
+            # Floor: always room for at least one full in-flight clip plus margin, even if
+            # that alone exceeds the byte budget.
+            floor = cfg.clip_length + cfg.frame_cache_margin
+            byte_cap = max(floor, budget_frames)
+            if byte_cap < frames_cap:
+                if not self._frame_cache_cap_warned:
+                    self._frame_cache_cap_warned = True
+                    logger.warning(
+                        "scheduler: frame_cache cap clamped by VRAM budget: %d -> %d frames "
+                        "(%d B/frame, budget %d MiB, floor %d)",
+                        frames_cap, byte_cap, self._frame_bytes,
+                        _FRAME_CACHE_BUDGET_BYTES >> 20, floor,
+                    )
+                return byte_cap
+        return frames_cap
 
     # ---- internals ------------------------------------------------------------------------
 
@@ -458,6 +500,9 @@ class Scheduler:
         self.ai_frontier = head
         self._last_head = head
         self._eof_flushed_at = None
+        # Drop unsettled restore-timing pairs: after e.g. a CUDA OOM their measurement is
+        # meaningless (and touching events on a possibly-broken context is not worth it).
+        self._restore_ev_pair.clear()
         self.stats.backlog_resyncs += 1
 
     def _run_iteration(self, gen: int) -> None:
@@ -563,18 +608,30 @@ class Scheduler:
     def _restore_and_push(self, clip: Clip, gen: int) -> None:
         frame_start, frame_end = clip.frame_start, clip.frame_end  # Clip.pop() mutates these
         n_frames = frame_end - frame_start + 1
-        # Net BasicVSR wall time only (no gate wait). Synchronize so async GPU work is fully
-        # charged to this clip rather than leaking into the subsequent blend/push path.
+        # P1: time restore with a CUDA event pair, NOT torch.cuda.synchronize(). A device-wide
+        # sync per clip drains the whole GPU pipeline every clip_length frames, serializing
+        # YOLO/blend/push/next-clip submission (same hazard webstream/decensor.py documents).
+        # Events record on the current stream, so the pair brackets everything the producer
+        # submitted in between - same measurement scope as the old sync-based wall time. The
+        # pair is settled lazily (next call, once the end event completes), so restore_fps
+        # lags reality by at most one clip and a clip in flight at stop() is simply not
+        # counted. CPU-only fallback keeps the old perf_counter measure (approximate: it
+        # includes submission overhead).
+        self._settle_restore_timing()
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        restore_clip(self.res_model, self.config.model_name, clip)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-        if dt > 0.0 and n_frames > 0:
-            self.stats.restore_frames += n_frames
-            self.stats.restore_seconds += dt
+            start_ev = self._restore_ev_pool.pop() if self._restore_ev_pool else torch.cuda.Event(enable_timing=True)
+            end_ev = self._restore_ev_pool.pop() if self._restore_ev_pool else torch.cuda.Event(enable_timing=True)
+            start_ev.record()
+            restore_clip(self.res_model, self.config.model_name, clip)
+            end_ev.record()
+            self._restore_ev_pair.append((start_ev, end_ev, n_frames))
+        else:
+            t0 = time.perf_counter()
+            restore_clip(self.res_model, self.config.model_name, clip)
+            dt = time.perf_counter() - t0
+            if dt > 0.0 and n_frames > 0:
+                self.stats.restore_frames += n_frames
+                self.stats.restore_seconds += dt
         self.stats.clips_restored += 1
 
         # The restore above can easily outlive a stop() join timeout (4K/long clips): if this
@@ -615,6 +672,23 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             head = 0
         self._flush_pending_to_native(head, gen)
+
+    def _settle_restore_timing(self) -> None:
+        """Read out completed restore-timing event pairs (P1). elapsed_time() raises if the
+        end event has not completed, so it is only called after query() says done; the stream
+        is FIFO, so the first incomplete pair means everything behind it is incomplete too.
+        Completed events go back to the pool for reuse."""
+        pending = self._restore_ev_pair
+        while pending:
+            start_ev, end_ev, n_frames = pending[0]
+            if not end_ev.query():
+                break
+            pending.pop(0)
+            dt = start_ev.elapsed_time(end_ev) / 1000.0  # ms -> s
+            if dt > 0.0 and n_frames > 0:
+                self.stats.restore_frames += n_frames
+                self.stats.restore_seconds += dt
+            self._restore_ev_pool.extend((start_ev, end_ev))
 
     def _flush_pending_to_native(self, head: int, gen: int) -> None:
         """Blend pending sparse regions for frames in [head, head+ai_push_window] and push.
@@ -679,6 +753,16 @@ class Scheduler:
                 self.stats.first_push_at = time.monotonic()
 
     def _cache_put(self, n: int, frame: torch.Tensor) -> None:
+        if self._frame_bytes == 0:
+            # First cached frame: learn the real per-frame byte size for the P3 byte-budget
+            # clamp, and log the resulting cap once (also fires the clamp warning here if the
+            # budget already binds at this resolution).
+            self._frame_bytes = int(frame.nelement()) * int(frame.element_size())
+            logger.info(
+                "scheduler: frame_cache frame=%d B (%dx%d) -> cap=%d frames (budget %d MiB)",
+                self._frame_bytes, frame.shape[1], frame.shape[0],
+                self._frame_cache_cap(), _FRAME_CACHE_BUDGET_BYTES >> 20,
+            )
         self.frame_cache[n] = frame
         # Drop frames already behind the present head (no clip can still need them for blend).
         head = 0

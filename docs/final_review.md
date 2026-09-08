@@ -118,9 +118,31 @@
   （re-retain 分支）与 double close 幂等通过；`smoke_player.py pause` + `seek --rounds 2` 全绿；
   seek GIL 修复为静态确认（与 open/reopen 同款 call_guard）。
 
-### S5 — P1+P3：scheduler 性能与 VRAM ✅/⬜
-- `torch.cuda.synchronize()` ×2 改 CUDA event 计时；frame_cache 按字节预算（分辨率感知）反推帧数上限。
-- 验证：`scripts\run_player.py --seconds 60` 对比 restore_fps / ai_hit_rate。
+### S5 — P1+P3：scheduler 性能与 VRAM ✅
+- **P1**：`_restore_and_push` 删掉每 clip 两次 `torch.cuda.synchronize()`（device 级 sync 把
+  YOLO/blend/push/下一 clip 提交串行化，危害同 webstream/decensor.py 注释），改 CUDA event 对
+  计时：start/end record 在同一 stream（测量范围与原 sync 一致），下一次进 `_restore_and_push`
+  时经 `_settle_restore_timing` 结算已完成的 pair（`query()` 守门，绝不在未完成时调
+  `elapsed_time()`），event 经 pool 复用；`_resync_after_error` 丢弃在飞 pair。CPU-only 回退
+  保留 perf_counter 近似计时。restore_fps 语义不变（两 record 间全部 GPU 工作），最多滞后一个 clip。
+- **P3**：frame_cache 上限改 `min(帧数 cap, 2 GiB // 每帧字节)`，每帧字节从首个缓存帧形状推
+  （1080p 6.2MB/帧→226 帧不变；4K 24.9MB/帧→clamp 到 86 帧+一次性 warning）；下限保底
+  `clip_length+frame_cache_margin`=46 帧（即使超预算也容得下一个完整在飞 clip）。行为变化
+  （4K clamp 后远端 clip 早期帧可能被淘汰计 miss）已写注释 + 更新 docs/scheduler.md。
+- 验证（2026-09-08，RTX 4080，改前基线同机实跑对比）：
+  - 1080p 60s（基线→改后）：ai_hit_rate 0.9789→0.9811，restore_fps 218.1→222.6（同量级，
+    语义衔接），present median 33.367→33.366ms / p99 33.66→33.76ms / max 36.3→36.1ms，
+    frame_cache_misses=0/0——无回归。
+  - 1080p 30s+seek：seek 1788/1788 精确（9.8ms），恢复窗 ai_hit_rate=0.954（S3 基线 0.950），
+    misses=0；seek_resets=3（notify_seek 与兜底启发式的时序性重复检测，seek 逻辑本阶段未动，
+    属既有竞态，结果无害）。
+  - 4K 30s：与基线逐项一致（decode 30s 仅 68 帧、frames_detected=0、frame_cache 始终为空、
+    present median 16.67ms）——本机 4K 解码饥饿场景 frame_cache 不填，clamp 路径改由临时单元
+    脚本验证（已删）：4K 尺寸张量驱动 `_cache_put` 断言 cap 226→86、越界淘汰成立、1080p 不
+    clamp、2GB/帧极端值保底下限 46；P1 断言 pair 延迟结算、restore_fps 合理、event pool 复用、
+    `_resync_after_error` 清 pair，全过。
+  - 4K VRAM（nvidia-smi 2s 采样峰值）：基线 8878 MiB → 改后 8877 MiB，符合预期（该场景
+    frame_cache 为空；预算钳制的收益在 4K AI 真正缓存帧的场景，如低帧率 4K 片源）。
 
 ### S6 — P2：AI 桥异步拷贝（需先量测）✅/⬜
 - 先 `scripts\analyze_present.py` 量 AI 并发时 present p99 毛刺；改 `cuMemcpy2DAsync` + event，锁内只留 enqueue，tag 翻转时机重新论证。
