@@ -144,9 +144,21 @@
   - 4K VRAM（nvidia-smi 2s 采样峰值）：基线 8878 MiB → 改后 8877 MiB，符合预期（该场景
     frame_cache 为空；预算钳制的收益在 4K AI 真正缓存帧的场景，如低帧率 4K 片源）。
 
-### S6 — P2：AI 桥异步拷贝（需先量测）✅/⬜
+### S6 — P2：AI 桥异步拷贝（需先量测）✅（量测结论：不显著，不实施）
 - 先 `scripts\analyze_present.py` 量 AI 并发时 present p99 毛刺；改 `cuMemcpy2DAsync` + event，锁内只留 enqueue，tag 翻转时机重新论证。
 - 若量测显示毛刺不显著则记录结论、跳过实施。
+- 量测（2026-09-08，RTX 4080；临时埋点 present_loop 抢 d3d_mutex_ 前后记 QPC，量完已还原）：
+  - 1080p30 全速 AI（AiFresh≈98%，push/pull ≈30 次/s）60s：present 间隔 median=33.367 /
+    p99=33.664 / max=34.103ms（budget 33.3ms）；锁等待 p99=0.0003ms、max=0.208ms，>0.1ms 仅 0.064%。
+  - 4K60 + AI 检测/pull 并发（pull ≈11 次/s，每次 12MB NV12）60s：间隔 median=16.674 /
+    p99=17.177 / max=18.394ms；锁等待 p99=0.026ms、max=13.8ms（60s 仅 1 次，当 tick 间隔
+    仍 <1.5×budget，被固定步进 pacing 吸收）。
+  - 4K 极限微基准（Python 线程满速 push 33MB RGBA + pull 并发轰炸 20s）：间隔 median=16.668 /
+    p99=17.160 / max=17.438ms；锁等待 p99=1.69ms、max=2.42ms（>1ms 占 1.8%），无 >25ms 间隔。
+- 结论：实测 D2D 同步拷贝远快于 finding 的 1-3ms 估计（1080p push 8MB 亚毫秒级），且 present
+  固定步进 pacing 能吸收偶发 ≤2.5ms 锁等待 —— 三种场景 p99 间隔相对 median 增量均 ≤0.5ms，
+  远低于 1ms 显著性阈值与 vblank 周期。**P2 不实施**，维持同步 cuMemcpy2D 与现有 Flush()；
+  临时埋点已还原，仅本文档留量测数据。
 
 ### S7 — 像素格式防线：非 NV12 显式检测 ✅/⬜
 - decoder 打开后检查 `sw_pix_fmt`/色彩 tag：非 NV12（P010、4:2:2、HDR 等）给出明确错误提示（i18n），不再静默黑屏/色偏。
