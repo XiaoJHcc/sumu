@@ -327,6 +327,23 @@ void Player::close_session(){
     {
         std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
 
+        // H2 修复：UI 快照里可能烘着缩略图 SRV 的裸指针（hover 进度条时 build_bottom_bar()
+        // AddImage 进 draw list，见 player_ui_bars.cpp）—— 包括还没被 present 取走的
+        // ui_pending_ 和 present 每 tick 都在渲染的 ui_active_。本函数马上要在下面释放
+        // scrub 纹理/SRV，而 reopen 期间主线程阻塞在 open_session()（网络源最长 ~30s）、
+        // 没有新 ui_tick 发布新快照，present 的 splash 分支会继续渲染 ui_active_ 旧快照
+        // → 解引用已释放的 SRV。present 渲染快照必持 d3d_mutex_（draw_splash()/
+        // draw_and_present() 都在锁内调 ui_render_drawdata()），所以在此临界区内清空两个
+        // 快照后与 present 严格互斥：之后的 splash tick 走 ui_render_drawdata() 的
+        // nothing-published 分支不画 UI（合法状态，代价仅是 reopen 期间短暂没有窗口
+        // chrome，open_session 返回后 Python 的 ui_tick 立刻发布新快照）。锁序
+        // d3d → ui 与 ui_render_drawdata() 自身一致，无新锁序。
+        {
+            std::lock_guard<std::mutex> ui_lock(ui_mutex_);
+            ui_pending_.reset();
+            ui_active_.reset();
+        }
+
         // CUDA unregister BEFORE releasing the D3D11 textures they wrap (cu_res_ wraps
         // landing_tex_; ai_in_cu_res_y_/uv_ wrap ai_in_y_tex_/ai_in_uv_tex_) -- cu_ctx_
         // itself is a device-layer resource and stays current/alive here (only close()'s
@@ -371,12 +388,12 @@ void Player::close_session(){
         ai_in_uv_tex_.Reset();
         ai_in_uv_rtv_.Reset();
 
-        // M4 scrub thumbnail resources. scrub_thread_ is already joined (above), and reopen()
-        // has already put present into its splash branch (so no live ImGui draw snapshot still
-        // references a thumbnail SRV) -- safe to release the NV12 blit source and the thumb
-        // pool. scrub_cache_ is also read by get_thumbnail() on the main thread; the same main
-        // thread runs close_session(), so there is no concurrent reader here, but take
-        // scrub_cache_mutex_ anyway to keep every scrub_cache_ access uniformly guarded.
+        // M4 scrub thumbnail resources. scrub_thread_ is already joined (above), and any UI
+        // snapshot that could still reference a thumbnail SRV has been cleared at the top of
+        // this critical section (H2, see there) -- safe to release the NV12 blit source and
+        // the thumb pool. scrub_cache_ is also read by get_thumbnail() on the main thread; the
+        // same main thread runs close_session(), so there is no concurrent reader here, but
+        // take scrub_cache_mutex_ anyway to keep every scrub_cache_ access uniformly guarded.
         scrub_nv12_tex_.Reset();
         scrub_srv_y_.Reset();
         scrub_srv_uv_.Reset();

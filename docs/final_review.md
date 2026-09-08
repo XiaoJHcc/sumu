@@ -83,8 +83,17 @@
   截断 mp4（线程启动后 EOF 零帧）throw 后再 open 正常视频不崩（原 use-after-free/terminate 路径）；
   假文件失败后 open 正常；`smoke_player.py all` 与 `stress_reopen.py --rounds 12` 全绿。
 
-### S2 — H2：缩略图 SRV 悬空 ✅/⬜
+> **插入修复（无新阶段编号）**：多 GPU 机器（核显+独显）`D3D11CreateDevice(默认适配器)` 可能选中
+> 核显 → `cuD3D11GetDevice` 报 NO_DEVICE、Player 无法构造（驱动更新后实测复现，dist 旧包同样中招）。
+> 已修：新增 `native/src/d3d_util.h`，两处 device 创建（Player 窗口路径 + HeadlessDecode）优先
+> `EnumAdapterByGpuPreference(HIGH_PERFORMANCE)`，失败回退默认行为。commit `a5c16eb`。
+> 验证：无注册表改动裸跑 open+present 正常（日志确认选中 RTX 4080）、HeadlessDecode 首帧正常、
+> `smoke_player.py pause` 通过。
+
+### S2 — H2：缩略图 SRV 悬空 ✅
 - `close_session` 拆 scrub 资源前清空/替换 `ui_pending_`/`ui_active_`（或 SRV 生命周期延长到下一次快照发布）。
+- 验证（2026-09-08，RTX 4080）：hover 进度条（缩略图烘入快照）→ reopen 1080p↔4K ×20 轮 +
+  hover 中 `close_current_session` + 再 open，present 不 stall、不崩；`smoke_player.py seek` 回归全绿。
 
 ### S3 — H4+H5：scheduler 健壮性 ✅/⬜
 - `_run` 包 try/except：异常时记日志 + 按 backlog-resync 重置前沿，线程不死。
