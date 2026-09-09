@@ -1009,13 +1009,28 @@ void Player::request_open_url_popup(){
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
     open_url_close_pending_ = false;
+    open_url_select_all_pending_ = false;
+    open_cancel_requested_.store(false, std::memory_order_relaxed);
     open_url_buf_[0] = '\0';
+}
+
+// Loading-state Cancel (see player.h). The atomic store + decoder interrupt are safe to
+// do from the UI thread while the worker blocks inside avformat_open_input; the worker then
+// unwinds through the normal failure path and Python reaps it as a silent cancellation
+// (open_url_cancel_requested()). No popup close here -- the loading card greys out its
+// Cancel button until notify_open_url_finished() lands.
+void Player::cancel_open_url(){
+    open_cancel_requested_.store(true, std::memory_order_relaxed);
+    decoder_.request_interrupt();
 }
 
 // Python calls this on the main thread when an async URL open finishes. Loading keeps the
 // modal open; success closes it on the next build_open_url_popup frame; failure restores the
-// input form with a load-error line (上一步). No-op if the user already cancelled the modal.
+// input form with a load-error line (上一步) -- unless the user cancelled (loading-state
+// loading state), which returns to the form silently. No-op if the user already cancelled
+// the modal.
 void Player::notify_open_url_finished(bool ok){
+    const bool cancelled = open_cancel_requested_.load(std::memory_order_relaxed);
     if (ok) {
         if (open_url_loading_)
             open_url_close_pending_ = true;
@@ -1025,8 +1040,9 @@ void Player::notify_open_url_finished(bool ok){
     } else if (open_url_loading_) {
         open_url_loading_ = false;
         open_url_show_error_ = false;
-        open_url_show_load_error_ = true;
+        open_url_show_load_error_ = !cancelled;
     }
+    open_cancel_requested_.store(false, std::memory_order_relaxed);
 }
 
 // Apply Windows monitor DPI to ImGui fonts + spacing and to our self-drawn chrome.
@@ -1122,6 +1138,11 @@ void Player::set_ui_strings(const py::dict& d){
     take("open_url_invalid", ui_str_.open_url_invalid);
     take("open_url_loading", ui_str_.open_url_loading);
     take("open_url_load_failed", ui_str_.open_url_load_failed);
+    take("input_cut", ui_str_.input_cut);
+    take("input_copy", ui_str_.input_copy);
+    take("input_paste", ui_str_.input_paste);
+    take("input_paste_open", ui_str_.input_paste_open);
+    take("input_select_all", ui_str_.input_select_all);
     take("compile_retry", ui_str_.compile_retry);
     take("compile_engine", ui_str_.compile_engine);
     take("compile_failed", ui_str_.compile_failed);

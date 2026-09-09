@@ -64,6 +64,11 @@ public:
     // Scheme check only -- does not open anything. Shared with Player for early UI decisions.
     static bool looks_like_network_url(const std::string& path);
 
+    // Ask a blocked open() to bail out early: the AVIOInterruptCB installed on fmt_ctx_
+    // makes FFmpeg's next network IO checkpoint fail instead of waiting out rw_timeout.
+    // Atomic store only -- safe to call from the UI thread while open() blocks a worker.
+    void request_interrupt() { interrupt_requested_.store(true, std::memory_order_relaxed); }
+
     // Decode until one frame is available. Returns false on EOF or unrecoverable error --
     // does NOT loop back to the start (product policy: pause on last frame; decode_loop idles
     // until Player::seek() repositions via seek_to_frame()). The returned DecodedFrame is only
@@ -182,6 +187,12 @@ private:
     std::atomic<bool> have_first_pts_{ false };
     std::atomic<double> first_pts_seconds_{ 0.0 };
     std::atomic<bool> at_eof_{ false }; // 见 at_eof() 注释；next_frame 置位、seek/close 复位
+
+    // AVIOInterruptCB backing flag (see request_interrupt()). Set by the UI thread to abort a
+    // blocked network open(); cleared at the top of every open() because the same callback
+    // also gates av_read_frame() during normal decode.
+    std::atomic<bool> interrupt_requested_{ false };
+    static int interrupt_cb(void* opaque);
     double loop_offset_seconds_ = 0.0; // stays 0 (pause-on-last-frame); kept for pts formula
     double last_out_pts_seconds_ = -1.0;
 

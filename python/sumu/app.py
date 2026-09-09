@@ -593,6 +593,20 @@ def main():
         except Exception:  # noqa: BLE001 -- older native builds without the method
             pass
 
+    def _finish_open_cancelled(path, is_reopen):
+        """URL float loading-state Cancel: native interrupted the blocked FFmpeg open
+        (cancel_open_url → AVIOInterruptCB) and the worker landed in the failure path. Same
+        bookkeeping as a failed open, but silent -- no 无法打开 float, no load-error line."""
+        nonlocal opened, current_path
+        if is_reopen:
+            opened = False
+            current_path = None
+        print(f"== open cancelled == {path!r}", file=sys.stderr)
+        try:
+            player.notify_open_url_finished(False)
+        except Exception:  # noqa: BLE001 -- older native builds without the method
+            pass
+
     def _prepare_reopen():
         """Save position + tear scheduler before a reopen (sync or async). Main thread only."""
         nonlocal scheduler
@@ -698,7 +712,17 @@ def main():
                     if os_ok:
                         _finish_open_success(os_path, is_reopen=os_reopen)
                     else:
-                        _finish_open_failed(os_path, os_err, is_reopen=os_reopen)
+                        # A loading-state Cancel in the URL float interrupts the blocked
+                        # FFmpeg open, so the worker lands here with an error -- reap it as a
+                        # silent cancellation, not a failure.
+                        try:
+                            os_cancelled = bool(player.open_url_cancel_requested())
+                        except Exception:  # noqa: BLE001 -- older native builds
+                            os_cancelled = False
+                        if os_cancelled:
+                            _finish_open_cancelled(os_path, is_reopen=os_reopen)
+                        else:
+                            _finish_open_failed(os_path, os_err, is_reopen=os_reopen)
                 elif os_running:
                     pass  # still in flight
 

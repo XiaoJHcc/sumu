@@ -488,6 +488,17 @@ public:
 
     void notify_open_url_finished(bool ok);
 
+    // Loading-state Cancel: flag the cancellation and interrupt the blocked FFmpeg
+    // network open (Decoder::request_interrupt). The popup stays up (button greys out)
+    // until the worker unwinds and Python calls notify_open_url_finished().
+    void cancel_open_url();
+
+    // Python polls this at reap time to tell "user cancelled" from a genuine open failure
+    // (cancel must not flash the 无法打开 error). Atomic read, safe from the main loop.
+    bool open_url_cancel_requested() const {
+        return open_cancel_requested_.load(std::memory_order_relaxed);
+    }
+
     const std::string& path() const { return video_path_; }
     // True when the current session opened an http(s) URL (shallow ring, no scrub).
     bool is_network() const { return network_source_; }
@@ -772,6 +783,12 @@ private:
         std::string open_url_invalid;
         std::string open_url_loading;
         std::string open_url_load_failed;
+        // URL field right-click context menu (Cut/Copy/Paste/Select All).
+        std::string input_cut;
+        std::string input_copy;
+        std::string input_paste;
+        std::string input_paste_open;
+        std::string input_select_all;
         std::string compile_retry;
         std::string compile_engine;
         std::string compile_failed;
@@ -867,6 +884,12 @@ private:
     bool open_url_show_load_error_ = false; // server/open failure after async open
     bool open_url_loading_ = false;
     bool open_url_close_pending_ = false;   // success → close on next build_open_url_popup
+    // Loading-state cancel: set by cancel_open_url() (UI thread), polled by Python's reap
+    // (open_url_cancel_requested()) to suppress the load-error surfaces for a cancellation.
+    std::atomic<bool> open_cancel_requested_{ false };
+    // Right-click "Select All" on an inactive URL field: focus + select on the next frame
+    // (same two-frame pattern as open_url_focus_).
+    bool open_url_select_all_pending_ = false;
     // Web-stream server / offline export popups (Phase 2). Main-thread only, same discipline.
     bool stream_popup_ = false;
     int stream_port_edit_ = 8080;

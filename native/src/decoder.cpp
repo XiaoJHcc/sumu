@@ -19,6 +19,12 @@ Decoder::~Decoder()
     close();
 }
 
+int Decoder::interrupt_cb(void* opaque)
+{
+    const Decoder* self = static_cast<const Decoder*>(opaque);
+    return self->interrupt_requested_.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
 void Decoder::close()
 {
     {
@@ -134,6 +140,22 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     close();
     d3d_device_ = device;
     is_network_ = looks_like_network_url(path);
+    // Fresh slate for the interrupt flag -- the callback installed below also gates
+    // av_read_frame() during normal decode, so a stale "cancelled" from a previous aborted
+    // open must not leak into the new session.
+    interrupt_requested_.store(false, std::memory_order_relaxed);
+
+    // Pre-allocate the format context so we can install AVIOInterruptCB BEFORE
+    // avformat_open_input: request_interrupt() then aborts a blocked network open at
+    // FFmpeg's next IO checkpoint instead of waiting out rw_timeout (URL float cancel).
+    // avformat_close_input() frees the context on every exit path, opened or not.
+    fmt_ctx_ = avformat_alloc_context();
+    if (!fmt_ctx_) {
+        error = "avformat_alloc_context failed";
+        return false;
+    }
+    fmt_ctx_->interrupt_callback.callback = &Decoder::interrupt_cb;
+    fmt_ctx_->interrupt_callback.opaque = this;
 
     // Network sources: timeout + reconnect + smaller probe. Local files keep FFmpeg defaults
     // (deep probe is fine on disk and preserves existing open latency characteristics).

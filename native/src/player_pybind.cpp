@@ -31,6 +31,8 @@ PYBIND11_MODULE(sumu_core, m)
             py::call_guard<py::gil_scoped_release>())
         .def("is_network", &Player::is_network) // http(s) session: shallow ring, scrub off
         .def("notify_open_url_finished", &Player::notify_open_url_finished, py::arg("ok"))
+        .def("open_url_cancel_requested", &Player::open_url_cancel_requested) // loading-state Cancel
+        .def("cancel_open_url", &Player::cancel_open_url) // URL float Cancel; scripted cancel tests use it too
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)
