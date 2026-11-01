@@ -87,6 +87,16 @@ finally 真正退出（此时才"卸载模型"）。
 看起来仍然"新鲜"，但内容是错的。把临界区扩大到整个"生产+发布"序列后，decode 线程的一次迭代和
 `seek()` 互斥，此竞态被彻底关闭。
 
+## 像素格式归一化
+
+下游 ring、scrub thumbnail、AI CUDA 桥与 HeadlessDecode 统一消费 8-bit NV12。8-bit 4:2:0
+硬解帧直接拷贝；`yuv420p10le`/`p010` 输入由 `Decoder` 内的 D3D11 VideoProcessor 做一次
+P010→NV12 GPU 转换后再进入同一拷贝路径，不经过主存，也不改 AI 模型或调度器。转换只在主播放、
+seek、缩略图和 headless 的 D3D11 临界区内执行，解码与网络等待仍不持有 `d3d_mutex_`。
+
+这只是 10-bit→8-bit 兼容层：HDR PQ/HLG 会记录 warning，但尚不做 tone mapping；非 4:2:0
+像素格式仍在 open 时明确拒绝。
+
 ## seek() = reposition，不是 teardown（I6）
 
 `Player::seek(frame_num)` **绝不**销毁或重建 decode/present 线程、`Decoder` 对象或 swapchain。

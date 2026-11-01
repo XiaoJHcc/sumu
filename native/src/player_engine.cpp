@@ -123,6 +123,8 @@ int64_t Player::seek(int64_t frame_num){
 
     {
         std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        if (!decoder_.prepare_nv12_frame(df, err))
+            throw std::runtime_error("P010->NV12 conversion failed during seek: " + err);
         context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
             df.texture, df.array_slice, nullptr);
     }
@@ -575,7 +577,14 @@ void Player::render_thumbnail(ID3D11RenderTargetView* rtv){
 bool Player::blit_thumbnail(const DecodedFrame& df, ID3D11RenderTargetView* dst_rtv){
     std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
     if (!scrub_nv12_tex_ || !dst_rtv) return false;
-    context_->CopySubresourceRegion(scrub_nv12_tex_.Get(), 0, 0, 0, 0, df.texture, df.array_slice, nullptr);
+    DecodedFrame nv12_df = df;
+    std::string err;
+    if (!scrub_decoder_.prepare_nv12_frame(nv12_df, err)) {
+        fprintf(stderr, "[sumu] P010->NV12 thumbnail conversion failed: %s\n", err.c_str());
+        return false;
+    }
+    context_->CopySubresourceRegion(scrub_nv12_tex_.Get(), 0, 0, 0, 0,
+        nv12_df.texture, nv12_df.array_slice, nullptr);
     render_thumbnail(dst_rtv);
     return true;
 }
@@ -1037,6 +1046,11 @@ void Player::decode_loop(){
 
             {
                 std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+                std::string err;
+                if (!decoder_.prepare_nv12_frame(df, err)) {
+                    fprintf(stderr, "[sumu] P010->NV12 conversion failed: %s\n", err.c_str());
+                    goto decode_idle;
+                }
                 context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
                     df.texture, df.array_slice, nullptr);
             }

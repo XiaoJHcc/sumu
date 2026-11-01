@@ -205,7 +205,7 @@
 
 ## 后续方向（本次不做，记录在案）
 
-- P010/10-bit、HDR tone mapping、BT.601/full-range 从流 tag 派生色彩参数（spike3 已给方案）。
+- HDR tone mapping、BT.601/full-range 从流 tag 派生色彩参数（spike3 已给方案）。
 - 软解 fallback（porting_manifest 已列为未来方向）；解码中途分辨率/格式切换处理。
 - 旋转元数据（手机竖拍）；播放端字幕与音轨选择；VFR 正式支持。
 - D3D11 device-removed 恢复路径（M3）；网络源 AVIOInterruptCB（M7 退出等待 15s）。

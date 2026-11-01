@@ -21,11 +21,13 @@
 #pragma once
 
 #include <d3d11.h>
+#include <wrl/client.h>
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -75,6 +77,11 @@ public:
     // valid until the next call to next_frame() or seek_to_frame() (we keep exactly one AVFrame
     // "in flight" to bound VRAM use / decoder pool pressure).
     bool next_frame(DecodedFrame& out);
+
+    // Convert a decoded P010 frame to the NV12 contract consumed by every downstream path.
+    // No-op for native 8-bit NV12 input. Player callers must hold d3d_mutex_ around this call
+    // and the subsequent copy; HeadlessDecode uses its single-threaded immediate context.
+    bool prepare_nv12_frame(DecodedFrame& frame, std::string& error);
 
     // EOF 状态：next_frame() 解到流末尾（pump 返回 0，即真实 EOF，不含解码错误）时置位，
     // seek_to_frame()/close() 复位。原子 —— 由 decode 线程写、Player::open_session() 的
@@ -159,6 +166,9 @@ private:
     static AVPixelFormat get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts);
     bool ensure_hw_frames_ctx(AVCodecContext* ctx);
     bool seek_to_start();
+    bool initialize_p010_conversion(std::string& error);
+    bool convert_p010_to_nv12(DecodedFrame& frame, std::string& error);
+    void reset_p010_conversion();
 
     // Shared "pull one hw frame out of the demuxer/decoder" pump, used by both next_frame()
     // and seek_to_frame()'s forward-decode-to-target loop. Does NOT loop-on-EOF (both callers
@@ -197,6 +207,17 @@ private:
     double last_out_pts_seconds_ = -1.0;
 
     ID3D11Device* d3d_device_ = nullptr; // not owned
+
+    bool needs_p010_conversion_ = false;
+    bool conversion_stream_initialized_ = false;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> conversion_context_;
+    Microsoft::WRL::ComPtr<ID3D11VideoContext> conversion_video_context_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> conversion_enumerator_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessor> conversion_processor_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> conversion_output_texture_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> conversion_output_view_;
+    ID3D11Texture2D* conversion_input_texture_ = nullptr; // not owned; views retain it
+    std::vector<Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>> conversion_input_views_;
 
     // Set in open() from looks_like_network_url(path); cleared in close(). Drives FFmpeg
     // format options (timeout/reconnect/probesize) and is read by Player for IO profile.

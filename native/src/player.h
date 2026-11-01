@@ -17,9 +17,10 @@
 // Threading model (unchanged from spike2, see spike2's presenter.cpp header for the full
 // story of why a single d3d_mutex_ is required on top of ID3D11Multithread::SetMultithread-
 // Protected(TRUE)):
-//   - decode thread:  FFmpeg d3d11va decode -> CopySubresourceRegion into a persistent NV12
-//                     "passthrough ring" Texture2DArray, throttled to stay within
-//                     decode_ahead_max_ frames of the present head.
+//   - decode thread:  FFmpeg d3d11va decode -> optional P010->NV12 video-processor conversion
+//                     -> CopySubresourceRegion into a persistent NV12 "passthrough ring"
+//                     Texture2DArray, throttled to stay within decode_ahead_max_ frames of the
+//                     present head.
 //   - AI-push thread (Python, not owned here): push_ai_frame() does the CUDA<->D3D11
 //                     zero-copy bridge into a landing texture, then a CopySubresourceRegion
 //                     into the AI ready-map's Texture2DArray slot, THEN marks that slot ready.

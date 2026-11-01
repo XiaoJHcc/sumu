@@ -39,6 +39,7 @@ void Decoder::close()
             av_packet_free(&e.pkt);
         }
     }
+    reset_p010_conversion();
     if (pkt_) av_packet_free(&pkt_);
     if (frame_) av_frame_free(&frame_);
     if (codec_ctx_) avcodec_free_context(&codec_ctx_);
@@ -112,6 +113,174 @@ bool Decoder::ensure_hw_frames_ctx(AVCodecContext* ctx)
     }
 
     ctx->hw_frames_ctx = frames_ref; // transfers ownership
+    return true;
+}
+
+void Decoder::reset_p010_conversion()
+{
+    conversion_input_views_.clear();
+    conversion_input_texture_ = nullptr;
+    conversion_output_view_.Reset();
+    conversion_output_texture_.Reset();
+    conversion_processor_.Reset();
+    conversion_enumerator_.Reset();
+    conversion_video_context_.Reset();
+    conversion_context_.Reset();
+    conversion_stream_initialized_ = false;
+    needs_p010_conversion_ = false;
+}
+
+bool Decoder::initialize_p010_conversion(std::string& error)
+{
+    auto fail_hr = [&error](const char* what, HRESULT hr) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s failed: hr=0x%08lx", what,
+            static_cast<unsigned long>(hr));
+        error = buf;
+        return false;
+    };
+
+    Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device;
+    HRESULT hr = d3d_device_->QueryInterface(IID_PPV_ARGS(&video_device));
+    if (FAILED(hr)) return fail_hr("QueryInterface(ID3D11VideoDevice)", hr);
+    d3d_device_->GetImmediateContext(&conversion_context_);
+    if (!conversion_context_) {
+        error = "GetImmediateContext failed for P010 conversion";
+        return false;
+    }
+    hr = conversion_context_->QueryInterface(IID_PPV_ARGS(&conversion_video_context_));
+    if (FAILED(hr)) return fail_hr("QueryInterface(ID3D11VideoContext)", hr);
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameRate = { static_cast<UINT>(fps_ * 1000.0 + 0.5), 1000 };
+    content.InputWidth = static_cast<UINT>(width_);
+    content.InputHeight = static_cast<UINT>(height_);
+    content.OutputFrameRate = content.InputFrameRate;
+    content.OutputWidth = content.InputWidth;
+    content.OutputHeight = content.InputHeight;
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+    hr = video_device->CreateVideoProcessorEnumerator(&content, &conversion_enumerator_);
+    if (FAILED(hr)) return fail_hr("CreateVideoProcessorEnumerator(P010->NV12)", hr);
+    UINT input_flags = 0;
+    UINT output_flags = 0;
+    if (FAILED(conversion_enumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_P010, &input_flags)) ||
+        !(input_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) ||
+        FAILED(conversion_enumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &output_flags)) ||
+        !(output_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
+        error = "D3D11 video processor does not support P010->NV12 conversion";
+        return false;
+    }
+    hr = video_device->CreateVideoProcessor(conversion_enumerator_.Get(), 0, &conversion_processor_);
+    if (FAILED(hr)) return fail_hr("CreateVideoProcessor(P010->NV12)", hr);
+
+    D3D11_TEXTURE2D_DESC output_desc{};
+    output_desc.Width = static_cast<UINT>(width_);
+    output_desc.Height = static_cast<UINT>(height_);
+    output_desc.MipLevels = 1;
+    output_desc.ArraySize = 1;
+    output_desc.Format = DXGI_FORMAT_NV12;
+    output_desc.SampleDesc.Count = 1;
+    output_desc.Usage = D3D11_USAGE_DEFAULT;
+    output_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    hr = d3d_device_->CreateTexture2D(&output_desc, nullptr, &conversion_output_texture_);
+    if (FAILED(hr)) return fail_hr("CreateTexture2D(P010 conversion NV12)", hr);
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
+    output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    output_view_desc.Texture2D.MipSlice = 0;
+    hr = video_device->CreateVideoProcessorOutputView(conversion_output_texture_.Get(),
+        conversion_enumerator_.Get(), &output_view_desc, &conversion_output_view_);
+    if (FAILED(hr)) return fail_hr("CreateVideoProcessorOutputView(NV12)", hr);
+
+    return true;
+}
+
+bool Decoder::prepare_nv12_frame(DecodedFrame& frame, std::string& error)
+{
+    if (!needs_p010_conversion_) return true;
+    return convert_p010_to_nv12(frame, error);
+}
+
+bool Decoder::convert_p010_to_nv12(DecodedFrame& frame, std::string& error)
+{
+    if (!frame.texture || !conversion_processor_ || !conversion_output_view_) {
+        error = "P010 conversion is not initialized";
+        return false;
+    }
+
+    if (!conversion_stream_initialized_) {
+        const RECT rect{ 0, 0, width_, height_ };
+        conversion_video_context_->VideoProcessorSetStreamSourceRect(conversion_processor_.Get(), 0, TRUE, &rect);
+        conversion_video_context_->VideoProcessorSetStreamDestRect(conversion_processor_.Get(), 0, TRUE, &rect);
+        conversion_video_context_->VideoProcessorSetStreamFrameFormat(conversion_processor_.Get(), 0,
+            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        conversion_video_context_->VideoProcessorSetOutputTargetRect(conversion_processor_.Get(), TRUE, &rect);
+
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE color_space{};
+        color_space.YCbCr_Matrix = codec_ctx_->colorspace == AVCOL_SPC_BT709 ? 1 : 0;
+        conversion_video_context_->VideoProcessorSetStreamColorSpace(conversion_processor_.Get(), 0, &color_space);
+        conversion_video_context_->VideoProcessorSetOutputColorSpace(conversion_processor_.Get(), &color_space);
+        conversion_stream_initialized_ = true;
+    }
+
+    if (conversion_input_texture_ != frame.texture) {
+        conversion_input_views_.clear();
+        conversion_input_texture_ = nullptr;
+
+        D3D11_TEXTURE2D_DESC input_desc{};
+        frame.texture->GetDesc(&input_desc);
+        if (input_desc.Format != DXGI_FORMAT_P010) {
+            error = "10-bit decoder output is not P010";
+            return false;
+        }
+
+        Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device;
+        HRESULT hr = d3d_device_->QueryInterface(IID_PPV_ARGS(&video_device));
+        if (FAILED(hr)) {
+            error = "QueryInterface(ID3D11VideoDevice) failed while converting P010";
+            return false;
+        }
+        std::vector<Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>> views(input_desc.ArraySize);
+        for (UINT i = 0; i < input_desc.ArraySize; ++i) {
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC view_desc{};
+            view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            view_desc.Texture2D.MipSlice = 0;
+            view_desc.Texture2D.ArraySlice = i;
+            hr = video_device->CreateVideoProcessorInputView(frame.texture, conversion_enumerator_.Get(),
+                &view_desc, &views[i]);
+            if (FAILED(hr)) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "CreateVideoProcessorInputView(P010) failed: hr=0x%08lx",
+                    static_cast<unsigned long>(hr));
+                error = buf;
+                return false;
+            }
+        }
+        conversion_input_views_.swap(views);
+        conversion_input_texture_ = frame.texture;
+    }
+
+    if (frame.array_slice >= conversion_input_views_.size()) {
+        error = "P010 frame array slice is out of range";
+        return false;
+    }
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = conversion_input_views_[frame.array_slice].Get();
+    HRESULT hr = conversion_video_context_->VideoProcessorBlt(conversion_processor_.Get(),
+        conversion_output_view_.Get(), 0, 1, &stream);
+    if (FAILED(hr)) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "VideoProcessorBlt(P010->NV12) failed: hr=0x%08lx",
+            static_cast<unsigned long>(hr));
+        error = buf;
+        return false;
+    }
+
+    frame.texture = conversion_output_texture_.Get();
+    frame.array_slice = 0;
     return true;
 }
 
@@ -211,25 +380,19 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     width_ = stream->codecpar->width;
     height_ = stream->codecpar->height;
 
-    // S7 像素格式防线：全链路硬编码 NV12 —— 环缓冲/scrub/headless 纹理都是
-    // DXGI_FORMAT_NV12、SRV 固定 R8_UNORM/R8G8_UNORM、present shader 与 AI 侧色转写死
-    // BT.709 limited。d3d11va 解出非 NV12（10-bit HEVC 的 P010、4:2:2、HDR…）时
-    // decode_loop 的 CopySubresourceRegion 不做格式转换、返回 void、无错误检查 →
-    // 静默黑屏/定格旧帧，用户毫无提示。这里在 open 路径显式拒绝，错误串带
-    // 机器可识别前缀 "unsupported_pix_fmt:"（Python 侧据此映射 i18n 提示）。
-    // 判定用 codecpar->format（parser 已从 SPS 解析出位深/色度格式，avformat_find_
-    // stream_info 后即可靠；codec_ctx_->sw_pix_fmt 此时还是 NONE —— 实测 avcodec_open2
-    // 后它仍可能未确定，不能用作门禁）。d3d11va 对 8-bit 4:2:0 恒输出 NV12，而 8-bit
-    // 片通常声明 yuv420p（H.264/HEVC 码流不区分 yuv420p/nv12 内存布局）、full-range
-    // 片声明 yuvj420p（同码流、只是 range tag 不同，走 open 后的 full-range warning）
-    // —— 三种都接受；其余（yuv420p10le/p010/yuv422p/yuv444p/NONE…）一律拒绝。
-    // 未来 P010 支持的落点：环缓冲/scrub/AI 桥纹理改 P010 + R16/R16G16 SRV +
-    // present shader 分支 + headless 16-bit 路径。
+    // 下游环缓冲/scrub/AI 桥/headless 仍统一消费 8-bit NV12。10-bit 4:2:0 由
+    // P010->NV12 GPU 转换接入同一契约；其余格式仍在 open 路径显式拒绝，避免
+    // CopySubresourceRegion 不转换格式而静默黑屏。判定用 codecpar->format：
+    // avformat_find_stream_info 后 parser 已确定位深/色度格式，codec_ctx_->sw_pix_fmt
+    // 此时仍可能未确定。
     {
         const AVPixelFormat coded_fmt = static_cast<AVPixelFormat>(stream->codecpar->format);
+        needs_p010_conversion_ = coded_fmt == AV_PIX_FMT_YUV420P10LE ||
+            coded_fmt == AV_PIX_FMT_P010LE;
         if (coded_fmt != AV_PIX_FMT_NV12 &&
             coded_fmt != AV_PIX_FMT_YUV420P &&
-            coded_fmt != AV_PIX_FMT_YUVJ420P) {
+            coded_fmt != AV_PIX_FMT_YUVJ420P &&
+            !needs_p010_conversion_) {
             const char* fmt_name = av_get_pix_fmt_name(coded_fmt);
             error = "unsupported_pix_fmt:" + std::string(fmt_name ? fmt_name : "unknown");
             close();
@@ -309,10 +472,17 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     }
     av_dict_free(&opts);
 
-    // S7 顺带：NV12 但色彩 tag 非 BT.709 limited（BT.601 / full-range / BT.2020）只埋
-    // warning —— present shader 写死 BT.709 limited，会色偏但不黑屏；从流 tag 派生
-    // 色彩参数是后续方向（docs/final_review.md「后续方向」）。tag 未指定
-    // （UNSPECIFIED）是常态，不 warn。像素格式门禁本身在上方 codecpar 处。
+    if (needs_p010_conversion_ && !initialize_p010_conversion(error)) {
+        close();
+        return false;
+    }
+
+    // 非 BT.709 limited 的色彩 tag 只埋 warning：present shader 写死 BT.709 limited，
+    // 10-bit 输入也只降位深，不做 HDR tone mapping。tag 未指定是常态，不 warn。
+    if (codec_ctx_->color_trc == AVCOL_TRC_SMPTE2084 ||
+        codec_ctx_->color_trc == AVCOL_TRC_ARIB_STD_B67)
+        fprintf(stderr, "[sumu] warning: HDR transfer '%s'; tone mapping is not supported\n",
+            av_color_transfer_name(codec_ctx_->color_trc));
     if (codec_ctx_->colorspace != AVCOL_SPC_BT709 &&
         codec_ctx_->colorspace != AVCOL_SPC_UNSPECIFIED)
         fprintf(stderr, "[sumu] warning: color space tag '%s' is not BT.709; presentation "
