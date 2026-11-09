@@ -36,6 +36,7 @@
   "open_failed": "Could not open this video",
   "open_failed_named": "Could not open: {name}",
   "open_failed_unsupported_pix_fmt": "Unsupported video format: {fmt} ({name}) — only 8-bit/10-bit 4:2:0 video is supported; HDR tone mapping is not yet supported",
+  "seek_unavailable_partial": "This position cannot be played yet — the file may not be fully downloaded",
   "warmup_failed": "Warmup failed",
   "warmup_status": "Warming up models…",
   "compile_running": "Compiling acceleration engines {step}/{total}… (first time, may take minutes)",

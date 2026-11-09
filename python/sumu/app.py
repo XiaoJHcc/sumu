@@ -57,14 +57,13 @@ class _WarmupState:
         self.ready = False
         self.models = None
         self.error = None
-        # The torch-heavy orchestration imports (Scheduler/SchedulerConfig, get_video_meta_data)
-        # are done ON this worker thread too -- see _warmup_worker -- and handed back here so the
-        # MAIN thread never pays their import cost (that cost is the ~3s startup black-window: a
-        # main-thread `from sumu.scheduler import ...` pulls in torch synchronously before the
-        # message loop can pump). Consumed only once ready is True, at scheduler-build time.
+        # The torch-heavy orchestration imports (Scheduler/SchedulerConfig) are done ON this
+        # worker thread too -- see _warmup_worker -- and handed back here so the MAIN thread never
+        # pays their import cost (that cost is the ~3s startup black-window: a main-thread
+        # `from sumu.scheduler import ...` pulls in torch synchronously before the message loop can
+        # pump). Consumed only once ready is True, at scheduler-build time.
         self.sched_cls = None   # Scheduler
         self.cfg_cls = None     # SchedulerConfig
-        self.meta_fn = None     # get_video_meta_data
         # TRT startup-UX handoff. trt_applicable: this machine can run TRT at all (cuda + fp16).
         # trt_active: engines were found + loaded (load-only warmup) so the restorer already runs
         # TRT. When applicable but not active, engines are absent -> app offers the on-demand
@@ -117,6 +116,9 @@ _COMPILE_UI_FAILED = 3     # compile failed: show error + "retry" button
 
 # How long the "无法打开" float stays visible after a failed open/reopen (seconds).
 _OPEN_ERROR_HOLD_S = 4.0
+
+# How long the seek hint float stays visible after a seek into an undecodable position (seconds).
+_SEEK_ERROR_HOLD_S = 3.0
 
 
 def _open_worker(ostate: "_OpenState", player, path: str, is_reopen: bool) -> None:
@@ -206,15 +208,13 @@ def _warmup_worker(state: "_WarmupState") -> None:
         # Import the torch-heavy orchestration modules here too, off the main thread. torch is
         # already imported above so these are effectively free now (module cache hit), but doing
         # them on the main thread at startup is exactly what caused the ~3s black window -- so
-        # they stay here and the classes/fn are handed back via state (see _WarmupState).
+        # they stay here and the classes are handed back via state (see _WarmupState).
         from sumu.scheduler import Scheduler, SchedulerConfig
-        from sumu.ai.utils.video_utils import get_video_meta_data
 
         with state.lock:
             state.models = (det_model, res_model, pad_mode)
             state.sched_cls = Scheduler
             state.cfg_cls = SchedulerConfig
-            state.meta_fn = get_video_meta_data
             state.trt_applicable = trt_applicable
             state.trt_active = trt_active
             state.res_path = res_path
@@ -283,10 +283,10 @@ def main():
     warmup = _WarmupState()
     threading.Thread(target=_warmup_worker, args=(warmup,), name="sumu-warmup", daemon=True).start()
 
-    # NOTE: no torch-touching imports on this (main) thread -- Scheduler/SchedulerConfig and
-    # get_video_meta_data are imported on the warmup worker and consumed post-warmup only (they
-    # pull in torch, and a main-thread import here blocks the message loop for ~3s = the startup
-    # black window). See _warmup_worker / _WarmupState.
+    # NOTE: no torch-touching imports on this (main) thread -- Scheduler/SchedulerConfig are
+    # imported on the warmup worker and consumed post-warmup only (they pull in torch, and a
+    # main-thread import here blocks the message loop for ~3s = the startup black window).
+    # See _warmup_worker / _WarmupState.
 
     # No more startup pick_open_file() -- an unopened window shows the native
     # build_open_prompt_overlay() (drop-file / "打开文件" button) instead. A video given on the
@@ -306,6 +306,9 @@ def main():
     cfg_lead = settings_mod.clamp_lead(settings.lead)
     cfg_target_fps = int(settings_mod.clamp_target_fps(settings.target_fps))
     scheduler = None
+    # File whose Scheduler was already dropped (build/start/notify failure): latched so it keeps
+    # playing passthrough instead of being rebuilt every tick. Reset on a successful open.
+    sched_failed_path = None
     det_model = res_model = pad_mode = None
     # Web-stream / offline-export feature state (Phase 2). transcode_engine is built lazily once
     # the models are warm; stream_server is the live background server; export is an exclusive
@@ -514,6 +517,10 @@ def main():
     open_error_text = ""
     open_error_until = 0.0
 
+    # Seek hint float (same mechanism): seeking past a partial file's decodable end throws.
+    seek_error_text = ""
+    seek_error_until = 0.0
+
     # Startup fast-path for the first-screen compile prompt. The prompt's visibility depends on
     # (a) is TRT applicable on this machine, (b) are engines already on disk -- and until now both
     # were only known AFTER the background warmup imported torch + probed the disk, so the prompt
@@ -560,6 +567,7 @@ def main():
     def _finish_open_success(path, is_reopen):
         """Shared post-open bookkeeping after player.open/reopen succeeded (main thread)."""
         nonlocal opened, current_path, open_error_text, open_error_until, video_meta
+        nonlocal sched_failed_path, seek_error_text, seek_error_until
         apply_target_fps_for_open()
         print(f"== player.{'reopen' if is_reopen else 'open'} == "
               f"fps={player.fps():.4f} frames={player.frame_count()} "
@@ -571,8 +579,11 @@ def main():
         current_path = path
         open_error_text = ""
         open_error_until = 0.0
-        # Force scheduler rebuild against the new file (reopen already stopped it).
+        seek_error_text = ""
+        seek_error_until = 0.0
+        # Fresh session: video_meta is rebuilt and a previously failed Scheduler gets one new try.
         video_meta = None
+        sched_failed_path = None
         settings.push_recent(current_path)
         player.play()  # open_session() starts paused at frame 0; auto-play from the start.
         try:
@@ -649,6 +660,43 @@ def main():
             return
         _finish_open_success(path, is_reopen=True)
 
+    def _degrade_scheduler(reason, sched):
+        """Drop AI for this file: best-effort stop, log, and latch so it is not rebuilt per tick."""
+        nonlocal scheduler, sched_failed_path
+        if sched is not None:
+            try:
+                sched.stop()  # start() can fail with a thread already running (Scheduler.start)
+            except Exception:  # noqa: BLE001 -- teardown must never raise into the loop
+                pass
+        print(f"== scheduler off == {current_path!r}: {reason}; passthrough only", file=sys.stderr)
+        scheduler = None
+        sched_failed_path = current_path
+
+    def _sched_notify(frame):
+        """Anchor the scheduler at a real frame; a broken scheduler is dropped, never raised."""
+        if scheduler is None:
+            return
+        try:
+            scheduler.notify_seek(int(frame))
+        except Exception as e:  # noqa: BLE001 -- keep playing on passthrough
+            _degrade_scheduler(f"notify_seek failed: {e!r}", scheduler)
+
+    def _apply_seek(target):
+        """Seek, tolerating a partial file's undecodable tail: hint on failure, and notify the
+        scheduler only after the seek landed (with native's real frame, not the requested one)."""
+        nonlocal seek_error_text, seek_error_until
+        try:
+            landed = player.seek(target)
+        except Exception as e:  # noqa: BLE001 -- undecodable tail: hint + stay on the old frame
+            seek_error_text = i18n_mod.t("seek_unavailable_partial")
+            seek_error_until = time.monotonic() + _SEEK_ERROR_HOLD_S
+            print(f"== seek failed == frame={target}: {e}", file=sys.stderr)
+            _sched_notify(player.current_frame())
+            return
+        seek_error_text = ""
+        seek_error_until = 0.0
+        _sched_notify(player.current_frame() if landed is None else landed)
+
     # Async network open: keeps pump_messages/ui_tick alive so the URL float can show loading.
     open_state = None
 
@@ -691,7 +739,6 @@ def main():
                 warm_error = warmup.error
                 warm_sched_cls = warmup.sched_cls
                 warm_sched_cfg_cls = warmup.cfg_cls
-                warm_meta_fn = warmup.meta_fn
                 warm_trt_applicable = warmup.trt_applicable
                 warm_trt_active = warmup.trt_active
                 warm_res_path = warmup.res_path
@@ -731,6 +778,11 @@ def main():
                 status_text = open_error_text
             elif open_error_text and now_mono >= open_error_until:
                 open_error_text = ""
+                status_text = ""
+            elif seek_error_text and now_mono < seek_error_until:
+                status_text = seek_error_text
+            elif seek_error_text:
+                seek_error_text = ""
                 status_text = ""
             elif warm_error is not None:
                 status_text = i18n_mod.t("warmup_failed")
@@ -978,9 +1030,7 @@ def main():
             elif not opening:
                 seek = intents["seek"]
                 if seek is not None and opened:
-                    if scheduler is not None:
-                        scheduler.notify_seek(seek)
-                    player.seek(seek)
+                    _apply_seek(seek)
 
             clip_length = intents["clip_length"]
             max_regions = intents["max_regions"]
@@ -1029,15 +1079,21 @@ def main():
                 settings_mod.save(settings)
             if (clip_length is not None or max_regions is not None or cold_start_s is not None
                     or lead is not None or target_fps is not None) and scheduler is not None:
-                # target_fps may retime the session (native fps_div); rebuild scheduler so
-                # cold-start/lead recompute against the new player.fps()/frame_count().
-                scheduler.stop()
-                config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
-                                            max_regions_per_frame=cfg_max_regions,
-                                            cold_start_s=cfg_cold_start_s,
-                                            lead=cfg_lead)
-                scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
-                scheduler.start()
+                # target_fps may retime the session (native fps_div): rebuild so cold-start/lead
+                # recompute against the new player.fps()/frame_count().
+                rebuilt = None
+                try:
+                    scheduler.stop()
+                    config = warm_sched_cfg_cls(clip_length=cfg_clip_length,
+                                                max_regions_per_frame=cfg_max_regions,
+                                                cold_start_s=cfg_cold_start_s,
+                                                lead=cfg_lead)
+                    rebuilt = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta,
+                                             config)
+                    rebuilt.start()
+                    scheduler = rebuilt
+                except Exception as e:  # noqa: BLE001 -- no AI must never stop playback
+                    _degrade_scheduler(f"rebuild failed: {e!r}", rebuilt)
 
 
             # ---- web-stream / offline-export intents (Phase 2) ----
@@ -1148,60 +1204,41 @@ def main():
                     _export_set_default_preset(sd)
 
 
-            # 延迟建 scheduler: only once a file is open AND warmup has succeeded AND no
-            # scheduler is already running. Deliberately re-checked every tick (not just right
-            # after do_open()/do_reopen()) since warmup can finish on its own schedule, well
-            # after either of those. Skip while an async open is in flight (session half-built).
+            # 延迟建 scheduler: only once a file is open AND warmup succeeded AND none is running
+            # yet -- re-checked every tick, since warmup can finish long after the open. Skipped
+            # while an async open is in flight, and latched per file after a failure
+            # (sched_failed_path) so such a file stays on passthrough instead of retrying.
             if (opened and warm_ready and scheduler is None and warm_error is None
-                    and open_state is None):
+                    and open_state is None and sched_failed_path != current_path):
                 det_model, res_model, pad_mode = warm_models
-                # Lazy, off the startup path: compute video_meta now (get_video_meta_data came from
-                # the warmup worker) and build the config from the committed int knobs.
-                # Network sources: skip ffprobe/cv2 second open -- native already probed fps/dims/
-                # frame_count; a second remote probe races the player and hurts weak links.
+                new_scheduler = None
                 try:
-                    if player.is_network():
-                        from fractions import Fraction
-                        from sumu.ai.utils import VideoMetadata
-                        sess_fps = float(player.fps())
-                        w, h = player.dims()
-                        fc = int(player.frame_count())
-                        fps_exact = Fraction(sess_fps).limit_denominator(1001)
-                        dur = (fc / sess_fps) if sess_fps > 0 and fc > 0 else 0.0
-                        video_meta = VideoMetadata(
-                            video_file=current_path,
-                            video_height=int(h),
-                            video_width=int(w),
-                            video_fps=sess_fps,
-                            average_fps=sess_fps,
-                            video_fps_exact=fps_exact,
-                            codec_name="unknown",
-                            frames_count=fc,
-                            duration=float(dur),
-                            time_base=Fraction(1, max(1, int(round(sess_fps * 1001))))
-                            if sess_fps > 0 else Fraction(1, 30),
-                            start_pts=0,
-                        )
-                        print(f"== video_meta (native, network) == {w}x{h} fps={sess_fps:.4f} "
-                              f"frames={fc}", file=sys.stderr)
-                    else:
-                        video_meta = warm_meta_fn(current_path)
-                except Exception as e:  # noqa: BLE001 -- meta probe failure must not kill playback
-                    # File is already open and playing passthrough; just skip AI for this file.
-                    print(f"== video_meta failed == {current_path!r}: {e}", file=sys.stderr)
-                    video_meta = None
-                if video_meta is not None:
-                    # Align AI meta with the retimed session (player.fps/frame_count after fps_div).
-                    # Network path already used session numbers; local still needs this remap.
-                    try:
-                        from fractions import Fraction
-                        sess_fps = float(player.fps())
-                        video_meta.video_fps = sess_fps
-                        video_meta.average_fps = sess_fps
-                        video_meta.video_fps_exact = Fraction(sess_fps).limit_denominator(1001)
-                        video_meta.frames_count = int(player.frame_count())
-                    except Exception:  # noqa: BLE001
-                        pass
+                    # Meta from native's own probe of the playing session -- never a second
+                    # ffprobe/cv2 open (slow or failing on a partial file, and it can report a
+                    # frame count the decoder cannot reach).
+                    from fractions import Fraction
+                    from sumu.ai.utils import VideoMetadata
+                    sess_fps = float(player.fps())
+                    w, h = player.dims()
+                    fc = int(player.frame_count())
+                    fps_exact = Fraction(sess_fps).limit_denominator(1001)
+                    dur = (fc / sess_fps) if sess_fps > 0 and fc > 0 else 0.0
+                    video_meta = VideoMetadata(
+                        video_file=current_path,
+                        video_height=int(h),
+                        video_width=int(w),
+                        video_fps=sess_fps,
+                        average_fps=sess_fps,
+                        video_fps_exact=fps_exact,
+                        codec_name="unknown",
+                        frames_count=fc,
+                        duration=float(dur),
+                        time_base=Fraction(1, max(1, int(round(sess_fps * 1001))))
+                        if sess_fps > 0 else Fraction(1, 30),
+                        start_pts=0,
+                    )
+                    print(f"== video_meta (native) == {w}x{h} fps={sess_fps:.4f} frames={fc}"
+                          f"{' network' if player.is_network() else ''}", file=sys.stderr)
                     # Network: clamp AI lead to the shallow native decode-ahead (already enforced
                     # inside Scheduler._effective_lead via decode_ahead_max, but keep config honest).
                     lead_for_cfg = cfg_lead
@@ -1214,8 +1251,13 @@ def main():
                                                 max_regions_per_frame=cfg_max_regions,
                                                 cold_start_s=cfg_cold_start_s,
                                                 lead=lead_for_cfg)
-                    scheduler = warm_sched_cls(player, det_model, res_model, pad_mode, video_meta, config)
-                    scheduler.start()
+                    new_scheduler = warm_sched_cls(player, det_model, res_model, pad_mode,
+                                                   video_meta, config)
+                    new_scheduler.start()
+                    scheduler = new_scheduler
+                except Exception as e:  # noqa: BLE001 -- no AI must never stop playback
+                    video_meta = None
+                    _degrade_scheduler(f"build failed: {e!r}", new_scheduler)
 
                 # Intentionally no auto-resume seek: open/reopen always start at frame 0.
                 # settings.positions still records last frame (do_reopen/finally) for a future

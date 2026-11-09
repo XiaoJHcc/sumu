@@ -218,15 +218,11 @@ void Player::open_session(const std::string& video_path){
         for (;;) {
             if (pt_high_water_.load(std::memory_order_relaxed) >= start_buf - 1)
                 break;
-            // H1 修复（短视频）：流的总帧数可能不到 start_buf（本地阈值 5、网络 2），此时
-            // 解码线程很快走到 EOF，高水位永远到不了阈值 —— 旧逻辑只能干等满 10s/30s 超时再
-            // throw，任何少于 5 帧的视频永远无法打开。解码线程已到 EOF 即「不会再有更多帧」，
-            // 视为缓冲完成、合法打开。判定用解码线程的 EOF 状态而不是 frame_count_：裸流
-            // 时长未知时 frame_count_ 为 0，不可靠。EOF 且一帧未出 = 文件能 open 但无可用
-            // 画面，按失败处理（与旧超时同等语义，只是报得更快）；走上面统一的 catch 清理。
-            if (decoder_.at_eof()) {
+            // 短片或截断文件可能不足起始缓冲阈值；解码已结束时保留现有画面，
+            // 一帧未出才算打开失败，不等待容器声明的帧数或完整超时。
+            if (decoder_.at_eof() || decoder_.failed()) {
                 if (pt_high_water_.load(std::memory_order_relaxed) < 0)
-                    throw std::runtime_error("decoder reached EOF without producing any frame");
+                    throw std::runtime_error("no playable video frames (incomplete or damaged file)");
                 break;
             }
             LARGE_INTEGER now;

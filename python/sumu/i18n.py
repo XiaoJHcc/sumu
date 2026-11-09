@@ -66,6 +66,7 @@ REQUIRED_KEYS: tuple[str, ...] = (
     "open_failed",
     "open_failed_named",
     "open_failed_unsupported_pix_fmt",
+    "seek_unavailable_partial",
     "warmup_failed",
     "warmup_status",
     "compile_running",

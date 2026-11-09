@@ -995,9 +995,7 @@ void Player::create_ai_input_bridge(){
 }
 
 void Player::decode_loop(){
-    // M-C1: decode_thread_ is session-scoped (join()ed and restarted by close_session()/
-    // open_session() on every reopen), so it must exit on EITHER the whole-Player stop_ OR
-    // the session-only session_stop_ -- present_loop() must keep checking only stop_.
+    auto next_recovery = std::chrono::steady_clock::now();
     while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
         // Throttle: never get more than decode_ahead_max_ frames ahead of the present
         // head, so we never overwrite a ring slot before present has had its one chance
@@ -1021,10 +1019,19 @@ void Player::decode_loop(){
 
             DecodedFrame df;
             if (!decoder_.next_frame(df)) {
-                // EOF (pause-on-last-frame) or rare unrecoverable decode error. Drop the
-                // decoder lock before sleeping so Player::seek() is not blocked while we
-                // idle; present keeps redrawing the last good ring slot.
-                goto decode_idle;
+                const int64_t high = pt_high_water_.load(std::memory_order_relaxed);
+                const int64_t head = present_head_frame_.load(std::memory_order_relaxed);
+                const auto now = std::chrono::steady_clock::now();
+                if (network_source_ || !playing_.load(std::memory_order_relaxed) ||
+                    !decoder_.have_first_pts() || frame_count_ <= 0 ||
+                    high >= frame_count_ - 1 || head >= frame_count_ - 1 || now < next_recovery)
+                    goto decode_idle;
+                next_recovery = now + std::chrono::milliseconds(250);
+                std::string err;
+                const int div = std::max(1, fps_div_.load(std::memory_order_relaxed));
+                // Reposition only the decoder; the playback clock must cross missing data unchanged.
+                if (!decoder_.seek_to_frame(std::min(head + 2, frame_count_ - 1) * div, df, err))
+                    goto decode_idle;
             }
 
             // Source timeline -> session timeline. Decode every GOP frame (required for
@@ -1053,8 +1060,6 @@ void Player::decode_loop(){
                 }
                 context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
                     df.texture, df.array_slice, nullptr);
-            }
-            {
                 std::lock_guard<std::mutex> lk(ready_mutex_);
                 pt_tag_[slot] = frame_num;
             }
@@ -1074,6 +1079,7 @@ void Player::present_loop(){
     int64_t last_frame_local = -1;
     Source last_actual_source = Source::PassthroughFresh;
     UINT last_actual_slot = 0;
+    int64_t last_actual_frame = -1;
     uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
     int64_t tick_idx = 0;
     uint64_t local_pace_epoch = pace_epoch_.load(std::memory_order_acquire);
@@ -1112,6 +1118,7 @@ void Player::present_loop(){
             // the old video (seekbar past end / green-slot / "fast-forward" on drop-open).
             last_frame_local = -1;
             last_actual_slot = 0;
+            last_actual_frame = -1;
             last_actual_source = Source::PassthroughFresh;
             local_seek_version = seek_version_.load(std::memory_order_relaxed);
         }
@@ -1131,6 +1138,7 @@ void Player::present_loop(){
             // fallback at the freshly-seeked slot so an immediately-following tick that
             // races ahead of decode never repeats pre-seek content.
             last_actual_slot = static_cast<UINT>(seek_slot_hint_.load(std::memory_order_relaxed));
+            last_actual_frame = anchor_frame_.load(std::memory_order_relaxed);
             last_actual_source = Source::PassthroughFresh;
         }
 
@@ -1171,12 +1179,13 @@ void Player::present_loop(){
                 int64_t computed = af + static_cast<int64_t>(std::llround(elapsed_s * fps_));
                 if (!just_seeked && computed <= last_frame_local) computed = last_frame_local + 1;
                 frame = computed;
-                // End of file: freeze on the last frame and auto-pause (no loop). Without
-                // this the wall-clock head keeps climbing past frame_count while the decoder
-                // sits at EOF, so the seekbar runs off the end and seeks land in a broken
-                // domain. frame_count_==0 (unknown duration) skips the clamp.
-                if (frame_count_ > 0 && frame >= frame_count_) {
-                    frame = frame_count_ - 1;
+                int64_t end_frame = frame_count_ > 0 ? frame_count_ - 1 : INT64_MAX;
+                if (frame_count_ <= 0 && decoder_.at_eof()) {
+                    const int64_t decoded_end = pt_high_water_.load(std::memory_order_relaxed);
+                    if (decoded_end >= 0) end_frame = decoded_end;
+                }
+                if (frame >= end_frame) {
+                    frame = end_frame;
                     anchor_frame_.store(frame, std::memory_order_relaxed);
                     playing_.store(false, std::memory_order_relaxed);
                 }
@@ -1222,6 +1231,13 @@ void Player::present_loop(){
                 // header). Decode/push threads are the ones who may occasionally wait a
                 // fraction of a frame for this lock, never the reverse.
                 std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+                if (source == Source::AiStale || source == Source::PassthroughStale) {
+                    std::lock_guard<std::mutex> lk(ready_mutex_);
+                    const auto& tags = is_ai(source) ? ai_tag_ : pt_tag_;
+                    if (last_actual_frame < 0 || use_slot >= tags.size() ||
+                        tags[use_slot] != last_actual_frame)
+                        use_slot = UINT_MAX;
+                }
                 draw_and_present(source, use_slot);
             }
         }
@@ -1257,6 +1273,7 @@ void Player::present_loop(){
         if (source == Source::AiFresh || source == Source::PassthroughFresh) {
             last_actual_source = source;
             last_actual_slot = use_slot;
+            last_actual_frame = frame;
         }
     }
 }
@@ -1305,6 +1322,11 @@ void Player::draw_and_present(Source source, UINT slot){
     // pixel of the backbuffer.
     const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     context_->ClearRenderTargetView(backbuffer_rtv_.Get(), black);
+    if (slot == UINT_MAX) {
+        ui_render_drawdata();
+        swapchain_->Present(1, 0);
+        return;
+    }
     D3D11_VIEWPORT vp = fit_viewport();
     context_->RSSetViewports(1, &vp);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

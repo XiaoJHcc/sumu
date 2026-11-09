@@ -23,6 +23,8 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -71,9 +73,9 @@ public:
     // Atomic store only -- safe to call from the UI thread while open() blocks a worker.
     void request_interrupt() { interrupt_requested_.store(true, std::memory_order_relaxed); }
 
-    // Decode until one frame is available. Returns false on EOF or unrecoverable error --
-    // does NOT loop back to the start (product policy: pause on last frame; decode_loop idles
-    // until Player::seek() repositions via seek_to_frame()). The returned DecodedFrame is only
+    // Decode until one frame is available. Returns false on EOF or unrecoverable error;
+    // no implicit looping. Player may retry seek_to_frame() across a local incomplete segment.
+    // The returned DecodedFrame is only
     // valid until the next call to next_frame() or seek_to_frame() (we keep exactly one AVFrame
     // "in flight" to bound VRAM use / decoder pool pressure).
     bool next_frame(DecodedFrame& out);
@@ -87,7 +89,8 @@ public:
     // seek_to_frame()/close() 复位。原子 —— 由 decode 线程写、Player::open_session() 的
     // 起始缓冲等待在另一线程读，用于区分「缓冲还没填满」与「流本来就短、已经解完了」
     // （短视频总帧数可能低于起始缓冲高水位，不能用 frame_count_ 判 —— 裸流时它为 0）。
-    bool at_eof() const { return at_eof_.load(std::memory_order_relaxed); }
+    bool at_eof() const { return at_eof_.load(std::memory_order_acquire); }
+    bool failed() const { return failed_.load(std::memory_order_acquire); }
 
     // I6: seek = reposition, not teardown. Does NOT touch fmt_ctx_/codec_ctx_/hw_device_ref_
     // lifetime at all -- av_seek_frame + AVSEEK_FLAG_BACKWARD to the nearest keyframe at or
@@ -163,6 +166,17 @@ public:
     void close();
 
 private:
+    class LogScope;
+    static thread_local Decoder* logging_decoder_;
+    static void log_callback(void* context, int level, const char* format, va_list args);
+    void record_corrupt_data(const char* message, bool packet_error = false);
+    void flush_corrupt_logs(bool force = false);
+    uint64_t corrupt_messages_ = 0;
+    uint64_t corrupt_packets_ = 0;
+    uint64_t reported_messages_ = 0;
+    uint64_t reported_packets_ = 0;
+    std::chrono::steady_clock::time_point next_log_summary_{};
+
     static AVPixelFormat get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts);
     bool ensure_hw_frames_ctx(AVCodecContext* ctx);
     bool seek_to_start();
@@ -197,6 +211,8 @@ private:
     std::atomic<bool> have_first_pts_{ false };
     std::atomic<double> first_pts_seconds_{ 0.0 };
     std::atomic<bool> at_eof_{ false }; // 见 at_eof() 注释；next_frame 置位、seek/close 复位
+    std::atomic<bool> failed_{ false };
+    bool draining_ = false;
 
     // AVIOInterruptCB backing flag (see request_interrupt()). Set by the UI thread to abort a
     // blocked network open(); cleared at the top of every open() because the same callback

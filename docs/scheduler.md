@@ -31,8 +31,10 @@ D「重写」清单），但它调用的每一个计算函数（`scene_clip.py` 
 
 ### seek/不连续性处理
 
-- **主路径**：调用方（`scripts/run_player.py`）在调用 `player.seek(n)` 的同时调用
-  `scheduler.notify_seek(n)`（顺序不敏感——生产者线程在下一轮循环开始时先检查这个挂起值）。
+- **主界面路径**（`python/sumu/app.py`）：先执行 `actual = player.seek(n)`，成功后用
+  `scheduler.notify_seek(actual)` 对齐真实落帧。若目标尚未下载、seek 失败，则显示提示并用
+  `player.current_frame()` 重新通知调度器，不把不可达的目标交给 AI。验证驱动
+  `scripts/run_player.py` 仍同时通知名义目标；生产者线程在下一轮循环开始时检查挂起值。
 - **兜底启发式**（仅当调用方绕过 `notify_seek()` 直接驱动 `player.seek()`/发生循环播放时才会
   触发）：`head` 相对上一轮**倒退**，或**前跳**超过 `seek_jump_threshold`（默认 500 帧）。
   之所以 500 帧是安全阈值：生产者循环每轮最多 sleep 1-2ms，即使某一轮处理耗时到了几十毫秒

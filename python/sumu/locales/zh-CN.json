@@ -36,6 +36,7 @@
   "open_failed": "无法打开该视频",
   "open_failed_named": "无法打开：{name}",
   "open_failed_unsupported_pix_fmt": "不支持的视频格式：{fmt}（{name}）——目前仅支持 8-bit/10-bit 4:2:0 视频，HDR 色调映射暂不支持",
+  "seek_unavailable_partial": "该位置暂时无法播放，文件可能尚未下载完整",
   "warmup_failed": "预热失败",
   "warmup_status": "正在预热模型…",
   "compile_running": "正在编译加速引擎 {step}/{total}…（首次，需数分钟）",

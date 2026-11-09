@@ -90,6 +90,8 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `verify_ai_core.py` / `verify_scene_clip_blend.py` | AI 核心：load_models/YOLO/BasicVSR 实测 fps；scene/clip + blend 端到端 |
 | `verify_transcode*.py` / `verify_stream*.py` | 转码与 Web 流媒体/导出（路由/token/passthrough 直出/e2e） |
 | `scripts\verify_url_open_cancel.py` | URL 打开取消链路：挂死服务器 + `cancel_open_url()`（AVIOInterruptCB 快速中断）+ 正常 URL 打开回归 |
+| `scripts\verify_partial_media.py` / `scripts\verify_app_partial.py` | 不完整媒体：截断 MP4/MKV 保持时钟、追加下载自动恢复、长缺损定帧/黑帧后续播、TS 推断时长边界，以及主界面 seek 失败提示与继续操作 |
+| `scripts\verify_decoder_logging.py` | 可恢复坏数据日志限频：首条/5s 汇总/会话收尾、长缺损续播，以及未分类错误和 Decoder 作用域外 FFmpeg 日志透传 |
 | `stress_reopen.py` / `stress_seek_ai.py` | 压测：反复 reopen 不同尺寸视频、seek 风暴与 AI 并发 |
 | `scripts\analyze_present.py` | 解析 present trace（PresentMon/ns），分冷启动/稳态窗口比 median/stddev/p99（I10 先量后改） |
 | `scripts\measure_trt_build.py` | 一次性：测 6 个 TRT 子引擎编译耗时 |

@@ -10,8 +10,95 @@
 
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+}
+
+namespace {
+
+bool is_corrupt_media_message(const char* format)
+{
+    static const char* patterns[] = {
+        "Invalid NAL unit size", "missing picture in access unit",
+        "Error splitting the input into NAL units", "co located POCs unavailable",
+        "mmco: unref short failure", "reference picture missing during reorder",
+        "Missing reference picture", "decode_slice_header error", "no frame!",
+        "error while decoding MB", "concealing ", "corrupt decoded frame",
+        "Packet corrupt", "partial file", "File ended prematurely",
+    };
+    for (const char* pattern : patterns)
+        if (std::strstr(format, pattern)) return true;
+    return false;
+}
+
+}
+
+thread_local Decoder* Decoder::logging_decoder_ = nullptr;
+
+class Decoder::LogScope
+{
+public:
+    explicit LogScope(Decoder& decoder) : decoder_(decoder), previous_(logging_decoder_)
+    {
+        logging_decoder_ = &decoder_;
+    }
+    ~LogScope()
+    {
+        decoder_.flush_corrupt_logs();
+        logging_decoder_ = previous_;
+    }
+private:
+    Decoder& decoder_;
+    Decoder* previous_;
+};
+
+void Decoder::log_callback(void* context, int level, const char* format, va_list args)
+{
+    if (level > av_log_get_level()) return;
+    if (logging_decoder_ && (level == AV_LOG_WARNING || level == AV_LOG_ERROR) &&
+        format && is_corrupt_media_message(format)) {
+        char message[512] = {};
+        if (logging_decoder_->corrupt_messages_ == 0 && logging_decoder_->corrupt_packets_ == 0)
+            vsnprintf(message, sizeof(message), format, args);
+        logging_decoder_->record_corrupt_data(message);
+        return;
+    }
+    av_log_default_callback(context, level, format, args);
+}
+
+void Decoder::record_corrupt_data(const char* message, bool packet_error)
+{
+    const bool first = corrupt_messages_ == 0 && corrupt_packets_ == 0;
+    if (packet_error) ++corrupt_packets_;
+    else ++corrupt_messages_;
+    if (first) {
+        const size_t length = std::strcspn(message, "\r\n");
+        fprintf(stderr, "[sumu] recoverable media data: first: %.*s "
+            "(ffmpeg_messages=%llu packet_errors=%llu; summaries every 5s)\n",
+            static_cast<int>(length), message,
+            static_cast<unsigned long long>(corrupt_messages_),
+            static_cast<unsigned long long>(corrupt_packets_));
+        reported_messages_ = corrupt_messages_;
+        reported_packets_ = corrupt_packets_;
+        next_log_summary_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    } else {
+        flush_corrupt_logs();
+    }
+}
+
+void Decoder::flush_corrupt_logs(bool force)
+{
+    if (corrupt_messages_ == reported_messages_ && corrupt_packets_ == reported_packets_)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now < next_log_summary_) return;
+    fprintf(stderr, "[sumu] recoverable media data: summary: ffmpeg_messages=%llu "
+        "packet_errors=%llu%s\n", static_cast<unsigned long long>(corrupt_messages_),
+        static_cast<unsigned long long>(corrupt_packets_), force ? " (session closed)" : "");
+    reported_messages_ = corrupt_messages_;
+    reported_packets_ = corrupt_packets_;
+    next_log_summary_ = now + std::chrono::seconds(5);
 }
 
 Decoder::~Decoder()
@@ -45,6 +132,12 @@ void Decoder::close()
     if (codec_ctx_) avcodec_free_context(&codec_ctx_);
     if (hw_device_ref_) av_buffer_unref(&hw_device_ref_);
     if (fmt_ctx_) avformat_close_input(&fmt_ctx_);
+    flush_corrupt_logs(true);
+    corrupt_messages_ = 0;
+    corrupt_packets_ = 0;
+    reported_messages_ = 0;
+    reported_packets_ = 0;
+    next_log_summary_ = {};
     video_stream_idx_ = -1;
     audio_stream_idx_ = -1;
     // Reset session-derived state so a subsequent open() (reopen path, or a retry after a
@@ -57,6 +150,8 @@ void Decoder::close()
     have_first_pts_.store(false, std::memory_order_relaxed);
     first_pts_seconds_.store(0.0, std::memory_order_relaxed);
     at_eof_.store(false, std::memory_order_relaxed);
+    failed_.store(false, std::memory_order_relaxed);
+    draining_ = false;
     loop_offset_seconds_ = 0.0;
     last_out_pts_seconds_ = -1.0;
     d3d_device_ = nullptr;
@@ -304,6 +399,9 @@ bool Decoder::looks_like_network_url(const std::string& path)
 
 bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& error)
 {
+    static std::once_flag log_once;
+    std::call_once(log_once, [] { av_log_set_callback(&Decoder::log_callback); });
+    LogScope log_scope(*this);
     // Always start from a clean slate -- a previous partial failure (or a reopen after
     // close_session) must not leave half-allocated FFmpeg contexts for the next attempt.
     close();
@@ -359,11 +457,14 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
         fmt_ctx_->max_analyze_duration = 2 * AV_TIME_BASE; // 2s
     }
 
-    if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
-        error = "avformat_find_stream_info failed";
+    const int probe = avformat_find_stream_info(fmt_ctx_, nullptr);
+    if (interrupt_requested_.load(std::memory_order_relaxed)) {
+        error = "video open cancelled";
         close();
         return false;
     }
+    if (probe < 0)
+        fprintf(stderr, "[sumu] incomplete stream probe (%d), trying available video metadata\n", probe);
 
     const AVCodec* decoder = nullptr;
     int idx = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
@@ -375,10 +476,16 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     video_stream_idx_ = idx;
     AVStream* stream = fmt_ctx_->streams[idx];
     time_base_ = stream->time_base;
-    if (stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0)
-        fps_ = av_q2d(stream->avg_frame_rate);
+    AVRational rate = av_guess_frame_rate(fmt_ctx_, stream, nullptr);
+    if (rate.num > 0 && rate.den > 0)
+        fps_ = av_q2d(rate);
     width_ = stream->codecpar->width;
     height_ = stream->codecpar->height;
+    if (width_ <= 0 || height_ <= 0 || time_base_.num <= 0 || time_base_.den <= 0) {
+        error = "video metadata is incomplete";
+        close();
+        return false;
+    }
 
     // 下游环缓冲/scrub/AI 桥/headless 仍统一消费 8-bit NV12。10-bit 4:2:0 由
     // P010->NV12 GPU 转换接入同一契约；其余格式仍在 open 路径显式拒绝，避免
@@ -493,6 +600,11 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
 
     pkt_ = av_packet_alloc();
     frame_ = av_frame_alloc();
+    if (!pkt_ || !frame_) {
+        error = "failed to allocate decoder packet/frame";
+        close();
+        return false;
+    }
     return true;
 }
 
@@ -525,86 +637,102 @@ static double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base, 
 
 int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
 {
+    LogScope log_scope(*this);
+    constexpr int kMaxRecoverableErrors = 256;
+    int errors = 0;
     for (;;) {
-        av_frame_unref(frame_); // release previous frame's ref on the decoder pool slice
+        if (interrupt_requested_.load(std::memory_order_relaxed)) return -1;
+        av_frame_unref(frame_);
 
         int recv = avcodec_receive_frame(codec_ctx_, frame_);
         if (recv == 0) {
-            if (frame_->format != AV_PIX_FMT_D3D11) {
-                fprintf(stderr, "unexpected non-hw frame format %d\n", frame_->format);
-                continue;
+            if (frame_->format != AV_PIX_FMT_D3D11 || !frame_->data[0]) {
+                fprintf(stderr, "unexpected decoder output format %d\n", frame_->format);
+                return -1;
             }
             out.texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
             out.array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
             raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, fps_, last_out_pts_seconds_);
             return 1;
         }
-        if (recv == AVERROR(EAGAIN)) {
-            int read = av_read_frame(fmt_ctx_, pkt_);
-            if (read >= 0) {
-                if (pkt_->stream_index == video_stream_idx_) {
-                    int send = avcodec_send_packet(codec_ctx_, pkt_);
-                    if (send < 0 && send != AVERROR(EAGAIN)) {
-                        av_packet_unref(pkt_);
-                        fprintf(stderr, "avcodec_send_packet failed: %d\n", send);
-                        return -1;
-                    }
-                } else if (audio_stream_idx_ >= 0 && pkt_->stream_index == audio_stream_idx_) {
-                    // Demux-only: hand this packet off to Player's audio thread via the
-                    // bounded queue instead of decoding it here (see file header / decoder.h).
-                    // av_packet_move_ref() resets pkt_ to empty, so the generic
-                    // av_packet_unref(pkt_) below is a harmless no-op for this branch.
-                    AVPacket* apkt = av_packet_alloc();
-                    if (apkt) {
-                        av_packet_move_ref(apkt, pkt_);
-                        std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-                        audio_pkt_queue_.push_back(AudioPacketEntry{ apkt, loop_offset_seconds_ });
-                        if (audio_pkt_queue_.size() > kAudioQueueMaxPackets) {
-                            AudioPacketEntry drop = audio_pkt_queue_.front();
-                            audio_pkt_queue_.pop_front();
-                            av_packet_free(&drop.pkt);
-                            ++audio_pkt_dropped_;
-                        }
-                    }
-                }
-                av_packet_unref(pkt_);
+        if (recv == AVERROR_EOF) return 0;
+        if (recv == AVERROR_INVALIDDATA) {
+            record_corrupt_data("avcodec_receive_frame: invalid data", true);
+            if (++errors <= kMaxRecoverableErrors) continue;
+            return -1;
+        }
+        if (recv != AVERROR(EAGAIN)) {
+            fprintf(stderr, "avcodec_receive_frame failed: %d\n", recv);
+            return -1;
+        }
+        if (draining_) return 0;
+
+        int read = av_read_frame(fmt_ctx_, pkt_);
+        if (read < 0) {
+            av_packet_unref(pkt_);
+            if (read == AVERROR_INVALIDDATA) {
+                record_corrupt_data("av_read_frame: invalid data", true);
+                if (++errors <= kMaxRecoverableErrors) continue;
+                return -1;
+            }
+            if (read == AVERROR(EAGAIN) && ++errors <= kMaxRecoverableErrors) {
+                Sleep(1);
                 continue;
             }
-            // EOF: flush the decoder and try to drain one last frame.
-            avcodec_send_packet(codec_ctx_, nullptr);
-            int drain = avcodec_receive_frame(codec_ctx_, frame_);
-            if (drain == 0) {
-                out.texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
-                out.array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
-                raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, fps_, last_out_pts_seconds_);
-                return 1; // caller sees this as a normal frame; next pump call will see EOF again
+            if (read == AVERROR_EXIT || interrupt_requested_.load(std::memory_order_relaxed))
+                return -1;
+            if (read != AVERROR_EOF && read != AVERROR(EIO)) {
+                fprintf(stderr, "av_read_frame failed: %d\n", read);
+                return -1;
             }
-            return 0; // genuinely nothing left
+            draining_ = true;
+            int send = avcodec_send_packet(codec_ctx_, nullptr);
+            if (send < 0 && send != AVERROR_EOF) return -1;
+            continue;
         }
-        if (recv == AVERROR_EOF) {
-            // Decoder is fully drained (this is the steady-state EOF signal once the drain
-            // path above has already run out): genuinely nothing left, same as the drain==0
-            // case a few lines up. Must NOT fall through to the generic failure below.
-            return 0;
+        if (pkt_->stream_index == video_stream_idx_) {
+            int send = avcodec_send_packet(codec_ctx_, pkt_);
+            av_packet_unref(pkt_);
+            if (send < 0) {
+                if (send == AVERROR_INVALIDDATA) {
+                    record_corrupt_data("avcodec_send_packet: invalid data", true);
+                    if (++errors <= kMaxRecoverableErrors) continue;
+                    return -1;
+                }
+                fprintf(stderr, "avcodec_send_packet failed: %d\n", send);
+                return -1;
+            }
+        } else {
+            if (audio_stream_idx_ >= 0 && pkt_->stream_index == audio_stream_idx_) {
+                AVPacket* apkt = av_packet_alloc();
+                if (apkt) {
+                    av_packet_move_ref(apkt, pkt_);
+                    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+                    audio_pkt_queue_.push_back(AudioPacketEntry{ apkt, loop_offset_seconds_ });
+                    if (audio_pkt_queue_.size() > kAudioQueueMaxPackets) {
+                        AudioPacketEntry drop = audio_pkt_queue_.front();
+                        audio_pkt_queue_.pop_front();
+                        av_packet_free(&drop.pkt);
+                        ++audio_pkt_dropped_;
+                    }
+                }
+            }
+            av_packet_unref(pkt_);
         }
-        fprintf(stderr, "avcodec_receive_frame failed: %d\n", recv);
-        return -1;
     }
 }
 
 bool Decoder::next_frame(DecodedFrame& out)
 {
+    if (at_eof() || failed()) return false;
     double raw_pts_s = 0.0;
     int r = pump_one_raw_frame(out, raw_pts_s);
-    if (r < 0) return false;
+    if (r < 0) {
+        failed_.store(true, std::memory_order_release);
+        return false;
+    }
     if (r == 0) {
-        // EOF: do NOT loop back to t=0. Product policy is pause-on-last-frame (present_loop
-        // clamps the clock and clears playing_); decode_loop treats false as "idle until seek
-        // repositions". Loop-on-EOF used to bump loop_offset_seconds_ past the real timeline,
-        // so the seekbar clock ran past frame_count and seek targets mapped into the wrong
-        // PTS domain. at_eof_ 只在此（真实 EOF）置位 —— r<0 的解码错误不算，open_session 的
-        // 起始缓冲等待靠它识别「短视频已解完」而不是干等超时。
-        at_eof_.store(true, std::memory_order_relaxed);
+        at_eof_.store(true, std::memory_order_release);
         return false;
     }
 
@@ -621,6 +749,7 @@ bool Decoder::next_frame(DecodedFrame& out)
 bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
                             bool nearest_keyframe)
 {
+    LogScope log_scope(*this);
     if (!have_first_pts_) {
         error = "seek_to_frame called before any frame decoded (no PTS origin yet)";
         return false;
@@ -641,6 +770,12 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
     double target_seconds_raw = (target_seconds_local - loop_offset_seconds_) + first_pts_seconds_;
     int64_t seek_ts = static_cast<int64_t>(std::llround(target_seconds_raw / av_q2d(time_base_)));
 
+    draining_ = false;
+    failed_.store(false, std::memory_order_relaxed);
+    if (fmt_ctx_->pb) {
+        fmt_ctx_->pb->eof_reached = 0;
+        fmt_ctx_->pb->error = 0;
+    }
     avcodec_flush_buffers(codec_ctx_);
     int ret = av_seek_frame(fmt_ctx_, video_stream_idx_, seek_ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
