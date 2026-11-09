@@ -103,7 +103,9 @@ class TranscodeEngine:
             if start_seconds > 0.0:
                 start_frame = int(dec.seek_to_frame(int(round(start_seconds * fps))))
 
+            from dataclasses import replace
             meta = video_meta or self.video_meta or self._build_meta(source, dec)
+            meta = replace(meta, video_width=w, video_height=h)
             proc = DecensorProcessor(self.det_model, self.res_model, self.pad_mode, meta, cfg)
             enc = NvencEncoder(w, h, fps, mode, out, encode=encode, quality_first=quality_first,
                                audio_source=audio_source if audio_source is not None else source,

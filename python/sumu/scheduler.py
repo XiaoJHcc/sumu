@@ -133,9 +133,7 @@ class SchedulerConfig:
     # jump of hundreds of frames is only explained by an actual seek.
     seek_jump_threshold: int = 500
 
-    # Color conversion params for _nv12_to_bgr_hwc_gpu. Both sumu test videos are BT.709
-    # limited-range (see CLAUDE.md); expose them here rather than hardcoding so a differently
-    # tagged source can be wired up later without touching the loop body.
+    # Native playback and headless decode normalize all sources to BT.709 limited NV12.
     bt709: bool = True
     full_range: bool = False
 

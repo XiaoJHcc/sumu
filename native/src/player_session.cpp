@@ -158,6 +158,10 @@ void Player::open_session(const std::string& video_path){
     create_ai_input_bridge();
 
     pt_tag_.assign(ring_capacity_, -1);
+    pt_end_tag_.assign(ring_capacity_, -1);
+    network_recovery_attempts_.store(0, std::memory_order_relaxed);
+    network_recovery_successes_.store(0, std::memory_order_relaxed);
+    network_recovering_.store(false, std::memory_order_relaxed);
     ai_tag_.assign(ai_ring_capacity_, -1);
     // Must reset before starting decode_thread_ / the start-buffer wait: otherwise a
     // reopen() inherits the previous session's high-water (e.g. 10000) and the wait
@@ -291,6 +295,8 @@ void Player::close_session(){
         check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (close_session)");
 
     session_stop_.store(true, std::memory_order_relaxed);
+    decoder_.request_interrupt();
+    scrub_decoder_.request_interrupt();
     scrub_cv_.notify_one(); // wake scrub_thread_ out of its wait so it observes session_stop_
     if (decode_thread_.joinable()) decode_thread_.join();
     if (audio_thread_.joinable()) audio_thread_.join();
@@ -367,6 +373,7 @@ void Player::close_session(){
             pt_srv_y_.clear();
             pt_srv_uv_.clear();
             pt_tag_.clear();
+            pt_end_tag_.clear();
         }
 
         ai_ring_tex_.Reset();
@@ -406,6 +413,10 @@ void Player::close_session(){
         scrub_request_frame_.store(-1, std::memory_order_relaxed);
         scrub_grid_wanted_.store(false, std::memory_order_relaxed);
     }
+
+    // Network-recovery flags are per session: a torn-down session must not report itself as
+    // mid-recovery (decode_loop() is joined above, so nothing else can clear this afterwards).
+    network_recovering_.store(false, std::memory_order_relaxed);
 
     decoder_.close();
     scrub_decoder_.close();

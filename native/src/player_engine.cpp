@@ -81,8 +81,12 @@ py::dict summarize(std::vector<double> samples_ms)
 // and returns -- it does NOT wait for steady playback to resume (that happens
 // organically on the decode/present threads, per I2/I9, never blocking).
 //
-// Returns the ACTUAL landed frame number (I5: anchored to the real decoded PTS, which
-// may differ slightly from the requested frame_num near GOP boundaries or EOF).
+// Returns the ACTUAL landed frame number on the fixed-fps grid. The decoder hands back the
+// landed picture's real PTS (I5) plus its duration, i.e. the grid interval that picture covers:
+// when the requested target falls inside that interval the target IS the landed frame (a VFR
+// picture holds many grid frames -- pinning the clock back to the interval's first frame would
+// move the playhead backwards), otherwise the interval's own start is as close as the decoder
+// could get (GOP boundary / EOF / a grid gap with no picture).
 int64_t Player::seek(int64_t frame_num){
     require_open();
     if (frame_count_ > 0) {
@@ -115,16 +119,29 @@ int64_t Player::seek(int64_t frame_num){
     if (!decoder_.seek_to_frame(source_target, df, err))
         throw std::runtime_error("seek_to_frame failed: " + err);
 
-    int64_t source_landed = static_cast<int64_t>(std::llround(df.pts_seconds * source_fps_));
-    int64_t actual_frame = source_landed / div; // session index
-    if (frame_count_ > 0)
-        actual_frame = std::max<int64_t>(0, std::min<int64_t>(actual_frame, frame_count_ - 1));
-    UINT slot = wrap_pt_slot(actual_frame);
+    // Same grid mapping decode_loop() uses (real PTS + duration -> [start, end] grid
+    // interval), so the tagged slot answers find_pt_slot_locked() for every frame the
+    // landed picture is on screen for. Without a declared duration the picture only claims
+    // its own single grid frame -- gaps are never invented.
+    const double duration = df.duration_seconds > 0.0 ? df.duration_seconds
+        : (source_fps_ > 0.0 ? 1.0 / source_fps_ : 1.0 / (fps_ > 0.0 ? fps_ : 60.0));
+    int64_t grid_start = static_cast<int64_t>(std::ceil(df.pts_seconds * fps_ - 1e-5));
+    int64_t grid_end = static_cast<int64_t>(std::ceil((df.pts_seconds + duration) * fps_ - 1e-5)) - 1;
+    if (grid_start < 0) grid_start = 0;
+    int64_t actual_frame = (frame_num >= grid_start && frame_num <= grid_end) ? frame_num : grid_start;
+    if (frame_count_ > 0) {
+        grid_end = std::min(grid_end, frame_count_ - 1);
+        grid_start = std::min(grid_start, grid_end);
+        actual_frame = std::max<int64_t>(0, std::min(actual_frame, grid_end));
+    }
+    if (grid_end < grid_start) grid_end = grid_start;
+    if (actual_frame > grid_end) actual_frame = grid_end;
+    UINT slot = wrap_pt_slot(grid_start);
 
     {
         std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
         if (!decoder_.prepare_nv12_frame(df, err))
-            throw std::runtime_error("P010->NV12 conversion failed during seek: " + err);
+            throw std::runtime_error("video normalization conversion failed during seek: " + err);
         context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
             df.texture, df.array_slice, nullptr);
     }
@@ -136,11 +153,17 @@ int64_t Player::seek(int64_t frame_num){
         // costs nothing but a few repeated-frame present ticks while decode refills).
         std::lock_guard<std::mutex> lk(ready_mutex_);
         std::fill(pt_tag_.begin(), pt_tag_.end(), -1);
+        std::fill(pt_end_tag_.begin(), pt_end_tag_.end(), -1);
         std::fill(ai_tag_.begin(), ai_tag_.end(), -1);
-        pt_tag_[slot] = actual_frame;
+        if (static_cast<size_t>(slot) < pt_tag_.size()) {
+            pt_tag_[slot] = grid_start;
+            pt_end_tag_[slot] = grid_end;
+        }
     }
 
-    pt_high_water_.store(actual_frame, std::memory_order_relaxed);
+    // High water = the last grid frame the sought picture covers, so decode's lookahead
+    // throttle measures timeline coverage from the new position, not the old one.
+    pt_high_water_.store(grid_end, std::memory_order_relaxed);
     present_head_frame_.store(actual_frame, std::memory_order_relaxed);
 
     // Reposition the present clock anchor. If playing, present continues from here at
@@ -271,55 +294,25 @@ void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int 
 // to this method, since that call will overwrite the same memory.
 py::dict Player::get_cuda_nv12_by_frame(int64_t frame_num){
     require_open();
-    UINT slot = wrap_pt_slot(frame_num);
-
-    // Phase 1: fast, lock-minimal cache check. On a miss -- expected to be the common
-    // case whenever the AI consumer is behind decode/present (e.g. still warming up, or
-    // slower than realtime) -- return immediately WITHOUT ever touching d3d_mutex_, so a
-    // cold/lagging AI consumer never adds contention to decode/present/push_ai_frame.
+    UINT slot = UINT_MAX;
+    auto miss = [frame_num]() {
+        py::dict result;
+        result["ready"] = false;
+        result["frame_num"] = frame_num;
+        return result;
+    };
     {
         std::lock_guard<std::mutex> lk(ready_mutex_);
-        // M-C2 fix: close_session() now .clear()s pt_tag_ under this same ready_mutex_
-        // (see close_session()) as part of a reopen()-driven teardown, which flips
-        // session_active_ false first -- checking it here, before indexing pt_tag_[slot],
-        // is what makes that safe: either this observes session_active_ still true (in
-        // which case close_session() has not yet reached its ready_lock, so pt_tag_ is
-        // still the full, correctly-sized vector) or it observes false and bails before
-        // ever indexing what might now be an empty (post-clear()) vector -- indexing it
-      // was the second crash this fix closes (undefined behaviour, not just a stale read).
-        if (!session_active_.load(std::memory_order_acquire) || pt_tag_[slot] != frame_num) {
-            py::dict miss;
-            miss["ready"] = false;
-            miss["frame_num"] = frame_num;
-            return miss;
-        }
+        if (!session_active_.load(std::memory_order_acquire)) return miss();
+        slot = find_pt_slot_locked(frame_num);
+        if (slot == UINT_MAX) return miss();
     }
-
-    // Phase 2: only reached after a phase-1 hit. Acquire d3d_mutex_, then re-check the
-    // tag: between phase 1 and acquiring the lock, this slot could have been overwritten
-    // (decode_loop advancing a full ring lap, or a seek()) -- both of those writers also
-    // take d3d_mutex_ before touching pt_ring_tex_, so once we hold d3d_mutex_ no
-    // concurrent writer can be modifying this slot's texture contents; the re-check only
-    // guards against having already lost that race before we got here. Also re-check
-    // session_active_ here (M-C2 fix, same reasoning as push_ai_frame()'s d3d_lock-guarded
-    // check): a reopen() could have flipped it false and be waiting on close_session()'s
-    // own d3d_lock right behind us -- bail before touching pt_ring_tex_/the AI bridge
-    // textures rather than racing that teardown.
     std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-    if (!session_active_.load(std::memory_order_acquire)) {
-        py::dict miss;
-        miss["ready"] = false;
-        miss["frame_num"] = frame_num;
-        return miss;
-    }
+    if (!session_active_.load(std::memory_order_acquire)) return miss();
     {
         std::lock_guard<std::mutex> lk(ready_mutex_);
-        if (pt_tag_[slot] != frame_num) {
-            py::dict miss;
-            miss["ready"] = false;
-            miss["frame_num"] = frame_num;
-            return miss;
-        }
+        slot = find_pt_slot_locked(frame_num);
+        if (slot == UINT_MAX) return miss();
     }
 
     try {
@@ -432,6 +425,23 @@ py::dict Player::stats(){
     d["ring_capacity"] = ring_capacity_;
     d["ai_ring_capacity"] = ai_ring_capacity_;
     d["decode_ahead_max"] = decode_ahead_max_;
+    d["network_recovery_attempts"] = network_recovery_attempts_.load(std::memory_order_relaxed);
+    d["network_recovery_successes"] = network_recovery_successes_.load(std::memory_order_relaxed);
+    d["network_recovering"] = network_recovering_.load(std::memory_order_relaxed);
+    // VFR diagnostics (no UI consumer): how many passthrough slots currently hold a picture,
+    // and the longest grid interval one picture stays on screen for. 1 == plain CFR.
+    int64_t ready_slots = 0, hold_max = 0;
+    {
+        std::lock_guard<std::mutex> lk(ready_mutex_);
+        const size_t n = std::min(pt_tag_.size(), pt_end_tag_.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (pt_tag_[i] < 0) continue;
+            ++ready_slots;
+            hold_max = std::max(hold_max, pt_end_tag_[i] - pt_tag_[i] + 1);
+        }
+    }
+    d["pt_ready_slots"] = ready_slots;
+    d["pt_hold_max"] = hold_max;
     return d;
 }
 
@@ -580,7 +590,7 @@ bool Player::blit_thumbnail(const DecodedFrame& df, ID3D11RenderTargetView* dst_
     DecodedFrame nv12_df = df;
     std::string err;
     if (!scrub_decoder_.prepare_nv12_frame(nv12_df, err)) {
-        fprintf(stderr, "[sumu] P010->NV12 thumbnail conversion failed: %s\n", err.c_str());
+        fprintf(stderr, "[sumu] video normalization thumbnail conversion failed: %s\n", err.c_str());
         return false;
     }
     context_->CopySubresourceRegion(scrub_nv12_tex_.Get(), 0, 0, 0, 0,
@@ -994,82 +1004,137 @@ void Player::create_ai_input_bridge(){
     check_cu(cuMemAlloc(&ai_in_cu_buf_, ai_in_cu_buf_size_), "cuMemAlloc(ai_in_cu_buf_)");
 }
 
+// Session frame number -> the passthrough ring slot showing that picture. A decoded picture
+// owns the fixed-fps grid interval [pt_tag_[i], pt_end_tag_[i]] derived from its real PTS and
+// duration, so one slot answers for every frame of a VFR hold; CFR keeps the cheap exact-slot
+// path. Overlapping claims (a duration running past the next picture's start) resolve to the
+// LATEST start -- the picture the timeline says is on screen at frame_num. Caller must hold
+// ready_mutex_. UINT_MAX == miss (frame not decoded yet, fell out of the ring, or ring torn
+// down); callers treat that as "nothing to show", never as an error.
+UINT Player::find_pt_slot_locked(int64_t frame_num) const{
+    const size_t n = std::min(pt_tag_.size(), pt_end_tag_.size());
+    if (n == 0 || frame_num < 0) return UINT_MAX;
+    const UINT exact = wrap_pt_slot(frame_num);
+    if (static_cast<size_t>(exact) < n && pt_tag_[exact] == frame_num && pt_end_tag_[exact] >= frame_num)
+        return exact;
+    UINT best = UINT_MAX;
+    int64_t best_start = -1;
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t start = pt_tag_[i];
+        if (start < 0 || start > frame_num || pt_end_tag_[i] < frame_num) continue;
+        if (start > best_start) { best_start = start; best = static_cast<UINT>(i); }
+    }
+    return best;
+}
+
 void Player::decode_loop(){
     auto next_recovery = std::chrono::steady_clock::now();
+    unsigned recovery_failures = 0;
+    uint64_t recovery_seek_version = seek_version_.load(std::memory_order_relaxed);
     while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
-        // Throttle: never get more than decode_ahead_max_ frames ahead of the present
-        // head, so we never overwrite a ring slot before present has had its one chance
-        // to read it. Before the present thread has started, present_head_frame_ is
-        // whatever open() initialized it to (0); after a seek it's the seeked frame.
         for (;;) {
             if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
-            int64_t head = present_head_frame_.load(std::memory_order_relaxed);
-            int64_t high = pt_high_water_.load(std::memory_order_relaxed);
+            const int64_t head = present_head_frame_.load(std::memory_order_relaxed);
+            const int64_t high = pt_high_water_.load(std::memory_order_relaxed);
             if (high - head < decode_ahead_max_) break;
             Sleep(1);
         }
-
-        // Widened critical section (see file header): decode-one-frame + copy-into-ring
-        // + tag-ready is one atomic unit with respect to seek()'s own reposition, so a
-        // frame decoded from the OLD position can never land in the ring after a seek's
-        // fresh write to the same slot.
         {
             std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
             if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
+            const uint64_t version = seek_version_.load(std::memory_order_relaxed);
+            if (version != recovery_seek_version) {
+                recovery_seek_version = version;
+                next_recovery = std::chrono::steady_clock::now();
+                recovery_failures = 0;
+                network_recovering_.store(false, std::memory_order_relaxed);
+            }
 
             DecodedFrame df;
             if (!decoder_.next_frame(df)) {
                 const int64_t high = pt_high_water_.load(std::memory_order_relaxed);
                 const int64_t head = present_head_frame_.load(std::memory_order_relaxed);
                 const auto now = std::chrono::steady_clock::now();
-                if (network_source_ || !playing_.load(std::memory_order_relaxed) ||
-                    !decoder_.have_first_pts() || frame_count_ <= 0 ||
-                    high >= frame_count_ - 1 || head >= frame_count_ - 1 || now < next_recovery)
+                const bool playing = playing_.load(std::memory_order_relaxed);
+                if (!playing)
+                    network_recovering_.store(false, std::memory_order_relaxed); // nothing to recover while paused
+                if (!playing || !decoder_.have_first_pts() ||
+                    frame_count_ <= 0 || high >= frame_count_ - 1 ||
+                    head >= frame_count_ - 1 || now < next_recovery)
                     goto decode_idle;
-                next_recovery = now + std::chrono::milliseconds(250);
-                std::string err;
                 const int div = std::max(1, fps_div_.load(std::memory_order_relaxed));
-                // Reposition only the decoder; the playback clock must cross missing data unchanged.
-                if (!decoder_.seek_to_frame(std::min(head + 2, frame_count_ - 1) * div, df, err))
+                std::string err;
+                if (network_source_) {
+                    network_recovering_.store(true, std::memory_order_relaxed);
+                    network_recovery_attempts_.fetch_add(1, std::memory_order_relaxed);
+                }
+                const int64_t target = std::min(head + 2, frame_count_ - 1) * div;
+                const bool recovered = network_source_
+                    ? decoder_.reconnect_to_frame(target, df, err)
+                    : decoder_.seek_to_frame(target, df, err);
+                if (!recovered) {
+                    recovery_failures = std::min(recovery_failures + 1, 4u);
+                    const unsigned delay_ms = network_source_ ? std::min(2000u, 500u << recovery_failures) : 250u;
+                    next_recovery = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+                    if (network_source_)
+                        fprintf(stderr, "[sumu] network recovery failed (%s); retry in %ums\n", err.c_str(), delay_ms);
                     goto decode_idle;
+                }
+                next_recovery = std::chrono::steady_clock::now() + std::chrono::milliseconds(network_source_ ? 1000 : 250);
+                if (network_source_) {
+                    network_recovery_successes_.fetch_add(1, std::memory_order_relaxed);
+                    network_recovering_.store(false, std::memory_order_relaxed);
+                    fprintf(stderr, "[sumu] network playback recovered at %.3fs\n", df.pts_seconds);
+                }
+                recovery_failures = 0;
             }
 
-            // Source timeline -> session timeline. Decode every GOP frame (required for
-            // HEVC/H.264); only keep every fps_div-th as a dense session frame so the rest
-            // of the player is identical to a native lower-fps file.
-            // frame_num is derived from presentation PTS (Decoder prefers
-            // best_effort_timestamp). Negative can appear only if a bad first_pts origin
-            // was locked before a earlier-PTS frame arrived -- drop rather than wrap into
-            // the ring tail (which would present as a flash of the wrong nearby frame).
-            int div = fps_div_.load(std::memory_order_relaxed);
-            if (div < 1) div = 1;
-            int64_t source_frame = static_cast<int64_t>(std::llround(df.pts_seconds * source_fps_));
-            if (source_frame < 0)
-                continue;
-            if (div > 1 && (source_frame % div) != 0)
-                continue;
-            int64_t frame_num = source_frame / div;
+            // Real-PTS grid mapping: a picture occupies [start, end] of the fixed-fps timeline,
+            // start from its PTS and end from its own declared duration (nothing is invented for
+            // a gap). An interval that contains no grid sample point (fps_div dropped it) is
+            // dropped whole; only a picture with no usable duration falls back to its own single
+            // grid frame. Fractional frames at the boundary are collapsed by the ceil(...-eps)
+            // on both edges, so fps_div keeps exactly the div-aligned pictures.
+            const int64_t frame_num = static_cast<int64_t>(std::ceil(df.pts_seconds * fps_ - 1e-5));
+            int64_t frame_end = frame_num;
+            if (df.duration_seconds > 0.0) {
+                frame_end = static_cast<int64_t>(std::ceil((df.pts_seconds + df.duration_seconds) * fps_ - 1e-5)) - 1;
+                if (frame_end < frame_num) continue;
+            }
+            if (frame_count_ > 0) frame_end = std::min(frame_end, frame_count_ - 1);
+            if (frame_num < 0 || frame_num > frame_end) continue;
             UINT slot = wrap_pt_slot(frame_num);
-
+            {
+                std::lock_guard<std::mutex> lk(ready_mutex_);
+                const int64_t head = present_head_frame_.load(std::memory_order_relaxed);
+                if (pt_tag_[slot] >= 0 && pt_end_tag_[slot] >= head && pt_tag_[slot] != frame_num) {
+                    for (UINT i = 0; i < pt_tag_.size(); ++i) {
+                        if (pt_tag_[i] < 0 || pt_end_tag_[i] < head) {
+                            slot = i;
+                            break;
+                        }
+                    }
+                }
+            }
             {
                 std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
                 std::string err;
                 if (!decoder_.prepare_nv12_frame(df, err)) {
-                    fprintf(stderr, "[sumu] P010->NV12 conversion failed: %s\n", err.c_str());
+                    fprintf(stderr, "[sumu] video normalization failed: %s\n", err.c_str());
                     goto decode_idle;
                 }
                 context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
                     df.texture, df.array_slice, nullptr);
                 std::lock_guard<std::mutex> lk(ready_mutex_);
                 pt_tag_[slot] = frame_num;
+                pt_end_tag_[slot] = frame_end;
             }
-            pt_high_water_.store(frame_num, std::memory_order_relaxed);
+            pt_high_water_.store(std::max(pt_high_water_.load(std::memory_order_relaxed), frame_end), std::memory_order_relaxed);
             ++decode_frame_count_;
             continue;
         }
     decode_idle:
-        if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))
-            return;
+        if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
         Sleep(5);
     }
 }
@@ -1078,8 +1143,12 @@ void Player::present_loop(){
     const double ticks_per_ms = static_cast<double>(freq_.QuadPart) / 1000.0;
     int64_t last_frame_local = -1;
     Source last_actual_source = Source::PassthroughFresh;
-    UINT last_actual_slot = 0;
-    int64_t last_actual_frame = -1;
+    UINT last_actual_slot = UINT_MAX;
+    // Owner tag of the frame actually on screen: the passthrough interval START that picture
+    // answered for (VFR: several grid frames share one slot, so the owner is what identifies
+    // the content -- comparing against the timeline frame would call every held frame stale),
+    // or the pushed frame number for an AI frame (that ring is frame-exact).
+    int64_t last_actual_owner = -1;
     uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
     int64_t tick_idx = 0;
     uint64_t local_pace_epoch = pace_epoch_.load(std::memory_order_acquire);
@@ -1117,8 +1186,8 @@ void Player::present_loop(){
             // the monotonic guard below cannot force the new timeline to last_frame+1 of
             // the old video (seekbar past end / green-slot / "fast-forward" on drop-open).
             last_frame_local = -1;
-            last_actual_slot = 0;
-            last_actual_frame = -1;
+            last_actual_slot = UINT_MAX;
+            last_actual_owner = -1;
             last_actual_source = Source::PassthroughFresh;
             local_seek_version = seek_version_.load(std::memory_order_relaxed);
         }
@@ -1136,15 +1205,20 @@ void Player::present_loop(){
             // Bypass the monotonic guard below for exactly this tick (a seek can
             // legitimately move backward or far forward), and repoint the stale-repeat
             // fallback at the freshly-seeked slot so an immediately-following tick that
-            // races ahead of decode never repeats pre-seek content.
-            last_actual_slot = static_cast<UINT>(seek_slot_hint_.load(std::memory_order_relaxed));
-            last_actual_frame = anchor_frame_.load(std::memory_order_relaxed);
+            // races ahead of decode never repeats pre-seek content. The owner tag is read
+            // from that slot (not from anchor_frame_) because seek() tags the slot with the
+            // landed picture's grid interval start, which can precede the target it covers.
+            std::lock_guard<std::mutex> lk(ready_mutex_);
+            const UINT hint = static_cast<UINT>(seek_slot_hint_.load(std::memory_order_relaxed));
+            last_actual_slot = (hint < pt_tag_.size()) ? hint : UINT_MAX;
+            last_actual_owner = (hint < pt_tag_.size()) ? pt_tag_[hint] : -1;
             last_actual_source = Source::PassthroughFresh;
         }
 
         int64_t frame;
         Source source;
-        UINT use_slot = 0;
+        UINT use_slot = UINT_MAX;
+        int64_t use_owner = -1;
 
         // M-C1: no session open yet (or one was just closed) -- skip frame-picking and
         // draw_and_present() entirely (every ring/tag/SRV they touch may not exist, or may
@@ -1200,43 +1274,51 @@ void Player::present_loop(){
             clock_frame_.store(frame, std::memory_order_relaxed);
             present_head_frame_.store(frame, std::memory_order_relaxed);
 
-            UINT pt_slot = wrap_pt_slot(frame);
-            UINT ai_slot = wrap_ai_slot(frame);
-            {
-                std::lock_guard<std::mutex> lk(ready_mutex_);
-                // Phase 6 M-D: gates the AI pick on the de-mosaic-on/off toggle, read once
-                // here under the same lock as the tag arrays it's compared against. When
-                // ai_enabled_==true (the default) `ai_on && x` is identical to the bare `x`
-                // this replaced, so steady-state behavior when de-mosaic stays on is
-                // unchanged.
-                bool ai_on = ai_enabled_.load(std::memory_order_relaxed);
-
-                if (ai_on && ai_tag_[ai_slot] == frame) {
-                    source = Source::AiFresh;
-                    use_slot = ai_slot;
-                } else if (pt_tag_[pt_slot] == frame) {
-                    source = Source::PassthroughFresh;
-                    use_slot = pt_slot;
-                } else {
-                    // Neither map has this exact frame number ready. NEVER block -- just
-                    // re-present whatever was actually shown last tick (I2/I9). When
-                    // de-mosaic is off, never repeat an AI frame here either.
-                    source = (ai_on && is_ai(last_actual_source)) ? Source::AiStale : Source::PassthroughStale;
-                    use_slot = last_actual_slot;
-                }
-            }
-
+            // Source pick + draw in ONE d3d_mutex_ section. Tag writers (decode_loop(),
+            // push_ai_frame()) publish slot contents and the slot's tag/interval together
+            // inside their own d3d_mutex_ section, so while we hold it a slot we just
+            // validated cannot be rewritten under us before the draw -- that is the
+            // re-validation the pick needs, not a second guess after the fact. present still
+            // never waits on the DECODER (decode_mutex_ is not involved), only on the same
+            // brief immediate-context sections it always waited for.
             {
                 // Serializes ALL D3D11/CUDA-interop use of the shared context (see file
                 // header). Decode/push threads are the ones who may occasionally wait a
                 // fraction of a frame for this lock, never the reverse.
                 std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-                if (source == Source::AiStale || source == Source::PassthroughStale) {
+                {
                     std::lock_guard<std::mutex> lk(ready_mutex_);
-                    const auto& tags = is_ai(source) ? ai_tag_ : pt_tag_;
-                    if (last_actual_frame < 0 || use_slot >= tags.size() ||
-                        tags[use_slot] != last_actual_frame)
-                        use_slot = UINT_MAX;
+                    // Phase 6 M-D: gates the AI pick on the de-mosaic-on/off toggle, read
+                    // once here under the same lock as the tag arrays it's compared against.
+                    // When ai_enabled_==true (the default) `ai_on && x` is identical to the
+                    // bare `x` this replaced, so steady-state behavior when de-mosaic stays
+                    // on is unchanged.
+                    const bool ai_on = ai_enabled_.load(std::memory_order_relaxed);
+                    const UINT ai_slot = wrap_ai_slot(frame);
+
+                    if (ai_on && frame >= 0 && ai_slot < ai_tag_.size() && ai_tag_[ai_slot] == frame) {
+                        source = Source::AiFresh;
+                        use_slot = ai_slot;
+                        use_owner = frame;
+                    } else if ((use_slot = find_pt_slot_locked(frame)) != UINT_MAX) {
+                        // A picture covering this grid frame is on the GPU: fresh, whether or
+                        // not the picture's own PTS landed exactly on it (VFR hold).
+                        source = Source::PassthroughFresh;
+                        use_owner = pt_tag_[use_slot];
+                    } else {
+                        // Nothing covers this frame (decode has not reached it, it fell out of
+                        // the ring, or the timeline has a gap with no picture). NEVER block --
+                        // re-present whatever was actually shown last tick (I2/I9), but only if
+                        // that slot still holds the SAME picture: a ring lap or a seek may have
+                        // overwritten it, and stale content must never be mistaken for the last
+                        // valid frame. When de-mosaic is off, never repeat an AI frame either.
+                        source = (ai_on && is_ai(last_actual_source)) ? Source::AiStale
+                                                                      : Source::PassthroughStale;
+                        const auto& tags = is_ai(source) ? ai_tag_ : pt_tag_;
+                        use_slot = (last_actual_owner >= 0 && last_actual_slot < tags.size() &&
+                                    tags[last_actual_slot] == last_actual_owner)
+                            ? last_actual_slot : UINT_MAX;
+                    }
                 }
                 draw_and_present(source, use_slot);
             }
@@ -1271,9 +1353,12 @@ void Player::present_loop(){
         }
 
         if (source == Source::AiFresh || source == Source::PassthroughFresh) {
+            // Only a validated fresh draw becomes "the last valid frame" -- the stale path may
+            // have resolved to UINT_MAX (one black tick), which must never be remembered as
+            // something to repeat.
             last_actual_source = source;
             last_actual_slot = use_slot;
-            last_actual_frame = frame;
+            last_actual_owner = use_owner;
         }
     }
 }
@@ -1386,39 +1471,14 @@ void Player::draw_splash(){
     swapchain_->Present(1, 0);
 }
 
-// ---- audio thread (spike, additive) -------------------------------------------------------
+// ---- audio thread (WASAPI) ----------------------------------------------------------------
 //
-// Slave to present_loop()'s QPC/video master clock -- present_loop()'s own clock computation
-// above is completely untouched by this addition (file header: QPC/video is the master,
-// audio is purely additive). This thread reads ONLY:
-//   - decoder_.pop_audio_packet() / decoder_.audio_queue_depth(): already thread-safe,
-//     guarded by Decoder's own audio_pkt_mutex_ (decode thread producer / this thread the
-//     sole consumer).
-//   - the SAME atomics present_loop() reads (playing_/anchor_frame_/anchor_qpc_ticks_),
-//     plus fps_/freq_ (plain members, stable after open() -- same read-without-a-lock
-//     precedent present_loop() itself already relies on), lock-free, read-only, via
-//     compute_master_s() below (same formula shape as present_loop()'s own, just left in
-//     continuous seconds rather than quantized to an integer frame_num -- audio needs
-//     continuous time, not a video frame index).
-// This thread NEVER touches d3d_mutex_/ready_mutex_/decoder_mutex_.
-//
-// WASAPI + SwrContext are built HERE (not in open()) because CoInitializeEx must run on
-// the thread that goes on to use the resulting COM interfaces; audio_codec_ctx_ itself was
-// already built on the main thread in open() (plain FFmpeg context, no thread affinity).
-//
-// Local decisions (see task brief for the categories called out as escalate-worthy; none
-// of the below hit a genuinely exotic/ambiguous case on this run -- see report):
-//   - Channel mapping: swr resamples straight from the source's decoded ch_layout to
-//     av_channel_layout_default(mix_format->nChannels) -- the standard default path, not a
-//     bespoke downmix policy.
-//   - Format negotiation: whichever sample type WASAPI's GetMixFormat actually reports
-//     (float32 in practice, but the integer PCM cases are handled too) is used as swr's
-//     output format directly, no forcing.
-//   - No default render endpoint / unrecognized mix format / any WASAPI call failing:
-//     logs to stderr and returns (has_audio_ already latched true in open(), so this simply
-//     means "opened as if audio, ended up silent" -- video/present are entirely unaffected).
-//   - Small in-window drift: left alone, absorbed by the ~200ms shared-mode buffer (no swr
-//     ratio micro-adjustment) -- see kLeadThresholdS/kLagThresholdS below.
+// Wholly implemented in player_audio.cpp (audio_loop()): it owns the WASAPI endpoint life
+// cycle -- open/teardown/re-open inside one COM lifetime on the audio thread, default-output
+// switch detection, error/stop-interruptible rebuild backoff -- plus the decode/resample/FIFO
+// gating that keeps audio a pure slave of the clock below. compute_master_s() stays here
+// because present_loop() reads the very same formula.
+
 double Player::compute_master_s() const{
     if (playing_.load(std::memory_order_relaxed)) {
         LARGE_INTEGER now;
@@ -1430,363 +1490,6 @@ double Player::compute_master_s() const{
     }
     // Paused: frozen at anchor_frame_, same as present_loop()'s own paused branch.
     return static_cast<double>(anchor_frame_.load(std::memory_order_relaxed)) / fps_;
-}
-
-void Player::audio_loop(){
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] CoInitializeEx failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        return;
-    }
-
-    IMMDeviceEnumerator* enumerator = nullptr;
-    IMMDevice* device = nullptr;
-    IAudioClient* audio_client = nullptr;
-    IAudioRenderClient* render_client = nullptr;
-    WAVEFORMATEX* mix_format = nullptr;
-    HANDLE audio_event = nullptr;
-    SwrContext* swr = nullptr;
-    AVAudioFifo* fifo = nullptr;
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    AVFrame* held_frame = nullptr; // a decoded frame we chose to hold (too far ahead of master)
-    double held_frame_loop_offset = 0.0; // loop_offset_seconds_ in effect when held_frame's packet was queued
-
-    auto cleanup = [&]() {
-        if (render_client) render_client->Release();
-        if (audio_client) audio_client->Release();
-        if (device) device->Release();
-        if (enumerator) enumerator->Release();
-        if (mix_format) CoTaskMemFree(mix_format);
-        if (audio_event) CloseHandle(audio_event);
-        if (swr) swr_free(&swr);
-        if (fifo) av_audio_fifo_free(fifo);
-        if (held_frame) av_frame_free(&held_frame);
-        if (frame) av_frame_free(&frame);
-        if (pkt) av_packet_free(&pkt);
-        CoUninitialize();
-    };
-
-    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-        __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] CoCreateInstance(MMDeviceEnumerator) failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] GetDefaultAudioEndpoint failed: hr=0x%08lx (no render device?), audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&audio_client));
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] IMMDevice::Activate(IAudioClient) failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-    hr = audio_client->GetMixFormat(&mix_format);
-    if (FAILED(hr) || !mix_format) {
-        fprintf(stderr, "[audio] GetMixFormat failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-
-    audio_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!audio_event) {
-        fprintf(stderr, "[audio] CreateEventW failed, audio disabled\n");
-        cleanup();
-        return;
-    }
-
-    constexpr REFERENCE_TIME kBufferDuration100ns = 200 * 10000; // 200ms shared-mode buffer
-    hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        kBufferDuration100ns, 0, mix_format, nullptr);
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] IAudioClient::Initialize failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-    hr = audio_client->SetEventHandle(audio_event);
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] SetEventHandle failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-    UINT32 buffer_frame_count = 0;
-    audio_client->GetBufferSize(&buffer_frame_count);
-    hr = audio_client->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&render_client));
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] GetService(IAudioRenderClient) failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-
-    // Device mix format's sample type -- WASAPI shared-mode mix format is float32 in
-    // practice, but the integer PCM cases are handled too rather than assumed away.
-    AVSampleFormat out_sample_fmt;
-    const WAVEFORMATEXTENSIBLE* wfex = nullptr;
-    if (mix_format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix_format->cbSize >= 22)
-        wfex = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix_format);
-    bool is_float = (mix_format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
-        (wfex && IsEqualGUID(wfex->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
-    if (is_float) {
-        out_sample_fmt = AV_SAMPLE_FMT_FLT;
-    } else if (mix_format->wBitsPerSample == 16) {
-        out_sample_fmt = AV_SAMPLE_FMT_S16;
-    } else if (mix_format->wBitsPerSample == 32) {
-        out_sample_fmt = AV_SAMPLE_FMT_S32;
-    } else {
-        fprintf(stderr, "[audio] unrecognized WASAPI mix format (tag=%u bits=%u), audio disabled\n",
-            mix_format->wFormatTag, mix_format->wBitsPerSample);
-        cleanup();
-        return;
-    }
-
-    AVChannelLayout out_layout;
-    av_channel_layout_default(&out_layout, static_cast<int>(mix_format->nChannels));
-    int swr_ret = swr_alloc_set_opts2(&swr,
-        &out_layout, out_sample_fmt, static_cast<int>(mix_format->nSamplesPerSec),
-        &audio_codec_ctx_->ch_layout, audio_codec_ctx_->sample_fmt, audio_codec_ctx_->sample_rate,
-        0, nullptr);
-    av_channel_layout_uninit(&out_layout);
-    if (swr_ret < 0 || !swr || swr_init(swr) < 0) {
-        fprintf(stderr, "[audio] swr_alloc_set_opts2/swr_init failed: %d, audio disabled\n", swr_ret);
-        cleanup();
-        return;
-    }
-
-    const int out_channels = static_cast<int>(mix_format->nChannels);
-    const double out_sample_rate_d = static_cast<double>(mix_format->nSamplesPerSec);
-    const size_t bytes_per_output_frame = mix_format->nBlockAlign;
-    fifo = av_audio_fifo_alloc(out_sample_fmt, out_channels, static_cast<int>(mix_format->nSamplesPerSec)); // 1s headroom
-    if (!fifo) {
-        fprintf(stderr, "[audio] av_audio_fifo_alloc failed, audio disabled\n");
-        cleanup();
-        return;
-    }
-
-    AVRational audio_tb = decoder_.audio_time_base();
-    double first_pts_s = decoder_.first_pts_seconds(); // shared time-axis origin (I5's origin, read-only here)
-    constexpr double kLeadThresholdS = 0.035; // audio_s this far ahead of master_s -> hold
-    constexpr double kLagThresholdS = 0.035;  // audio_s this far behind master_s -> drop, catch up
-
-    hr = audio_client->Start();
-    if (FAILED(hr)) {
-        fprintf(stderr, "[audio] IAudioClient::Start failed: hr=0x%08lx, audio disabled\n", static_cast<unsigned long>(hr));
-        cleanup();
-        return;
-    }
-
-    uint64_t underruns = 0;
-    double next_raw_pts_s = first_pts_s;   // fallback estimate if a decoded frame has no PTS
-    double pending_loop_offset = 0.0;      // loop_offset of the most recently popped-and-sent audio packet
-    double last_written_audio_s = first_pts_s; // approx audio_s of the most recently-enqueued PCM, for the drift log
-    float last_peak = 0.0f; // peak |sample| (post-gain, normalized to [0,1]) of the most recent device write -- measurable proof gain is actually applied
-    LARGE_INTEGER log_t0;
-    QueryPerformanceCounter(&log_t0);
-    double last_log_wall_s = 0.0;
-    std::vector<uint8_t> resample_buf; // reused scratch, grown as needed
-    uint64_t local_seek_version = seek_version_.load(std::memory_order_relaxed);
-
-    // M-C1: audio_thread_ is session-scoped (join()ed and restarted by close_session()/
-    // open_session() on every reopen), same as decode_loop() -- see its own M-C1 comment.
-    while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
-        DWORD wait_result = WaitForSingleObject(audio_event, 100);
-        if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) break;
-        if (wait_result != WAIT_OBJECT_0) continue; // timeout: re-check stop_/session_stop_ and loop
-
-        bool playing = playing_.load(std::memory_order_relaxed);
-
-        // Seek coordination (additive): same poll-once-per-iteration pattern present_loop()
-        // already uses for seek_version_/seek_slot_hint_ (see file header) -- Player::seek()
-        // already called decoder_.flush_audio_queue() under decoder_mutex_ and pushed fresh,
-        // already-correct-for-the-new-position audio packets (via seek_to_frame()'s own
-        // forward-decode, same thread/lock) BEFORE bumping seek_version_. This thread just
-        // needs to drop whatever pre-seek state it was privately holding so no stale audio
-        // plays: the held-ahead frame (if any), the FIFO's buffered PCM (pre-seek position),
-        // and the audio decoder's own internal state (avcodec_flush_buffers) -- mirrors
-        // Decoder::seek_to_frame()'s own avcodec_flush_buffers(codec_ctx_) on the video side.
-        // Realignment to master then happens exactly like normal steady-state playback, via
-        // the same hold/drop/play gating below against compute_master_s().
-        uint64_t sv = seek_version_.load(std::memory_order_relaxed);
-        if (sv != local_seek_version) {
-            local_seek_version = sv;
-            if (held_frame) av_frame_free(&held_frame);
-            av_audio_fifo_reset(fifo);
-            avcodec_flush_buffers(audio_codec_ctx_);
-            double master_now = compute_master_s();
-            last_written_audio_s = master_now; // avoid a stale, pre-seek drift_ms spike in the log
-        }
-
-        UINT32 padding = 0;
-        if (FAILED(audio_client->GetCurrentPadding(&padding))) continue;
-        UINT32 available = (buffer_frame_count > padding) ? (buffer_frame_count - padding) : 0;
-
-        if (available > 0) {
-            if (!playing) {
-                // Paused: write silence, do NOT touch the FIFO/decode consumption -- master
-                // is frozen at anchor_frame_, audio must never race ahead of it.
-                BYTE* data = nullptr;
-                if (SUCCEEDED(render_client->GetBuffer(available, &data)))
-                    render_client->ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT);
-            } else {
-                // Top up the FIFO until it can satisfy `available`, decoding/resampling/
-                // gating fresh source frames as needed. Bounded, non-blocking per wake --
-                // if the decoder/queue has nothing more to offer right now we just stop and
-                // try again next wake, same non-blocking spirit as present_loop().
-                while (static_cast<UINT32>(std::max(av_audio_fifo_size(fifo), 0)) < available) {
-                    AVFrame* cur = nullptr;
-                    double cur_loop_offset = 0.0;
-                    if (held_frame) {
-                        cur = held_frame;
-                        cur_loop_offset = held_frame_loop_offset;
-                    } else {
-                        int recv = avcodec_receive_frame(audio_codec_ctx_, frame);
-                        if (recv == 0) {
-                            cur = frame;
-                            cur_loop_offset = pending_loop_offset;
-                        } else if (recv == AVERROR(EAGAIN)) {
-                            double popped_loop_offset = 0.0;
-                            if (!decoder_.pop_audio_packet(pkt, popped_loop_offset)) break; // nothing queued right now
-                            pending_loop_offset = popped_loop_offset;
-                            int send = avcodec_send_packet(audio_codec_ctx_, pkt);
-                            av_packet_unref(pkt);
-                            if (send < 0 && send != AVERROR(EAGAIN)) break;
-                            continue; // retry avcodec_receive_frame
-                        } else {
-                            break; // decoder error/EOF this tick -- try again next wake
-                        }
-                    }
-
-                    double raw_pts_s = (cur->pts != AV_NOPTS_VALUE)
-                        ? static_cast<double>(cur->pts) * av_q2d(audio_tb)
-                        : next_raw_pts_s;
-                    int frame_sr = (cur->sample_rate > 0) ? cur->sample_rate : audio_codec_ctx_->sample_rate;
-                    next_raw_pts_s = raw_pts_s + static_cast<double>(cur->nb_samples) / static_cast<double>(frame_sr);
-                    // loop_offset-aware (M-C): same formula as Decoder::next_frame()'s video
-                    // pts_seconds, using THIS packet's own loop_offset (stamped at decode-thread
-                    // enqueue time -- see AudioPacketEntry) rather than the current decoder-wide
-                    // loop_offset_seconds_, so audio computed from a not-yet-drained pre-wrap
-                    // packet still lands in the correct (pre-wrap) domain.
-                    double audio_s = cur_loop_offset + (raw_pts_s - first_pts_s);
-                    double master_s = compute_master_s();
-                    double diff = audio_s - master_s;
-
-                    if (diff > kLeadThresholdS) {
-                        // Too far ahead of master: hold this exact frame and stop topping
-                        // up for this wake -- master will catch up on a later tick.
-                        if (!held_frame) {
-                            held_frame = av_frame_alloc();
-                            av_frame_move_ref(held_frame, frame);
-                            held_frame_loop_offset = cur_loop_offset;
-                        }
-                        break;
-                    }
-
-                    bool was_held = (cur == held_frame);
-                    if (diff >= -kLagThresholdS) {
-                        // Within window (or master briefly ahead by less than the lag
-                        // threshold): resample and enqueue. Small in-window drift is left
-                        // to the shared-mode buffer to absorb (no swr ratio nudge).
-                        int max_out = swr_get_out_samples(swr, cur->nb_samples);
-                        if (max_out > 0) {
-                            size_t need = static_cast<size_t>(max_out) * out_channels *
-                                av_get_bytes_per_sample(out_sample_fmt);
-                            if (resample_buf.size() < need) resample_buf.resize(need);
-                            uint8_t* out_ptrs[1] = { resample_buf.data() };
-                            int converted = swr_convert(swr, out_ptrs, max_out,
-                                const_cast<const uint8_t**>(cur->data), cur->nb_samples);
-                            if (converted > 0) {
-                                void* fifo_ptrs[1] = { resample_buf.data() };
-                                av_audio_fifo_write(fifo, fifo_ptrs, converted);
-                                last_written_audio_s = audio_s;
-                            }
-                        }
-                    }
-                    // else: fell behind past the lag threshold -- drop this frame's audio
-                    // entirely (don't resample/enqueue) to catch back up to master.
-
-                    if (was_held) { av_frame_free(&held_frame); } // also clears held_frame to null
-                    else { av_frame_unref(frame); } // release frame's buffer for the next receive_frame
-                }
-            }
-
-            UINT32 fifo_depth = static_cast<UINT32>(std::max(av_audio_fifo_size(fifo), 0));
-            UINT32 to_write = std::min(available, fifo_depth);
-            BYTE* data = nullptr;
-            if (SUCCEEDED(render_client->GetBuffer(available, &data))) {
-                UINT32 got = 0;
-                if (to_write > 0) {
-                    void* out_ptrs[1] = { data };
-                    int r = av_audio_fifo_read(fifo, out_ptrs, static_cast<int>(to_write));
-                    got = (r > 0) ? static_cast<UINT32>(r) : 0;
-                }
-                if (got > 0) {
-                    // Volume/mute (additive): applied to samples right before they leave
-                    // this thread, i.e. as late as possible -- a volume/mute change takes
-                    // effect within one WASAPI device-wake (~10-20ms) instead of waiting out
-                    // up to ~1s of already-resampled FIFO content. muted_ wins outright
-                    // (gain 0) over whatever volume_ is currently set to.
-                    float gain = muted_.load(std::memory_order_relaxed)
-                        ? 0.0f
-                        : std::clamp(volume_.load(std::memory_order_relaxed), 0.0f, 1.0f);
-                    size_t nsamples = static_cast<size_t>(got) * static_cast<size_t>(out_channels);
-                    float peak = 0.0f;
-                    switch (out_sample_fmt) {
-                    case AV_SAMPLE_FMT_FLT: {
-                        float* s = reinterpret_cast<float*>(data);
-                        for (size_t i = 0; i < nsamples; ++i) {
-                            s[i] *= gain;
-                            peak = std::max(peak, std::fabs(s[i]));
-                        }
-                        break;
-                    }
-                    case AV_SAMPLE_FMT_S16: {
-                        int16_t* s = reinterpret_cast<int16_t*>(data);
-                        for (size_t i = 0; i < nsamples; ++i) {
-                            s[i] = static_cast<int16_t>(std::lround(static_cast<float>(s[i]) * gain));
-                            peak = std::max(peak, std::fabs(static_cast<float>(s[i]) / 32768.0f));
-                        }
-                        break;
-                    }
-                    case AV_SAMPLE_FMT_S32: {
-                        int32_t* s = reinterpret_cast<int32_t*>(data);
-                        for (size_t i = 0; i < nsamples; ++i) {
-                            s[i] = static_cast<int32_t>(std::lround(static_cast<double>(s[i]) * gain));
-                            peak = std::max(peak, static_cast<float>(std::fabs(static_cast<double>(s[i]) / 2147483648.0)));
-                        }
-                        break;
-                    }
-                    default: break;
-                    }
-                    last_peak = peak;
-                }
-                if (got < available) {
-                    memset(data + static_cast<size_t>(got) * bytes_per_output_frame, 0,
-                        static_cast<size_t>(available - got) * bytes_per_output_frame);
-                    if (playing) ++underruns; // silence while paused is intentional, not an underrun
-                }
-                render_client->ReleaseBuffer(available, (got == 0) ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
-            }
-        }
-
-        // Drift/health log (~1/s): the core evidence this spike exists to produce.
-        LARGE_INTEGER now_qpc;
-        QueryPerformanceCounter(&now_qpc);
-        double wall_s = static_cast<double>(now_qpc.QuadPart - log_t0.QuadPart) / freq_.QuadPart;
-        if (wall_s - last_log_wall_s >= 1.0) {
-            last_log_wall_s = wall_s;
-            double master_s_now = compute_master_s();
-            fprintf(stderr, "[audio] master_s=%.3f audio_s=%.3f drift_ms=%.1f queue_depth=%zu underruns=%llu peak=%.4f\n",
-                master_s_now, last_written_audio_s, (last_written_audio_s - master_s_now) * 1000.0,
-                decoder_.audio_queue_depth(), static_cast<unsigned long long>(underruns), last_peak);
-        }
-    }
-
-    audio_client->Stop();
-    cleanup();
 }
 
 void Player::recompute_session_rate(){

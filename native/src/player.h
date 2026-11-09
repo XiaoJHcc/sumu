@@ -17,8 +17,8 @@
 // Threading model (unchanged from spike2, see spike2's presenter.cpp header for the full
 // story of why a single d3d_mutex_ is required on top of ID3D11Multithread::SetMultithread-
 // Protected(TRUE)):
-//   - decode thread:  FFmpeg d3d11va decode -> optional P010->NV12 video-processor conversion
-//                     -> CopySubresourceRegion into a persistent NV12 "passthrough ring"
+//   - decode thread:  FFmpeg d3d11va decode -> optional GPU color/HDR/display normalization
+//                     -> CopySubresourceRegion into a persistent BT.709 NV12 "passthrough ring"
 //                     Texture2DArray, throttled to stay within decode_ahead_max_ frames of the
 //                     present head.
 //   - AI-push thread (Python, not owned here): push_ai_frame() does the CUDA<->D3D11
@@ -144,7 +144,7 @@ void check_cu(CUresult res, const char* what);
 enum class Source : int8_t {
     PassthroughFresh = 0,
     AiFresh = 1,
-    PassthroughStale = 2, // re-presented because neither map had this exact frame_num
+    PassthroughStale = 2, // no valid AI frame or passthrough interval covers this grid frame
     AiStale = 3,
     NoSession = 4, // M-C1: present ticked but no session is open yet (or was just closed) --
                    // draw_splash() ran instead of draw_and_present(), see present_loop().
@@ -446,6 +446,18 @@ public:
     void toggle_mute();
 
     bool is_muted() const { return muted_.load(std::memory_order_relaxed); }
+
+    // Audio device recovery (hot-plug / default-output switch), see player_audio.cpp: the audio
+    // thread re-opens its WASAPI endpoint on its own when the device disappears or the default
+    // render endpoint changes. These are additive observability/control hooks -- the recovery
+    // itself needs no caller. request_audio_device_rebuild() forces exactly one rebuild cycle on
+    // the audio thread (deterministic end-to-end verification without touching the user's
+    // default output device); audio_device_active() is true while a started endpoint is live.
+    void request_audio_device_rebuild();
+
+    bool audio_device_active() const;
+
+    py::dict audio_stats() const;
 
     void set_ai_enabled(bool v);
 
@@ -969,7 +981,12 @@ private:
     std::vector<ComPtr<ID3D11ShaderResourceView>> pt_srv_y_;
     std::vector<ComPtr<ID3D11ShaderResourceView>> pt_srv_uv_;
     std::vector<int64_t> pt_tag_; // guarded by ready_mutex_
+    std::vector<int64_t> pt_end_tag_;
+    UINT find_pt_slot_locked(int64_t frame_num) const;
     std::atomic<int64_t> pt_high_water_{ -1 };
+    std::atomic<uint64_t> network_recovery_attempts_{ 0 };
+    std::atomic<uint64_t> network_recovery_successes_{ 0 };
+    std::atomic<bool> network_recovering_{ false };
 
     ComPtr<ID3D11Texture2D> ai_ring_tex_;
     std::vector<ComPtr<ID3D11ShaderResourceView>> ai_srv_;
@@ -1151,9 +1168,10 @@ private:
     std::atomic<bool> ai_enabled_{ true };
 
     // ---- audio (spike, additive) -- slave to the master clock below (present_head_frame_/
-    // playing_/anchor_frame_/anchor_qpc_ticks_/fps_/freq_), never the reverse; see audio_loop()
-    // for the full design writeup. audio_codec_ctx_ is built once in open() (main thread, no
-    // thread-affinity concern for a plain FFmpeg context) and used exclusively by
+    // playing_/anchor_frame_/anchor_qpc_ticks_/fps_/freq_), never the reverse; see
+    // player_audio.cpp's audio_loop() for the full design writeup (including the endpoint
+    // hot-plug/default-output-switch recovery). audio_codec_ctx_ is built once in open() (main
+    // thread, no thread-affinity concern for a plain FFmpeg context) and used exclusively by
     // audio_thread_ from then on. has_audio_ is set once in open(), read-only afterward.
     std::thread audio_thread_;
     bool has_audio_ = false;
@@ -1165,6 +1183,27 @@ private:
     // through UiIntents -- see set_volume()/set_muted() above for why.
     std::atomic<float> volume_{ 1.0f };
     std::atomic<bool> muted_{ false };
+
+    // ---- audio endpoint recovery (hot-plug / default-output switch) --------------------------
+    // Written by audio_thread_ (player_audio.cpp), read from the main/Python thread through
+    // audio_stats() -- all relaxed: they are diagnostics, never control flow. audio_info_mutex_
+    // guards the two strings only (device id / last error); mutable so audio_stats() can be
+    // const.
+    std::atomic<bool> audio_device_active_{ false };
+    std::atomic<uint64_t> audio_build_count_{ 0 };        // successful endpoint opens
+    std::atomic<uint64_t> audio_failure_count_{ 0 };      // failed open attempts
+    std::atomic<uint64_t> audio_invalidation_count_{ 0 }; // lost endpoints (error/switch/request)
+    std::atomic<uint64_t> audio_device_change_count_{ 0 };
+    std::atomic<uint64_t> audio_rebuild_request_{ 0 };    // bumped by request_audio_device_rebuild()
+    std::atomic<uint64_t> audio_write_frames_{ 0 };       // real device frames pushed (paused=0)
+    std::atomic<uint64_t> audio_underrun_count_{ 0 };
+    std::atomic<float> audio_last_peak_{ 0.0f };
+    std::atomic<int> audio_out_sample_rate_{ 0 };
+    std::atomic<int> audio_out_channels_{ 0 };
+    std::atomic<int> audio_buffer_frames_{ 0 };
+    mutable std::mutex audio_info_mutex_;
+    std::string audio_device_id_;   // IMMDevice::GetId() of the last opened endpoint
+    std::string audio_last_error_;
 
     LARGE_INTEGER pace_origin_qpc_{};
     LARGE_INTEGER freq_{};

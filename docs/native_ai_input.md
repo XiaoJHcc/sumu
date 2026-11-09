@@ -25,8 +25,10 @@ result = p.get_cuda_nv12_by_frame(frame_num)  # -> dict
   拷贝。
 - 返回的 NV12 缓冲区布局与 lada 的 `to_ndarray('nv12')`/spike3 一致：形状
   `(height*3//2, width)`，rows `[0,height)` = 全分辨率 luma，rows `[height, height*3/2)` =
-  半分辨率交错 chroma。**原生只出 NV12 原始数据，颜色转换留在 Python 侧**
-  （`python/sumu/ai/utils/video_utils.py::_nv12_to_bgr_hwc_gpu`）。
+  半分辨率交错 chroma。原生已将源色彩、HDR 与旋转归一化为**显示方向正确的 BT.709 limited
+  8-bit NV12**；Python 只需用固定的 BT.709 limited 参数转换为 BGR
+  （`python/sumu/ai/utils/video_utils.py::_nv12_to_bgr_hwc_gpu`）。VFR 的多个网格帧可命中同一张
+  图片的有效持续区间；返回的 `frame_num` 仍是调用者请求的时间网格帧号。
 - **单缓冲区复用**：`dev_ptr` 指向的内存是 `Player` 持有的一块持久 CUDA 缓冲区，每次调用
   `get_cuda_nv12_by_frame()` 都会被覆写。调用方必须在下一次调用前消费完（跑完颜色转换）或自行
   `.clone()`；这与 `push_ai_frame` 期望调用方每帧提供新缓冲区的方向相反，但都是"单生产者/单消费者，
@@ -49,10 +51,9 @@ result = p.get_cuda_nv12_by_frame(frame_num)  # -> dict
    - `cuMemAlloc` 一块 `ai_in_cu_buf_`，大小 = `src_width_ * src_height_ * 3 / 2` 字节
      （紧密排列，`ai_in_cu_buf_pitch_ = src_width_`）。
 2. **`get_cuda_nv12_by_frame(frame_num)`**：
-   - `UINT slot = wrap_slot(frame_num);`
-   - **Phase 1**（只加 `ready_mutex_`，不碰 `d3d_mutex_`）：若 `pt_tag_[slot] != frame_num`，
-     立即返回 `ready=False`——这是让 miss 路径真正做到"零 D3D11/CUDA 接触"的关键，miss 是热路径
-     （AI 编排大概率经常问到还没解码到的帧）。
+   - **Phase 1**（只加 `ready_mutex_`，不碰 `d3d_mutex_`）：由 `find_pt_slot_locked()` 查找
+     `pt_tag_[slot] <= frame_num <= pt_end_tag_[slot]` 的图片，有重叠时取起点最新的区间。
+     CFR 精确命中保留取模快路径；没有有效区间时立即返回 `ready=False`，不接触 D3D11/CUDA。
    - **Phase 2**（仅 Phase 1 命中时才执行）：加 `d3d_mutex_`，在锁内**重新检查** tag（关闭竞态，
      见下节），确认仍命中后：用 `pt_srv_y_[slot]`/`pt_srv_uv_[slot]`（**既有**、`create_ring_resources()`
      里已经建好的、per-slot 的 ring SRV）作为源，向 `ai_in_y_rtv_`/`ai_in_uv_rtv_` 做两次全屏三角形

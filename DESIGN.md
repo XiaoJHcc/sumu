@@ -86,7 +86,7 @@
 
 1. **播放器宿主 + present 面**：Qt(PySide6/QRhi) ／ GTK4+叠加原生 HWND ／ 内嵌 libmpv ／ Win32·GLFW+D3D11。→ 已定：Win32 + 原生 D3D11 flip-model swapchain（变体 B）。
 2. **present + CUDA 互操作的语言**：小原生模块(C++/Rust) ／ 尽量纯 Python(cupy·pycuda + CUDA↔GL)。→ 已定：C++（VS2022 BuildTools）+ pybind11。
-3. **音频 / A-V 同步是否进 v1**。→ 已进 v1：`native/src/player.cpp` 的 `audio_loop()`（WASAPI），以 QPC 主时钟为准的纯附加从属时钟，已实测验证不扰动 present。
+3. **音频 / A-V 同步是否进 v1**。→ 已进 v1：`native/src/player_audio.cpp` 的 `audio_loop()`（WASAPI），以 QPC 主时钟为准的纯附加从属时钟，已实测验证不扰动 present；设备失效 / 默认输出切换时在音频线程内重建端点。
 
 **成败 100% 押在「4K60 全 GPU present 从可选宿主/语言里能否做到上屏稳定」。** 所以先只验证这个，AI 一概不接。
 

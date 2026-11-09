@@ -93,6 +93,7 @@ pybind11_add_module(sumu_core
     src/player_session.cpp
     src/player_window.cpp
     src/player_engine.cpp
+    src/player_audio.cpp
     src/player_ui_overlays.cpp
     src/player_ui_bars.cpp
     src/player_ui_export.cpp
@@ -102,6 +103,7 @@ pybind11_add_module(sumu_core
     src/ui/widgets.cpp
     src/ui/icons.cpp
     src/decoder.cpp
+    src/video_normalizer.cpp
     src/headless_decode.cpp
     "${IMGUI_DIR}/imgui.cpp"
     "${IMGUI_DIR}/imgui_draw.cpp"

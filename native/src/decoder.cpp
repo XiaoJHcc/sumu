@@ -126,7 +126,13 @@ void Decoder::close()
             av_packet_free(&e.pkt);
         }
     }
-    reset_p010_conversion();
+    normalizer_.reset();
+    needs_normalization_ = false;
+    normalize_desc_ = {};
+    coded_width_ = 0;
+    coded_height_ = 0;
+    display_rotation_cw_ = 0;
+    display_hflip_ = false;
     if (pkt_) av_packet_free(&pkt_);
     if (frame_) av_frame_free(&frame_);
     if (codec_ctx_) avcodec_free_context(&codec_ctx_);
@@ -154,6 +160,8 @@ void Decoder::close()
     draining_ = false;
     loop_offset_seconds_ = 0.0;
     last_out_pts_seconds_ = -1.0;
+    last_raw_pts_seconds_ = 0.0;
+    discontinuity_offset_ = 0.0;
     d3d_device_ = nullptr;
     is_network_ = false;
 }
@@ -211,170 +219,123 @@ bool Decoder::ensure_hw_frames_ctx(AVCodecContext* ctx)
     return true;
 }
 
-void Decoder::reset_p010_conversion()
+void Decoder::resolve_display_transform(AVStream* stream)
 {
-    conversion_input_views_.clear();
-    conversion_input_texture_ = nullptr;
-    conversion_output_view_.Reset();
-    conversion_output_texture_.Reset();
-    conversion_processor_.Reset();
-    conversion_enumerator_.Reset();
-    conversion_video_context_.Reset();
-    conversion_context_.Reset();
-    conversion_stream_initialized_ = false;
-    needs_p010_conversion_ = false;
+    display_rotation_cw_ = 0;
+    display_hflip_ = false;
+    if (!stream || !stream->codecpar) return;
+
+    // AV_PKT_DATA_DISPLAYMATRIX (libavutil/display.h) is the container's presentation
+    // transform, stored as (a, b, u, c, d, v, x, y, w) 16.16 fixed point with
+    //   p' = a*p + c*q + x,  q' = b*p + d*q + y
+    // i.e. the linear part is [[a, c], [b, d]] in a y-down frame. It is the transform that has
+    // to be applied to the decoded frame for correct presentation.
+    const AVPacketSideData* side = av_packet_side_data_get(stream->codecpar->coded_side_data,
+        stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+    if (!side || side->size < 9 * static_cast<int>(sizeof(int32_t))) return;
+
+    int32_t matrix[9] = {};
+    std::memcpy(matrix, side->data, sizeof(matrix));
+    const double a = matrix[0] / 65536.0;
+    const double b = matrix[1] / 65536.0;
+    const double c = matrix[3] / 65536.0;
+    const double d = matrix[4] / 65536.0;
+    const double det = a * d - b * c;
+    if (!std::isfinite(det) || std::fabs(det) < 1e-6) {
+        fprintf(stderr, "[sumu] ignoring singular display matrix\n");
+        return;
+    }
+    // det < 0 means the matrix mirrors; decompose as rotate-then-display-flip, i.e.
+    // A = R(theta) * F_hflip, which for a pure horizontal flip yields theta == 0.
+    const double degrees = det > 0
+        ? std::atan2(b, a) * 180.0 / 3.14159265358979323846
+        : std::atan2(-b, -a) * 180.0 / 3.14159265358979323846;
+    const double snapped = std::round(degrees / 90.0) * 90.0;
+    if (std::fabs(degrees - snapped) > 2.0)
+        fprintf(stderr, "[sumu] display matrix rotates %.2f degrees; snapping to %.0f "
+            "(only axis-aligned rotations are supported)\n", degrees, snapped);
+    int rotation = static_cast<int>(std::llround(snapped)) % 360;
+    if (rotation < 0) rotation += 360;
+    display_rotation_cw_ = rotation;
+    display_hflip_ = det < 0;
 }
 
-bool Decoder::initialize_p010_conversion(std::string& error)
+bool Decoder::configure_frame_normalization(std::string& error)
 {
-    auto fail_hr = [&error](const char* what, HRESULT hr) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s failed: hr=0x%08lx", what,
-            static_cast<unsigned long>(hr));
-        error = buf;
-        return false;
-    };
+    const AVPixelFormat coded_fmt =
+        static_cast<AVPixelFormat>(fmt_ctx_->streams[video_stream_idx_]->codecpar->format);
+    const bool ten_bit = coded_fmt == AV_PIX_FMT_YUV420P10LE || coded_fmt == AV_PIX_FMT_P010LE;
 
-    Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device;
-    HRESULT hr = d3d_device_->QueryInterface(IID_PPV_ARGS(&video_device));
-    if (FAILED(hr)) return fail_hr("QueryInterface(ID3D11VideoDevice)", hr);
-    d3d_device_->GetImmediateContext(&conversion_context_);
-    if (!conversion_context_) {
-        error = "GetImmediateContext failed for P010 conversion";
-        return false;
+    // Range: an unmarked stream is limited, matching the (already untagged) 709 assumption
+    // below; the legacy JPEG-range pixel formats carry it implicitly.
+    bool full_range = codec_ctx_->color_range == AVCOL_RANGE_JPEG;
+    if (codec_ctx_->color_range == AVCOL_RANGE_UNSPECIFIED)
+        full_range = coded_fmt == AV_PIX_FMT_YUVJ420P;
+    else if (codec_ctx_->color_range != AVCOL_RANGE_MPEG && codec_ctx_->color_range != AVCOL_RANGE_JPEG)
+        full_range = coded_fmt == AV_PIX_FMT_YUVJ420P;
+
+    // Matrix: an untagged stream keeps the historical BT.709 contract, an explicit BT.470BG/
+    // SMPTE 170M tag is honoured as BT.601.
+    VideoMatrix matrix_kind = VideoMatrix::Bt709;
+    switch (codec_ctx_->colorspace) {
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:
+        matrix_kind = VideoMatrix::Bt601;
+        break;
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL: // constant-luminance content is vanishingly rare; treat as NCL
+        matrix_kind = VideoMatrix::Bt2020;
+        break;
+    default:
+        break;
     }
-    hr = conversion_context_->QueryInterface(IID_PPV_ARGS(&conversion_video_context_));
-    if (FAILED(hr)) return fail_hr("QueryInterface(ID3D11VideoContext)", hr);
 
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
-    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-    content.InputFrameRate = { static_cast<UINT>(fps_ * 1000.0 + 0.5), 1000 };
-    content.InputWidth = static_cast<UINT>(width_);
-    content.InputHeight = static_cast<UINT>(height_);
-    content.OutputFrameRate = content.InputFrameRate;
-    content.OutputWidth = content.InputWidth;
-    content.OutputHeight = content.InputHeight;
-    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    VideoTransfer transfer = VideoTransfer::Sdr;
+    if (codec_ctx_->color_trc == AVCOL_TRC_SMPTE2084)
+        transfer = VideoTransfer::Pq;
+    else if (codec_ctx_->color_trc == AVCOL_TRC_ARIB_STD_B67)
+        transfer = VideoTransfer::Hlg;
 
-    hr = video_device->CreateVideoProcessorEnumerator(&content, &conversion_enumerator_);
-    if (FAILED(hr)) return fail_hr("CreateVideoProcessorEnumerator(P010->NV12)", hr);
-    UINT input_flags = 0;
-    UINT output_flags = 0;
-    if (FAILED(conversion_enumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_P010, &input_flags)) ||
-        !(input_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) ||
-        FAILED(conversion_enumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &output_flags)) ||
-        !(output_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
-        error = "D3D11 video processor does not support P010->NV12 conversion";
+    // Primaries: an unmarked HDR stream is BT.2020 by convention, an unmarked SDR stream stays
+    // BT.709 (no primary conversion, which is what the present shader has always assumed).
+    bool primaries_2020 = codec_ctx_->color_primaries == AVCOL_PRI_BT2020;
+    if (codec_ctx_->color_primaries == AVCOL_PRI_UNSPECIFIED)
+        primaries_2020 = transfer != VideoTransfer::Sdr || matrix_kind == VideoMatrix::Bt2020;
+
+    normalize_desc_ = {};
+    normalize_desc_.src_width = coded_width_;
+    normalize_desc_.src_height = coded_height_;
+    normalize_desc_.bit_depth = ten_bit ? 10 : 8;
+    normalize_desc_.full_range = full_range;
+    normalize_desc_.matrix = matrix_kind;
+    normalize_desc_.transfer = transfer;
+    normalize_desc_.primaries_2020 = primaries_2020;
+    normalize_desc_.rotation_cw = display_rotation_cw_;
+    normalize_desc_.hflip = display_hflip_;
+    normalize_desc_.fps = fps_;
+    const bool swap = (display_rotation_cw_ % 180) != 0;
+    width_ = swap ? coded_height_ : coded_width_;
+    height_ = swap ? coded_width_ : coded_height_;
+    normalize_desc_.dst_width = width_;
+    normalize_desc_.dst_height = height_;
+
+    needs_normalization_ = video_normalize_required(normalize_desc_);
+    if (!needs_normalization_) return true;
+
+    if (!normalizer_.initialize(d3d_device_, normalize_desc_, error))
         return false;
-    }
-    hr = video_device->CreateVideoProcessor(conversion_enumerator_.Get(), 0, &conversion_processor_);
-    if (FAILED(hr)) return fail_hr("CreateVideoProcessor(P010->NV12)", hr);
-
-    D3D11_TEXTURE2D_DESC output_desc{};
-    output_desc.Width = static_cast<UINT>(width_);
-    output_desc.Height = static_cast<UINT>(height_);
-    output_desc.MipLevels = 1;
-    output_desc.ArraySize = 1;
-    output_desc.Format = DXGI_FORMAT_NV12;
-    output_desc.SampleDesc.Count = 1;
-    output_desc.Usage = D3D11_USAGE_DEFAULT;
-    output_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-    hr = d3d_device_->CreateTexture2D(&output_desc, nullptr, &conversion_output_texture_);
-    if (FAILED(hr)) return fail_hr("CreateTexture2D(P010 conversion NV12)", hr);
-
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
-    output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    output_view_desc.Texture2D.MipSlice = 0;
-    hr = video_device->CreateVideoProcessorOutputView(conversion_output_texture_.Get(),
-        conversion_enumerator_.Get(), &output_view_desc, &conversion_output_view_);
-    if (FAILED(hr)) return fail_hr("CreateVideoProcessorOutputView(NV12)", hr);
-
+    if (display_rotation_cw_ != 0 || display_hflip_)
+        fprintf(stderr, "[sumu] display matrix: rotate %d deg clockwise%s, %dx%d -> %dx%d\n",
+            display_rotation_cw_, display_hflip_ ? " + horizontal flip" : "",
+            coded_width_, coded_height_, width_, height_);
     return true;
 }
 
 bool Decoder::prepare_nv12_frame(DecodedFrame& frame, std::string& error)
 {
-    if (!needs_p010_conversion_) return true;
-    return convert_p010_to_nv12(frame, error);
-}
-
-bool Decoder::convert_p010_to_nv12(DecodedFrame& frame, std::string& error)
-{
-    if (!frame.texture || !conversion_processor_ || !conversion_output_view_) {
-        error = "P010 conversion is not initialized";
-        return false;
-    }
-
-    if (!conversion_stream_initialized_) {
-        const RECT rect{ 0, 0, width_, height_ };
-        conversion_video_context_->VideoProcessorSetStreamSourceRect(conversion_processor_.Get(), 0, TRUE, &rect);
-        conversion_video_context_->VideoProcessorSetStreamDestRect(conversion_processor_.Get(), 0, TRUE, &rect);
-        conversion_video_context_->VideoProcessorSetStreamFrameFormat(conversion_processor_.Get(), 0,
-            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-        conversion_video_context_->VideoProcessorSetOutputTargetRect(conversion_processor_.Get(), TRUE, &rect);
-
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE color_space{};
-        color_space.YCbCr_Matrix = codec_ctx_->colorspace == AVCOL_SPC_BT709 ? 1 : 0;
-        conversion_video_context_->VideoProcessorSetStreamColorSpace(conversion_processor_.Get(), 0, &color_space);
-        conversion_video_context_->VideoProcessorSetOutputColorSpace(conversion_processor_.Get(), &color_space);
-        conversion_stream_initialized_ = true;
-    }
-
-    if (conversion_input_texture_ != frame.texture) {
-        conversion_input_views_.clear();
-        conversion_input_texture_ = nullptr;
-
-        D3D11_TEXTURE2D_DESC input_desc{};
-        frame.texture->GetDesc(&input_desc);
-        if (input_desc.Format != DXGI_FORMAT_P010) {
-            error = "10-bit decoder output is not P010";
-            return false;
-        }
-
-        Microsoft::WRL::ComPtr<ID3D11VideoDevice> video_device;
-        HRESULT hr = d3d_device_->QueryInterface(IID_PPV_ARGS(&video_device));
-        if (FAILED(hr)) {
-            error = "QueryInterface(ID3D11VideoDevice) failed while converting P010";
-            return false;
-        }
-        std::vector<Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>> views(input_desc.ArraySize);
-        for (UINT i = 0; i < input_desc.ArraySize; ++i) {
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC view_desc{};
-            view_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            view_desc.Texture2D.MipSlice = 0;
-            view_desc.Texture2D.ArraySlice = i;
-            hr = video_device->CreateVideoProcessorInputView(frame.texture, conversion_enumerator_.Get(),
-                &view_desc, &views[i]);
-            if (FAILED(hr)) {
-                char buf[256];
-                snprintf(buf, sizeof(buf), "CreateVideoProcessorInputView(P010) failed: hr=0x%08lx",
-                    static_cast<unsigned long>(hr));
-                error = buf;
-                return false;
-            }
-        }
-        conversion_input_views_.swap(views);
-        conversion_input_texture_ = frame.texture;
-    }
-
-    if (frame.array_slice >= conversion_input_views_.size()) {
-        error = "P010 frame array slice is out of range";
-        return false;
-    }
-    D3D11_VIDEO_PROCESSOR_STREAM stream{};
-    stream.Enable = TRUE;
-    stream.pInputSurface = conversion_input_views_[frame.array_slice].Get();
-    HRESULT hr = conversion_video_context_->VideoProcessorBlt(conversion_processor_.Get(),
-        conversion_output_view_.Get(), 0, 1, &stream);
-    if (FAILED(hr)) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "VideoProcessorBlt(P010->NV12) failed: hr=0x%08lx",
-            static_cast<unsigned long>(hr));
-        error = buf;
-        return false;
-    }
-
-    frame.texture = conversion_output_texture_.Get();
+    if (!needs_normalization_) return true; // already the downstream contract
+    if (!normalizer_.process(frame.texture, frame.array_slice, error)) return false;
+    frame.texture = normalizer_.output_texture();
     frame.array_slice = 0;
     return true;
 }
@@ -479,27 +440,30 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     AVRational rate = av_guess_frame_rate(fmt_ctx_, stream, nullptr);
     if (rate.num > 0 && rate.den > 0)
         fps_ = av_q2d(rate);
-    width_ = stream->codecpar->width;
-    height_ = stream->codecpar->height;
+    coded_width_ = stream->codecpar->width;
+    coded_height_ = stream->codecpar->height;
+    width_ = coded_width_;
+    height_ = coded_height_;
     if (width_ <= 0 || height_ <= 0 || time_base_.num <= 0 || time_base_.den <= 0) {
         error = "video metadata is incomplete";
         close();
         return false;
     }
 
-    // 下游环缓冲/scrub/AI 桥/headless 仍统一消费 8-bit NV12。10-bit 4:2:0 由
-    // P010->NV12 GPU 转换接入同一契约；其余格式仍在 open 路径显式拒绝，避免
-    // CopySubresourceRegion 不转换格式而静默黑屏。判定用 codecpar->format：
+    // 下游环缓冲/scrub/AI 桥/headless 统一消费 8-bit BT.709 limited NV12。8-bit 4:2:0 与
+    // 10-bit 4:2:0（P010）都接入同一契约：后者由 VideoNormalizer 在 GPU 上按色彩 tag 归一化
+    // （含 HDR tone mapping / 旋转），不是简单降位深；其余 4:2:2 / 4:4:4 等格式在 open 路径
+    // 显式拒绝，避免 CopySubresourceRegion 不转换格式而静默黑屏。判定用 codecpar->format：
     // avformat_find_stream_info 后 parser 已确定位深/色度格式，codec_ctx_->sw_pix_fmt
     // 此时仍可能未确定。
     {
         const AVPixelFormat coded_fmt = static_cast<AVPixelFormat>(stream->codecpar->format);
-        needs_p010_conversion_ = coded_fmt == AV_PIX_FMT_YUV420P10LE ||
+        const bool ten_bit_420 = coded_fmt == AV_PIX_FMT_YUV420P10LE ||
             coded_fmt == AV_PIX_FMT_P010LE;
         if (coded_fmt != AV_PIX_FMT_NV12 &&
             coded_fmt != AV_PIX_FMT_YUV420P &&
             coded_fmt != AV_PIX_FMT_YUVJ420P &&
-            !needs_p010_conversion_) {
+            !ten_bit_420) {
             const char* fmt_name = av_get_pix_fmt_name(coded_fmt);
             error = "unsupported_pix_fmt:" + std::string(fmt_name ? fmt_name : "unknown");
             close();
@@ -507,24 +471,23 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
         }
     }
 
+    resolve_display_transform(stream);
+
     // Audio (spike, additive): demux-only, best-effort. related_stream=idx nudges FFmpeg to
     // prefer an audio stream muxed alongside the chosen video stream when a container has
     // several. No audio track is a legitimate, silent result (-1), not an error -- callers
     // (Player::open()) must treat has_audio()==false the same as "no audio in this file".
     audio_stream_idx_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, idx, nullptr, 0);
 
-    // Best-effort total frame count: prefer the container's own count, else derive from
-    // duration * fps. Used only for clamping seek targets -- 0 (unknown) is handled by
-    // callers as "no known upper bound", not a fatal condition.
-    if (stream->nb_frames > 0) {
-        frame_count_ = stream->nb_frames;
-    } else {
+    {
         double dur_s = -1.0;
-        if (stream->duration != AV_NOPTS_VALUE)
+        if (stream->duration != AV_NOPTS_VALUE && stream->duration > 0)
             dur_s = stream->duration * av_q2d(stream->time_base);
-        else if (fmt_ctx_->duration != AV_NOPTS_VALUE)
+        else if (fmt_ctx_->duration != AV_NOPTS_VALUE && fmt_ctx_->duration > 0)
             dur_s = static_cast<double>(fmt_ctx_->duration) / AV_TIME_BASE;
-        frame_count_ = (dur_s > 0) ? static_cast<int64_t>(std::llround(dur_s * fps_)) : 0;
+        frame_count_ = dur_s > 0
+            ? static_cast<int64_t>(std::llround(dur_s * fps_))
+            : std::max<int64_t>(0, stream->nb_frames);
     }
 
     codec_ctx_ = avcodec_alloc_context3(decoder);
@@ -579,24 +542,15 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     }
     av_dict_free(&opts);
 
-    if (needs_p010_conversion_ && !initialize_p010_conversion(error)) {
+    // Frame contract: everything downstream (present / AI / headless / scrub) consumes
+    // display-oriented BT.709 limited 8-bit NV12. Build the GPU normalizer here when the source
+    // is anything else (10-bit, full range, non-709 matrix, HDR, display-matrix rotation) so an
+    // unsupported combination fails the open with a reason instead of producing a wrong image.
+    if (!configure_frame_normalization(error)) {
+        error = "frame normalization failed: " + error;
         close();
         return false;
     }
-
-    // 非 BT.709 limited 的色彩 tag 只埋 warning：present shader 写死 BT.709 limited，
-    // 10-bit 输入也只降位深，不做 HDR tone mapping。tag 未指定是常态，不 warn。
-    if (codec_ctx_->color_trc == AVCOL_TRC_SMPTE2084 ||
-        codec_ctx_->color_trc == AVCOL_TRC_ARIB_STD_B67)
-        fprintf(stderr, "[sumu] warning: HDR transfer '%s'; tone mapping is not supported\n",
-            av_color_transfer_name(codec_ctx_->color_trc));
-    if (codec_ctx_->colorspace != AVCOL_SPC_BT709 &&
-        codec_ctx_->colorspace != AVCOL_SPC_UNSPECIFIED)
-        fprintf(stderr, "[sumu] warning: color space tag '%s' is not BT.709; presentation "
-            "assumes BT.709 (color shift likely)\n", av_color_space_name(codec_ctx_->colorspace));
-    if (codec_ctx_->color_range == AVCOL_RANGE_JPEG)
-        fprintf(stderr, "[sumu] warning: full-range (JPEG) color tag; presentation assumes "
-            "limited range (levels will look off)\n");
 
     pkt_ = av_packet_alloc();
     frame_ = av_frame_alloc();
@@ -621,8 +575,10 @@ bool Decoder::seek_to_start()
 // (common bad remux), frame->pts stays in decode order and would map frame_num backwards
 // (visible as nearby-frame flicker). best_effort_timestamp is FFmpeg's presentation-order
 // estimate (equals pts when the container timestamps are already correct).
-static double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base, double fps,
-                                    double last_out_pts_seconds)
+// `fallback_raw_pts` is the previous frame's raw PTS plus one frame interval: the frame's own
+// raw PTS from ffprobe is already in the origin-shifted domain, so the fallback must be too.
+static double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base,
+                                    double fallback_raw_pts)
 {
     int64_t ts = AV_NOPTS_VALUE;
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
@@ -631,8 +587,31 @@ static double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base, 
         ts = frame->pts;
     if (ts != AV_NOPTS_VALUE)
         return ts * av_q2d(time_base);
-    // No timestamp at all: step one frame from the last remapped output (best-effort only).
-    return last_out_pts_seconds + 1.0 / fps;
+    return fallback_raw_pts;
+}
+
+// Raw stream PTS -> playback timeline, the single place every DecodedFrame's pts_seconds is
+// produced from (next_frame / seek_to_frame / nearest_keyframe).
+//
+// The monotonic guard handles streams whose timestamps restart or jump backwards mid-file
+// (concatenated TS segments, restarted encoders): a backwards jump beyond a generous threshold
+// shifts the whole remaining stream forward so the timeline keeps advancing instead of
+// rewinding into already-presented grid positions (which froze playback at the join). Small
+// non-monotonicities (B-frame reordering residue, VFR jitter) pass through untouched, and
+// forward holes are real missing content -- they are never compressed away.
+double Decoder::map_timeline_pts(double raw_pts_s)
+{
+    double pts_s = loop_offset_seconds_ + (raw_pts_s - first_pts_seconds_) + discontinuity_offset_;
+    const double step = 1.0 / (fps_ > 0.0 ? fps_ : 1.0);
+    // windows.h's min/max macros are live in this TU (no NOMINMAX here): no std::max call.
+    double back_jump = 8.0 * step;
+    if (back_jump < 0.5) back_jump = 0.5;
+    if (last_out_pts_seconds_ >= 0.0 && pts_s < last_out_pts_seconds_ - back_jump) {
+        discontinuity_offset_ += (last_out_pts_seconds_ + step) - pts_s;
+        pts_s = last_out_pts_seconds_ + step;
+    }
+    last_out_pts_seconds_ = pts_s;
+    return pts_s;
 }
 
 int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
@@ -652,7 +631,14 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
             }
             out.texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
             out.array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
-            raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, fps_, last_out_pts_seconds_);
+            const double step = 1.0 / (fps_ > 0.0 ? fps_ : 1.0);
+            raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, last_raw_pts_seconds_ + step);
+            last_raw_pts_seconds_ = raw_pts_s_out;
+            // Hold length on the source timeline: whatever the container declared for this
+            // packet, else one frame interval. Never invented for a gap.
+            out.duration_seconds = (frame_->duration > 0)
+                ? static_cast<double>(frame_->duration) * av_q2d(time_base_)
+                : step;
             return 1;
         }
         if (recv == AVERROR_EOF) return 0;
@@ -708,7 +694,11 @@ int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
                 if (apkt) {
                     av_packet_move_ref(apkt, pkt_);
                     std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-                    audio_pkt_queue_.push_back(AudioPacketEntry{ apkt, loop_offset_seconds_ });
+                    // Stamped with the discontinuity correction in effect at this demux
+                    // position, so audio rides the same timeline as the video frames decoded
+                    // around it (a cut shifts both tracks together instead of desyncing them).
+                    audio_pkt_queue_.push_back(AudioPacketEntry{ apkt,
+                        loop_offset_seconds_ + discontinuity_offset_ });
                     if (audio_pkt_queue_.size() > kAudioQueueMaxPackets) {
                         AudioPacketEntry drop = audio_pkt_queue_.front();
                         audio_pkt_queue_.pop_front();
@@ -740,10 +730,70 @@ bool Decoder::next_frame(DecodedFrame& out)
         first_pts_seconds_ = raw_pts_s;
         have_first_pts_ = true;
     }
-    double pts_s = loop_offset_seconds_ + (raw_pts_s - first_pts_seconds_);
-    out.pts_seconds = pts_s;
-    last_out_pts_seconds_ = pts_s;
+    out.pts_seconds = map_timeline_pts(raw_pts_s);
     return true;
+}
+
+bool Decoder::reconnect_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error)
+{
+    LogScope log_scope(*this);
+    if (!is_network_ || !fmt_ctx_ || !fmt_ctx_->pb || !fmt_ctx_->url ||
+        (fmt_ctx_->iformat->flags & AVFMT_NOFILE)) {
+        error = "network input cannot be reconnected as a seekable file";
+        return false;
+    }
+    AVFormatContext* replacement = avformat_alloc_context();
+    if (!replacement) {
+        error = "network reconnect could not allocate a format context";
+        return false;
+    }
+    replacement->interrupt_callback = fmt_ctx_->interrupt_callback;
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "rw_timeout", "15000000", 0);
+    av_dict_set(&options, "reconnect", "1", 0);
+    av_dict_set(&options, "reconnect_streamed", "1", 0);
+    av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+    av_dict_set(&options, "reconnect_delay_max", "5", 0);
+    av_dict_set(&options, "seekable", "1", 0);
+    av_dict_set(&options, "probesize", "1048576", 0);
+    av_dict_set(&options, "analyzeduration", "2000000", 0);
+    int ret = avformat_open_input(&replacement, fmt_ctx_->url, nullptr, &options);
+    av_dict_free(&options);
+    if (ret >= 0) ret = avformat_find_stream_info(replacement, nullptr);
+    if (ret < 0 || interrupt_requested_.load(std::memory_order_relaxed)) {
+        char message[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(ret < 0 ? ret : AVERROR_EXIT, message, sizeof(message));
+        error = std::string("network reconnect failed: ") + message;
+        avformat_close_input(&replacement);
+        return false;
+    }
+    const int video = av_find_best_stream(replacement, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    const int audio = video >= 0
+        ? av_find_best_stream(replacement, AVMEDIA_TYPE_AUDIO, -1, video, nullptr, 0) : -1;
+    const AVCodecParameters* params = video >= 0 ? replacement->streams[video]->codecpar : nullptr;
+    const AVCodecParameters* old_audio = audio_codecpar();
+    const AVCodecParameters* new_audio = audio >= 0 ? replacement->streams[audio]->codecpar : nullptr;
+    const bool audio_matches = old_audio && new_audio
+        ? old_audio->codec_id == new_audio->codec_id &&
+          old_audio->sample_rate == new_audio->sample_rate &&
+          av_channel_layout_compare(&old_audio->ch_layout, &new_audio->ch_layout) == 0 &&
+          av_cmp_q(audio_time_base(), replacement->streams[audio]->time_base) == 0
+        : !old_audio && !new_audio;
+    if (!params || params->codec_id != codec_ctx_->codec_id ||
+        params->width != coded_width_ || params->height != coded_height_ ||
+        av_cmp_q(time_base_, replacement->streams[video]->time_base) != 0 || !audio_matches ||
+        !(replacement->pb && (replacement->pb->seekable & AVIO_SEEKABLE_NORMAL))) {
+        error = "network source changed format or is no longer seekable";
+        avformat_close_input(&replacement);
+        return false;
+    }
+    // Demuxers can retain their own IO pointers; replace the transport and demuxer together.
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = replacement;
+    video_stream_idx_ = video;
+    audio_stream_idx_ = audio;
+    flush_audio_queue();
+    return seek_to_frame(target_frame, out, error);
 }
 
 bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
@@ -766,6 +816,8 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
     // globally anchored to that one origin across any number of seeks (I5). A seek never
     // touches loop_offset_seconds_/first_pts_seconds_ (loop_offset stays 0 for the session
     // under pause-on-last-frame; the term remains in the formula for a single code path).
+    // The discontinuity correction is reset below, so this linear mapping is the plain origin
+    // relation: after a seek the timeline is re-anchored at the raw stream axis.
     double target_seconds_local = static_cast<double>(target_frame) / fps_; // in loop_offset_ domain
     double target_seconds_raw = (target_seconds_local - loop_offset_seconds_) + first_pts_seconds_;
     int64_t seek_ts = static_cast<int64_t>(std::llround(target_seconds_raw / av_q2d(time_base_)));
@@ -782,9 +834,16 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
         error = "av_seek_frame failed";
         return false;
     }
+    // A reposition legitimately jumps the timeline backwards: drop the monotonic guard and any
+    // discontinuity correction accumulated before the seek (it only described the old position;
+    // a cut encountered again after the seek is detected again from here on).
+    discontinuity_offset_ = 0.0;
+    last_out_pts_seconds_ = -1.0;
 
-    // Decode forward from the keyframe av_seek_frame landed on until the REAL decoded PTS
-    // (not the nominal target) reaches target_frame (I5). Bounded loop: a HEVC GOP is
+    // Decode forward from the keyframe av_seek_frame landed on until the picture ON SCREEN at
+    // target_frame is found (I5): a picture covers [ceil(pts*fps), ceil((pts+duration)*fps)-1]
+    // of the fixed grid, so a VFR picture answers for its whole hold and forward decoding stops
+    // on that picture instead of running on to the next one. Bounded loop: a HEVC GOP is
     // essentially never long enough to need more than a few hundred frames of forward decode
     // even on a deep seek, since av_seek_frame itself did the O(log n) jump to the nearest
     // keyframe regardless of how far away target_frame is.
@@ -794,10 +853,8 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
         DecodedFrame df;
         int r = pump_one_raw_frame(df, raw_pts_s);
         if (r <= 0) { error = "nearest_keyframe: no frame decoded after seek"; return false; }
-        double pts_s = loop_offset_seconds_ + (raw_pts_s - first_pts_seconds_);
-        last_out_pts_seconds_ = pts_s;
         out = df;
-        out.pts_seconds = pts_s;
+        out.pts_seconds = map_timeline_pts(raw_pts_s);
         return true;
     }
 
@@ -819,16 +876,20 @@ bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string
             // whatever we already have instead of failing the whole seek.
             break;
         }
-        double pts_s = loop_offset_seconds_ + (raw_pts_s - first_pts_seconds_);
-        last_out_pts_seconds_ = pts_s;
+        const double pts_s = map_timeline_pts(raw_pts_s);
+        df.pts_seconds = pts_s;
         last_good = df;
         last_good_pts_s = pts_s;
         have_any = true;
 
-        int64_t derived_frame = static_cast<int64_t>(std::llround(pts_s * fps_));
-        if (derived_frame >= target_frame) {
+        const int64_t grid_start = static_cast<int64_t>(std::ceil(pts_s * fps_ - 1e-5));
+        const int64_t grid_end = (df.duration_seconds > 0.0)
+            ? static_cast<int64_t>(std::ceil((pts_s + df.duration_seconds) * fps_ - 1e-5)) - 1
+            : grid_start;
+        // Covered by this picture, or this picture starts past the target (a gap with no
+        // picture at target_frame -- the next sample is the closest answer there is).
+        if (target_frame <= grid_end || grid_start > target_frame) {
             out = df;
-            out.pts_seconds = pts_s;
             return true;
         }
     }

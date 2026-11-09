@@ -5,8 +5,8 @@
 // spikes/spike2_clock_mixing/src/decoder.{h,cpp}, plus a new seek_to_frame() for sumu's I6
 // ("seek = reposition, not teardown"). Product EOF policy is pause-on-last-frame (no loop);
 // FFmpeg d3d11va hardware decode of HEVC (or anything FFmpeg + the installed D3D11VA hwaccel
-// supports) straight into GPU-resident NV12 D3D11 textures shared with the caller's device --
-// no readback, no re-upload.
+// supports) straight into GPU-resident NV12/P010 D3D11 textures shared with the caller's
+// device -- no readback, no re-upload.
 //
 // AVFrame with format == AV_PIX_FMT_D3D11:
 //   frame->data[0] -> ID3D11Texture2D*  (a texture ARRAY; one physical texture backs the
@@ -17,6 +17,10 @@
 // We ask FFmpeg to build the hw_frames_ctx with BindFlags including
 // D3D11_BIND_SHADER_RESOURCE (in addition to the D3D11_BIND_DECODER it always needs) so we
 // can create SRVs straight on the decoder's own texture array slices.
+//
+// Frame contract (see prepare_nv12_frame): every consumer always receives
+// display-oriented, BT.709, limited-range, 8-bit NV12. width()/height() report that normalized
+// display size; the coded size the codec actually produced is coded_width()/coded_height().
 
 #pragma once
 
@@ -30,6 +34,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "video_normalizer.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -47,6 +53,10 @@ struct DecodedFrame
     ID3D11Texture2D* texture = nullptr; // NOT owned; alive as long as `owner_frame` is
     UINT array_slice = 0;
     double pts_seconds = 0.0;
+    // How long this picture stays on screen: the frame's own declared duration, or one frame
+    // interval (1/fps) when the container does not carry one. Downstream maps it onto the
+    // fixed-fps grid so a VFR picture answers for its whole hold interval.
+    double duration_seconds = 0.0;
 };
 
 class Decoder
@@ -80,9 +90,15 @@ public:
     // "in flight" to bound VRAM use / decoder pool pressure).
     bool next_frame(DecodedFrame& out);
 
-    // Convert a decoded P010 frame to the NV12 contract consumed by every downstream path.
-    // No-op for native 8-bit NV12 input. Player callers must hold d3d_mutex_ around this call
-    // and the subsequent copy; HeadlessDecode uses its single-threaded immediate context.
+    // Normalize a decoded frame to the one contract every downstream path consumes:
+    // display-oriented (display-matrix rotation/mirror applied), BT.709, limited range, 8-bit
+    // NV12, array slice 0 -- all on this device, no CPU involvement. A source that already
+    // matches is passed through untouched (frame left exactly as decoded, zero GPU work).
+    // On success `frame` points at either the decoded surface (fast path) or the normalizer's
+    // output surface; either way the caller may copy it with CopySubresourceRegion(...., nullptr)
+    // as before. Player callers must hold d3d_mutex_ around this call and the subsequent copy;
+    // HeadlessDecode uses its single-threaded immediate context. Returns false + `error` on any
+    // unsupported/unsatisfiable case (never a silently wrong image).
     bool prepare_nv12_frame(DecodedFrame& frame, std::string& error);
 
     // EOF 状态：next_frame() 解到流末尾（pump 返回 0，即真实 EOF，不含解码错误）时置位，
@@ -106,13 +122,20 @@ public:
     // grid fill barely competes with a foreground 4K decode. out lands on that keyframe's real PTS.
     bool seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
                        bool nearest_keyframe = false);
+    bool reconnect_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error);
 
     double fps() const { return fps_; }
+    // Normalized (display) size: for a stream carrying a 90/270 display matrix this is the
+    // coded size swapped, so callers never have to know about rotation.
     int width() const { return width_; }
     int height() const { return height_; }
-    // Best-effort total frame count (nb_frames if the container knows it, else derived from
-    // stream/format duration * fps). 0 means genuinely unknown (rare containers) -- callers
-    // should treat that as "no known upper bound" rather than crash.
+    // Size the codec actually produced (pre-rotation), for diagnostics only.
+    int coded_width() const { return coded_width_; }
+    int coded_height() const { return coded_height_; }
+    // Timeline length in the fixed-fps grid the player lays over the stream (stream/format
+    // duration * fps, floored by the physical frame count so a short declared duration can
+    // never hide pictures that really exist). 0 means genuinely unknown (rare containers) --
+    // callers should treat that as "no known upper bound" rather than crash.
     int64_t frame_count() const { return frame_count_; }
 
     // ---- audio (spike, additive) -- demux-only: this class never builds an audio
@@ -180,9 +203,13 @@ private:
     static AVPixelFormat get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts);
     bool ensure_hw_frames_ctx(AVCodecContext* ctx);
     bool seek_to_start();
-    bool initialize_p010_conversion(std::string& error);
-    bool convert_p010_to_nv12(DecodedFrame& frame, std::string& error);
-    void reset_p010_conversion();
+    // Reads the stream's AV_PKT_DATA_DISPLAYMATRIX (if any) and derives the display transform.
+    // Never fails: a malformed/absent matrix means "no transform".
+    void resolve_display_transform(AVStream* stream);
+    // Fills normalize_desc_ from the codec tags + the resolved display transform, updates
+    // width_/height_ to the normalized display size, and builds the normalizer when the source
+    // needs one. Returns false + `error` when the conversion is impossible on this device.
+    bool configure_frame_normalization(std::string& error);
 
     // Shared "pull one hw frame out of the demuxer/decoder" pump, used by both next_frame()
     // and seek_to_frame()'s forward-decode-to-target loop. Does NOT loop-on-EOF (both callers
@@ -220,20 +247,33 @@ private:
     std::atomic<bool> interrupt_requested_{ false };
     static int interrupt_cb(void* opaque);
     double loop_offset_seconds_ = 0.0; // stays 0 (pause-on-last-frame); kept for pts formula
-    double last_out_pts_seconds_ = -1.0;
+    // Raw stream PTS (time_base applied, NOT origin-shifted) of the last frame -- the base the
+    // no-timestamp fallback steps from, so it stays in the same domain it is subtracted from.
+    double last_raw_pts_seconds_ = 0.0;
+    double last_out_pts_seconds_ = -1.0; // last timeline PTS handed out (origin shifted)
+    // Accumulated correction that keeps the timeline continuous across a significant backwards
+    // PTS jump (concatenated segments / restarted timestamps). Reset on seek -- see
+    // map_timeline_pts().
+    double discontinuity_offset_ = 0.0;
+    // raw stream PTS -> playback timeline (loop_offset + origin + discontinuity correction),
+    // with the monotonic guard for backwards jumps. Every caller that hands out a
+    // DecodedFrame goes through this, so video and the audio packets queued alongside it stay
+    // on one timeline.
+    double map_timeline_pts(double raw_pts_s);
 
     ID3D11Device* d3d_device_ = nullptr; // not owned
 
-    bool needs_p010_conversion_ = false;
-    bool conversion_stream_initialized_ = false;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext> conversion_context_;
-    Microsoft::WRL::ComPtr<ID3D11VideoContext> conversion_video_context_;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> conversion_enumerator_;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessor> conversion_processor_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> conversion_output_texture_;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> conversion_output_view_;
-    ID3D11Texture2D* conversion_input_texture_ = nullptr; // not owned; views retain it
-    std::vector<Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView>> conversion_input_views_;
+    // Frame normalization (see prepare_nv12_frame). needs_normalization_ false == the decoded
+    // surface is already the contract, so nothing is ever bound or drawn.
+    bool needs_normalization_ = false;
+    VideoNormalizeDesc normalize_desc_{};
+    VideoNormalizer normalizer_;
+    int coded_width_ = 0;
+    int coded_height_ = 0;
+    // Clockwise display rotation (0/90/180/270) and horizontal mirror from the container's
+    // display matrix, kept for diagnostics.
+    int display_rotation_cw_ = 0;
+    bool display_hflip_ = false;
 
     // Set in open() from looks_like_network_url(path); cleared in close(). Drives FFmpeg
     // format options (timeout/reconnect/probesize) and is read by Player for IO profile.
@@ -242,12 +282,7 @@ private:
     // ---- audio (spike, additive) -----------------------------------------------------------
     int audio_stream_idx_ = -1; // -1 == no audio stream (legitimate, silent)
 
-    // One queued audio packet plus the loop_offset_seconds_ that was in effect (decode thread,
-    // pump_one_raw_frame()) the moment it was read off fmt_ctx_ -- needed so the audio thread
-    // can compute audio_s = loop_offset + (raw_pts - first_pts), the SAME formula next_frame()
-    // uses for video's pts_seconds. loop_offset_seconds_ is legacy of the old loop-on-EOF path
-    // and stays 0 for the whole session now (pause-on-last-frame); the field is kept so seek/
-    // audio math stays one formula.
+    // Timestamp correction at demux time, including any detected backwards discontinuity.
     struct AudioPacketEntry {
         AVPacket* pkt;
         double loop_offset;

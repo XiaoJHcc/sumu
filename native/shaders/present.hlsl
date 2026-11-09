@@ -37,8 +37,11 @@ VSOut VSMain(uint vid : SV_VertexID)
     return o;
 }
 
-// passthrough source: decoder's NV12 -> RGB (BT.709 limited range), identical math to
-// spike 0's shader.
+// passthrough source: decoder's NV12 -> RGB (BT.709, limited range). The decoder hands this
+// shader BT.709 limited NV12 unconditionally (see Decoder::prepare_nv12_frame /
+// VideoNormalizer), so the coefficients are the BT.709 ones: Kr/Kg/Kb = 0.2126/0.7152/0.0722,
+// luma scaled by 255/219 and chroma by 255/224 (x256 fixed point, exact round trip of the
+// 16/219 + 128/224 encode).
 float4 PSMain_NV12(VSOut i) : SV_Target
 {
     float3 uvw = float3(i.uv, (float)arraySlice);
@@ -49,9 +52,9 @@ float4 PSMain_NV12(VSOut i) : SV_Target
     float d = cbcr.x - 128.0;
     float e = cbcr.y - 128.0;
 
-    float r = clamp((298.082 * c + 408.583 * e) / 256.0, 0.0, 255.0);
-    float g = clamp((298.082 * c - 100.291 * d - 208.120 * e) / 256.0, 0.0, 255.0);
-    float b = clamp((298.082 * c + 516.412 * d) / 256.0, 0.0, 255.0);
+    float r = clamp((298.082 * c + 458.9417 * e) / 256.0, 0.0, 255.0);
+    float g = clamp((298.082 * c - 54.5916 * d - 136.4248 * e) / 256.0, 0.0, 255.0);
+    float b = clamp((298.082 * c + 540.7749 * d) / 256.0, 0.0, 255.0);
 
     return float4(r / 255.0, g / 255.0, b / 255.0, 1.0);
 }

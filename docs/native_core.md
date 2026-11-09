@@ -87,15 +87,23 @@ finally 真正退出（此时才"卸载模型"）。
 看起来仍然"新鲜"，但内容是错的。把临界区扩大到整个"生产+发布"序列后，decode 线程的一次迭代和
 `seek()` 互斥，此竞态被彻底关闭。
 
-## 像素格式归一化
+## 帧归一化契约
 
-下游 ring、scrub thumbnail、AI CUDA 桥与 HeadlessDecode 统一消费 8-bit NV12。8-bit 4:2:0
-硬解帧直接拷贝；`yuv420p10le`/`p010` 输入由 `Decoder` 内的 D3D11 VideoProcessor 做一次
-P010→NV12 GPU 转换后再进入同一拷贝路径，不经过主存，也不改 AI 模型或调度器。转换只在主播放、
-seek、缩略图和 headless 的 D3D11 临界区内执行，解码与网络等待仍不持有 `d3d_mutex_`。
+下游 ring、scrub thumbnail、AI CUDA 桥与 HeadlessDecode 统一消费**显示方向正确、BT.709、
+limited range、8-bit NV12**。`Decoder::prepare_nv12_frame()` 是这个契约的唯一出口：
 
-这只是 10-bit→8-bit 兼容层：HDR PQ/HLG 会记录 warning，但尚不做 tone mapping；非 4:2:0
-像素格式仍在 open 时明确拒绝。
+- 已满足契约的源（8-bit BT.709 limited、无 display matrix）原样直通，零 GPU 工作量；
+- 其余源由 `native/src/video_normalizer.*` 在 GPU 上一趟归一化：直接采样解码器纹理数组的
+  NV12/P010 平面（不回读主存），按流 tag 还原 RGB（BT.601 / BT.709 / BT.2020，limited / full
+  range），PQ / HLG 做逆传递 + 亮度域 tone map 到 SDR，BT.2020 转 BT.709 基色，并按容器的
+  display matrix 施加 90/180/270 旋转与镜像；10-bit 精度保留到 tone map 之后才量化到 8-bit，
+  不是简单降位深。输出写进自己的 NV12 纹理（D3D11.1 平面 RTV，退化时用 VideoProcessor
+  把 RGB 转成 BT.709 studio range NV12），失败明确报错，不静默给错图。
+- `Decoder::width()/height()` 返回归一化后的（旋转后）显示尺寸，`coded_width()/coded_height()`
+  是解码器实际产出的尺寸；下游只认前者。
+- 未标记色彩 tag 沿既有 BT.709 limited 契约；非 4:2:0 像素格式仍在 open 时明确拒绝。
+- 归一化只在主播放、seek、缩略图和 headless 的 D3D11 临界区内执行，解码与网络等待仍不持有
+  `d3d_mutex_`；它设置的必要管线状态由下游每帧重设，用后立即解绑自己的 SRV/RTV。
 
 ## seek() = reposition，不是 teardown（I6）
 
@@ -123,6 +131,32 @@ seek、缩略图和 headless 的 D3D11 临界区内执行，解码与网络等�
    刚 seek 好的 slot（`seek_slot_hint_` + `seek_version_`），防止 seek 后紧跟的第一个 present
    tick 因为调度抖动跑到 decode 尚未来得及填充的帧号时，兜底路径去重复**seek 前**的旧画面。
 6. 返回真正落地的帧号（由 `Decoder::seek_to_frame` 的真实 PTS 反推），供 Python 侧核实。
+
+## VFR 时间网格
+
+帧号仍是以源标称 fps 为刻度的时间网格，不是文件内物理图片的序号。已知时长时，总网格数由
+`duration × fps` 推导，物理 `nb_frames` 仅在没有时长时兜底。每张解码图片以真实 PTS 与声明的
+持续时长确定覆盖区间；ring 只存一份 GPU 图片，present 与 AI 输入桥都按区间查找，持帧不重复
+分配纹理，也不把下载缺损的无图区间伪造为有效图片。`fps_div` 改变网格采样率，不改变内容时长。
+
+seek 仍只重定位：目标落在长持帧区间内时显示该图片，并把时钟放到请求位置。区间所有者标签
+用于验证 stale 重放；长持帧跨过取模环周期时，后续图片优先使用空槽或已过期槽，不覆盖仍有效的
+图片。真实时间戳显著回退时接到上一帧之后，正向缺损保持原时间跨度；拼接 TS 若声明时长过短仍
+按声明末尾暂停，不保证跨重复时间戳段的精确 seek。验证入口：`scripts/verify_playback_timeline.py`。
+
+## 网络与音频输出恢复
+
+HTTP/HTTPS 已知时长、支持 Range 的文件提前断流时，先由 FFmpeg 尝试重连；失败返回后，解码线程
+按有上限的退避重新打开失效连接与解封装器，再 seek 到当前播放时间附近；保留硬解 codec、GPU
+资源、播放器、模型与线程，也不重置 QPC 时钟。正常 seek 仍不重新打开任何资源。
+真实末尾不重试；关闭会话通过 AVIOInterruptCB 打断网络等待。未知时长直播、RTSP 与服务端不支持
+Range 的输入不在此恢复保证内。`Player.stats()` 提供网络恢复次数与状态，验证入口为
+`scripts/verify_network_recovery.py`。
+
+WASAPI 在音频线程内检测默认端点改变、设备失效及输出调用失败，释放旧端点及重采样缓冲后重建；
+无设备时有界退避，视频照常前进，新端点按当前视频时钟丢弃落后音频并重新同步。
+`Player.audio_stats()` 提供真实端点与输出计数；`scripts/verify_audio_recovery.py` 通过显式请求走
+同一条真实 WASAPI 重建路径，不改用户默认设备，物理拔插和系统默认端点切换仍需人工验证。
 
 ## 不完整媒体与下载临时文件
 

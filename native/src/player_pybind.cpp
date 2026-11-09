@@ -42,6 +42,11 @@ PYBIND11_MODULE(sumu_core, m)
         .def("set_muted", &Player::set_muted, py::arg("muted"))
         .def("toggle_mute", &Player::toggle_mute)
         .def("is_muted", &Player::is_muted)
+        // Audio device recovery (hot-plug / default-output switch): observability + a forced
+        // rebuild hook for scripts/verify_audio_recovery.py. Recovery itself is automatic.
+        .def("audio_device_active", &Player::audio_device_active)
+        .def("audio_stats", &Player::audio_stats)
+        .def("request_audio_device_rebuild", &Player::request_audio_device_rebuild)
         .def("set_ai_enabled", &Player::set_ai_enabled, py::arg("enabled")) // Phase 6 M-D
         .def("is_ai_enabled", &Player::is_ai_enabled)
         .def("set_fps_div", &Player::set_fps_div, py::arg("fps_div"))

@@ -33,8 +33,10 @@ README.md / README.en.md  面向用户：功能、硬件需求、构建运行
 native/                  C++ 原生内核，构建产物 sumu_core.cp313-win_amd64.pyd（pybind11）
   build.bat              唯一构建入口（source vcvars64 + CMake + Ninja）
   CMakeLists.txt         目标/依赖/产物落位
-  src/                   player_engine / player_session / player_window / player_pybind /
+  src/                   player_engine / player_audio（WASAPI 音频线程 + 端点恢复）/
+                         player_session / player_window / player_pybind /
                          player_ui_overlays / player_ui_bars / player_ui_export / decoder /
+                         video_normalizer（GPU 色彩/HDR/旋转归一化）/
                          headless_decode（Web 转码用无窗口解码）
   src/ui/                ImGui 设计系统（theme / widgets / icons）
   shaders/present.hlsl   NV12→RGB 着色器
@@ -60,7 +62,7 @@ docs/                    状态文档（索引见下文「docs 查询索引」�
 test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片（gitignored）
 ```
 
-**代码落点速查**：改播放内核/解码/窗口/UI → `native/src/`（C++）；改 AI 调度策略 → `python/sumu/scheduler.py`；改模型与推理 → `python/sumu/ai/`；改 Web 串流/导出 → `python/sumu/webstream/` + `native/src/headless_decode.cpp`；改用户持久化 → `python/sumu/settings.py`；改界面文案 → `python/sumu/locales/*.json` + `i18n.py`；改 UI 视觉规范 → `docs/ui_design.md` + `native/src/ui/`。
+**代码落点速查**：改播放内核/解码/窗口/UI → `native/src/`（C++）；改音频输出/端点恢复 → `native/src/player_audio.cpp`；改 AI 调度策略 → `python/sumu/scheduler.py`；改模型与推理 → `python/sumu/ai/`；改 Web 串流/导出 → `python/sumu/webstream/` + `native/src/headless_decode.cpp`；改用户持久化 → `python/sumu/settings.py`；改界面文案 → `python/sumu/locales/*.json` + `i18n.py`；改 UI 视觉规范 → `docs/ui_design.md` + `native/src/ui/`。
 
 ## 构建、运行与验证工具
 
@@ -87,6 +89,10 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `native\smoke_player.py {smoothness\|seek\|pause\|all}` | native Player 冒烟：4K60 流畅度 / 长片 seek 风暴 / pause 帧号冻结 |
 | `scripts\run_player.py [video] --seconds N [--seek-test] [--correctness]` | 端到端冒烟：接 Player+Scheduler，打印 ai_hit_rate / present；`--correctness` 用 PyAV CPU 解码交叉校验 RGBA 通道序与「马赛克确实被改」 |
 | `verify_i18n.py` / `verify_settings.py` / `verify_weights_resolve.py` | 无 GPU 快速检查：文案键对齐 / 设置往返与原子写 / 权重目录解析 |
+| `scripts\verify_video_formats.py` | GPU 色彩/格式归一化：BT.601/709、limited/full、10-bit、PQ/HLG、旋转/镜像；CUDA 输出对照公式与独立 FFmpeg，`--ai` 检查 AI 输入/呈现桥 |
+| `scripts\verify_playback_timeline.py` | VFR 时间网格与持帧内容、seek、fps_div、CFR/短视频、拼接 TS 防回退覆盖边界 |
+| `scripts\verify_network_recovery.py` | 本地 HTTP Range 主动断流/503 后恢复、真实 EOF 不重试、关窗打断挂起读取 |
+| `scripts\verify_audio_recovery.py` | 音频端点恢复：真实 WASAPI 初始化、显式重建后输出恢复、pause/seek/关闭重开；物理热插拔需人工（脚本不动默认设备） |
 | `verify_ai_core.py` / `verify_scene_clip_blend.py` | AI 核心：load_models/YOLO/BasicVSR 实测 fps；scene/clip + blend 端到端 |
 | `verify_transcode*.py` / `verify_stream*.py` | 转码与 Web 流媒体/导出（路由/token/passthrough 直出/e2e） |
 | `scripts\verify_url_open_cancel.py` | URL 打开取消链路：挂死服务器 + `cancel_open_url()`（AVIOInterruptCB 快速中断）+ 正常 URL 打开回归 |

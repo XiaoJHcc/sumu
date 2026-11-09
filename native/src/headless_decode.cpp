@@ -3,7 +3,7 @@
 //
 // HeadlessDecode: a windowless, sequential d3d11va-hard-decode -> CUDA-NV12 source for the
 // transcode / web-streaming / offline-export pipeline (python/sumu/webstream/). Reuses the
-// same Decoder (including P010->NV12 normalization) plus the AI-input-bridge blit technique already
+// same Decoder (including its frame normalization to display-oriented BT.709 limited NV12) plus the AI-input-bridge blit technique already
 // validated in player.cpp (create_ai_input_bridge + get_cuda_nv12_by_frame, see
 // docs/native_ai_input.md), WITHOUT any window / swapchain / present thread / audio machinery.
 //
@@ -177,7 +177,7 @@ public:
                 // R8/R8G8 plane targets and copy out to the persistent device buffer.
                 std::string conversion_error;
                 if (!decoder_.prepare_nv12_frame(df, conversion_error))
-                    throw std::runtime_error("HeadlessDecode P010->NV12 conversion: " + conversion_error);
+                    throw std::runtime_error("HeadlessDecode frame normalization: " + conversion_error);
                 context_->CopySubresourceRegion(nv12_tex_.Get(), 0, 0, 0, 0,
                     df.texture, df.array_slice, nullptr);
 

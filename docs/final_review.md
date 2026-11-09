@@ -203,11 +203,18 @@
   | 场景抽查：10-bit 片（S7） | PASS | open 报 `unsupported_pix_fmt:yuv420p10le`，i18n 映射正确，拒绝后再 open 正常视频不崩 |
 
 
-## 后续方向（本次不做，记录在案）
+## 当前支持与后续方向
 
-- HDR tone mapping、BT.601/full-range 从流 tag 派生色彩参数（spike3 已给方案）。
-- 软解 fallback（porting_manifest 已列为未来方向）；解码中途分辨率/格式切换处理。
-- 旋转元数据（手机竖拍）；播放端字幕与音轨选择；VFR 正式支持。
-- D3D11 device-removed 恢复路径（M3）；网络源 AVIOInterruptCB（M7 退出等待 15s）。
+本文件前文为各审查阶段的历史状态。当前 Decoder 已统一 GPU 色彩/HDR/旋转归一化，播放器已用
+PTS 持续区间支持 VFR 时间网格；HTTP 文件断流可恢复，WASAPI 默认端点变化与失效可重建。
+现行契约与验证入口见 `docs/native_core.md`，不再把这些项目列为尚未实现。
+
+剩余边界：
+
+- HDR 为固定参数 SDR tone mapping，不读取 mastering-display/MaxCLL 做动态适配，不做 HDR 直出。
+- 软解 fallback；解码中途分辨率/格式切换；SAR、去隔行；播放端字幕与音轨选择。
+- 拼接 TS 的重复时间戳仅防止回退画面覆盖，容器声明时长过短时仍按声明末尾暂停；未提供跨段精确 seek。
+- RTSP、未知时长直播与不支持 Range 的网络源不在 HTTP 文件恢复保证内。
+- D3D11 device-removed 恢复路径（M3）；物理音频热插拔/默认设备切换仍需人工验收。
 - P4/P5/P6 性能项（转码管线重叠、NV12→BGR 融合、Present 出锁）——按量测结果单独立项。
-- L6 音频设备热插拔恢复；L7 EOF 后播放键回 0 重播（UX 决策）。
+- EOF 后播放键回 0 重播（UX 决策）。
