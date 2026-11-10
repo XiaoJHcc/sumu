@@ -84,6 +84,21 @@ powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1 -FastFreeze
 - `build_dist.ps1` 会把仓库根的 `LICENSE.md` 拷进 `dist/sumu/LICENSE.md`，满足"向他人转让程序副本时一并给出许可证"（AGPL-3.0 §4）。自行打包分发（如打 zip）时保留这个文件。
 - 本管线**不**处理"提供对应源代码"义务（AGPL §6 的书面要约/网络访问等）——分发给仓库之外的人前，自行确认满足这部分。
 
+## 运行期额外依赖：WebView2 Runtime（Evergreen）
+
+URL 页的内嵌浏览器用系统 **Evergreen WebView2 Runtime**，不随包分发 Fixed Runtime，也不带
+任何 WebView2 DLL：
+
+- 构建期只要 NuGet SDK 的头文件 + `WebView2LoaderStatic.lib`（`native/CMakeLists.txt` 自动
+  解析/下载到 `native/third_party/webview2`，gitignored），**静态**链接进 pyd —— 包体几乎不
+  增加（该 loader 几十 KB），onedir 里也就没有需要额外装配的 DLL。
+- 运行期 Runtime 缺失（或版本被裁剪）不会影响任何其它功能：浏览器页只显示 `browser_unavailable`
+  一行字，Player 构造/退出/本地文件与媒体直链的原生打开都不经过它。
+- 首次进入浏览器页会在 `%LOCALAPPDATA%\sumu\WebView2` 建 WebView2 用户数据目录（不在包内，
+  不在仓库里）；卸载/清理时删这个目录即可。
+- 目标机实测：Runtime `157.0.4341.42`（SDK 头 1.0.3179.45），`scripts/verify_browser.py`
+  全链路通过（真实页面加载 → 媒体捕获 → Cookie/Referer 交接 → 原生 open 推进帧）。
+
 ## 验证边界（重要）
 
 - **本包不含任何预编译 TRT 引擎**，每台机器首次运行经首屏提示自行编译（数分钟，需 `torch_tensorrt` 运行时 + 可写 `model_weights/`），产物 tag 如 `sm89.trt1012.fp16.win`，只对本机这套 arch/TRT/精度/OS 有效、落盘后下次直接命中。**编译前**去码走 eager PyTorch 回退（能用但约 3x 慢，实时可能追不上→回退原片）；**非 Nvidia / 非 fp16** 机器不触发编译，恒走 eager。

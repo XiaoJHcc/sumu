@@ -25,7 +25,10 @@ native/src/
   player_session.cpp     会话生命周期：open/reopen/close、ui_init/apply_ui_dpi、ui_tick
   player_window.cpp      Win32 窗口/WndProc、全屏、DWM chrome、present loop 入口
   player_engine.cpp      解码/调度/缩略图 scrub 等引擎侧逻辑
-  player_ui_overlays.cpp build_ui() 调度 + 首屏提示/打开 URL/Web 串流弹窗/状态浮窗
+  player_ui_overlays.cpp build_ui() 调度 + 首屏提示/浏览器页（地址栏 + 页内表单）/
+                         Web 串流弹窗/状态浮窗
+  browser_view.h/.cpp    WebView2 嵌入页视图（windowed child controller、只读导航与
+                         请求观测）；WebView2 SDK 头只进这里，Player 只持 unique_ptr
   player_ui_bars.cpp     顶栏/底栏（手绘 seekbar、音量条）+ 设置面板
   player_ui_export.cpp   离线导出页（四段卡片式布局）+ 预设管理器/编辑器
   player_pybind.cpp      pybind11 模块定义
@@ -68,8 +71,8 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 ### 容器
 
 - **`kPaddingContainer = 12`：所有卡片/弹窗/面板必须保证的最小内边距**（四边）。
-  控件永远不得贴容器边缘（旧 URL 弹窗输入框右侧贴边即反例，已由 BeginModal 的钉宽
-  机制根治）。
+  控件永远不得贴容器边缘（旧的开 URL 弹窗输入框右侧贴边即反例，已由 BeginModal 的
+  钉宽机制根治；迁移成页面后由 `url_field` 的显式宽度保证）。
 - **卡片** = `ui::BeginCard`：`kPanelBg` 底 + `kRadiusWindow` 圆角 + 四边 12px padding，
   **无描边**（靠与窗口底的填充对比分层）。
 - 弹窗 = `ui::BeginModal`：宽度钉死为 `内容宽 + 2×12`，内容列右缘距窗口右缘恒为
@@ -282,10 +285,43 @@ if (ui::BeginModal(title.c_str(), &open)) {   // 默认内容宽 kModalContentW 
 ```
 
 Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表单错误标志时在
-`BeginModal` 返回后检查 `!open`）。已有用例：open-URL（含 chromeless 加载卡片特例）、
-Web 串流、预设编辑器。
+`BeginModal` 返回后检查 `!open`）。已有用例：Web 串流、预设编辑器。（旧的开 URL 弹窗
+已改为独立页面，见下节「浏览器页」。）
 
 ## 页面布局约定
+
+### 浏览器页（`build_browser_page`）
+
+首屏「打开 URL」与顶栏 link 图标进入的页面（`request_open_url_popup()`，名字沿用，
+不再是弹窗）。三层竖排，全部满宽：
+
+1. **主标题栏**（`build_top_bar`，原样保留）。页面打开时它的下圆角改为方角，让地址栏
+   与它拼成一条连续的 chrome。
+2. **地址栏**（`##sumu_browser_bar`，高度 `kAddrBarHBase = 36`，与标题栏同高同底色
+   `kPanelBg` + 下边缘 `kBorder` 发丝线）。控件行 32px 高、按 `kSpaceXS` 内缩，从左到右
+   只有四个元素：关闭网页（Close glyph）· URL 输入框（占满剩余宽）· 访问（OpenUrl
+   glyph）· 原生播放（Play glyph，仅在页面已捕获到媒体地址时可用）。没有标签页、
+   书签、历史、前进后退。
+3. **页面区**（标题栏 + 地址栏以下）。四种互斥形态：
+   - **首屏页内表单**：标题（`open_url_title`）+ hint（`open_url_hint`，小字次级色）+
+     输入框 + 错误行 + [打开(Primary)][取消(Secondary)]，整体在页面区居中。
+   - **加载态**：`ui::Spinner` + Cancel（原生 open 进行中；Cancel 走
+     `cancel_open_url()`），卡片宽 200px。
+   - **`browser_unavailable`**：居中一行次级色文本（WebView2 运行时缺失/创建失败）。
+   - **网页本体**：WebView2 的 windowed child window，覆盖整个页面区。
+
+**布局铁律**：网页本体是**真实子窗口**，ImGui 画在它下面的一切都看不见。因此标题栏/
+地址栏必须排在它的矩形之上；加载卡片与首屏表单出现时 `set_visible(false)` 隐藏子窗口；
+open 失败提示是地址栏正下方一条独立的错误行窗口——子窗口的上沿随之下移它的高度，
+而不是把文字叠在网页上。地址栏与其上的标题栏是仅有的两块自绘 chrome。
+
+**两个输入框**：地址栏与首屏表单各持独立 buffer + 独立 ImGui id，共用
+`Player::url_field()`（输入框 + 右键菜单）。不共享同一个 buffer —— 同一段文本被两个
+`ImGuiInputTextState` 分别跟踪会互相覆盖光标/选区。地址栏内容由
+`SourceChanged`/`NavigationCompleted` 同步（用户正在输入时跳过，避免抢字）。
+
+改动本页后跑 `scripts/shot_browser.py` 目检三张图（首屏表单 / 真实网页 / 捕获媒体后
+原生播放按钮点亮），功能链路由 `scripts/verify_browser.py` 断言。
 
 ### 导出页（`build_export_screen`）
 
@@ -359,3 +395,8 @@ Web 串流、预设编辑器。
 无 AI 引擎的裸 Player 窗口，注入合成快照（6 预设 + 3 种状态的队列项），先截导出页
 全图，再自动点击首个预设行截编辑器弹窗（`native/trace/export_ui_shot*.png`）。肉眼
 检查：滚动条条数、垂直居中、label 列对齐、四边 12px 边距。
+
+改了浏览器页/地址栏布局后跑 `scripts/shot_browser.py`（`native/trace/browser_home.png`
+`browser_page.png` `browser_play.png`）：检查标题栏与地址栏是否拼成一条连续 chrome、
+地址栏四个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于地址栏下沿（不遮挡
+任何自绘 chrome）、首屏表单是否居中。

@@ -76,12 +76,14 @@ void Player::build_top_bar(float& out_height){
       // theme's kRadiusWindow rounding there leaves two transparent notches at the screen's
       // top corners in fullscreen (DWM chrome disabled / DONOTROUND); square corners instead
       // get clipped by DWM's ~8px window rounding in windowed mode -- both states end up
-      // flush with zero leakage. BOTTOM corners keep the theme rounding.
+      // flush with zero leakage. BOTTOM corners keep the theme rounding -- except on the
+      // browser page, where the address bar continues the same fill right below this strip
+      // (rounded notches there would cut into the adjacent bar).
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetWindowPos();
         const ImVec2 p1 = ImVec2(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
         dl->AddRectFilled(p0, p1, ui::theme::panel_bg_u32(), ui_s(ui::theme::kRadiusWindow),
-            ImDrawFlags_RoundCornersBottom);
+            browser_page_ ? ImDrawFlags_RoundCornersNone : ImDrawFlags_RoundCornersBottom);
     }
 
     const float btn_w = ui_s(ui::theme::kControlHeight); // icon button = control-height square
@@ -98,6 +100,9 @@ void Player::build_top_bar(float& out_height){
     { // settings toggle: sliders-horizontal glyph from the lucide atlas (ui::AppIcon)
         IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h), ui::AppIcon::Settings, settings_disabled);
         if (r.clicked) {
+            // The panel is drawn INTO the client area, which the page view covers -- leave the
+            // browser page first so the panel is never half-hidden behind the child window.
+            if (browser_page_) exit_browser_page();
             ui_settings_open_ = !ui_settings_open_;
             if (ui_settings_open_) settings_edit_init_ = false; // resync edit buffers to latest cfg on open
         }
@@ -110,14 +115,15 @@ void Player::build_top_bar(float& out_height){
         IconButtonResult r = icon_button("##open_btn", ImVec2(btn_w, btn_h), ui::AppIcon::OpenFile, export_nav_disabled);
         if (r.clicked) {
             if (export_mode_) ui_intents_.export_exit = true; // open exits the export page first
+            if (browser_page_) exit_browser_page(); // ...and the browser page too
             record_open_dialog();
         }
         if (ImGui::IsItemHovered() && !ui_str_.open_file.empty())
             ImGui::SetTooltip("%s", ui_str_.open_file.c_str());
     }
     ImGui::SameLine();
-    { // Network URL open: opens the ImGui URL popup (build_open_url_popup); on confirm
-      // writes open_path for Python.
+    { // Network URL page (build_browser_page): the address bar + embedded page view. Already
+      // on the page -> the entry point just puts the caret back in the address bar.
         IconButtonResult r = icon_button("##open_url_btn", ImVec2(btn_w, btn_h), ui::AppIcon::OpenUrl, export_nav_disabled);
         if (r.clicked) {
             if (export_mode_) ui_intents_.export_exit = true; // URL open exits the export page first
@@ -131,6 +137,7 @@ void Player::build_top_bar(float& out_height){
         IconButtonResult r = icon_button("##stream_btn", ImVec2(btn_w, btn_h), ui::AppIcon::WebServer, export_nav_disabled);
         if (r.clicked) {
             if (export_mode_) ui_intents_.export_exit = true; // web server exits the export page first
+            if (browser_page_) exit_browser_page(); // modal would sit behind the page view
             request_stream_popup();
         }
         if (ImGui::IsItemHovered() && !ui_str_.stream_server.empty())
@@ -141,6 +148,7 @@ void Player::build_top_bar(float& out_height){
       // when already in it); disabled while an export is running.
         IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h), ui::AppIcon::Export, export_nav_disabled);
         if (r.clicked) {
+            if (browser_page_) exit_browser_page(); // export screen replaces the page view
             if (export_mode_) ui_intents_.export_exit = true;
             else ui_intents_.export_enter = true;
         }

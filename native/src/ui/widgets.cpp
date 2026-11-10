@@ -674,7 +674,7 @@ void Spinner(const char* id){
     const ImVec2 center((lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f);
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // Soft track + rotating head arc (verbatim from the open-URL loading card).
+    // Soft track + rotating head arc (verbatim from the retired open-URL loading card).
     constexpr float kPi = 3.14159265f;
     dl->PathClear();
     dl->PathArcTo(center, r, 0.0f, kPi * 2.0f, 48);

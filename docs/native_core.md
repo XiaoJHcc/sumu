@@ -23,7 +23,17 @@ native/
                          角形 + PSMain_NV12 BT.709 limited-range 转换 + PSMain_AI 直通采样）。
   src/decoder.h/.cpp      在 Spike 0/2 的 Decoder 基础上新增 seek_to_frame()、width()/
                          height()/frame_count()。
-  src/player.cpp          晋升后的主体：Player 类 + pybind11 模块 sumu_core。
+  src/player.h            Player 类完整声明（UiIntents / UiStrings / 各 build_* 与状态）
+  src/player_session.cpp  会话生命周期 open/reopen/close、UI 状态机、set_ui_strings、
+                          take_ui_intents（含浏览器页的进出/交接）
+  src/player_window.cpp   Win32 窗口 + WndProc、全屏、DWM chrome、ImGui 初始化
+  src/player_engine.cpp   解码/present/seek/缩略图 scrub 等引擎侧逻辑
+  src/player_audio.cpp    WASAPI 音频线程与端点恢复
+  src/player_ui_*.cpp     ImGui 界面层（overlays=首屏/浏览器页/弹窗、bars=顶底栏+设置、
+                          export=导出页）
+  src/browser_view.h/.cpp 内嵌 WebView2 页视图（windowed child controller）。WebView2 SDK
+                          头只出现在这里，Player 只持 forward-declared unique_ptr
+  src/player_pybind.cpp   pybind11 模块定义 sumu_core。
   smoke_player.py         三项验证场景的驱动脚本（见下文"验证结果"）。
 python/sumu/
   sumu_core.cp313-win_amd64.pyd  + avcodec/avformat/avutil/avdevice/avfilter/swresample/
@@ -39,13 +49,26 @@ p = sumu_core.Player(width_hint=1920, height_hint=1080, maximized=False)  # 窗�
                                                                             # 无关（shader 的 UV
                                                                             # 拉伸采样已完全解耦
                                                                             # 二者）
-p.open(path)            # 打开视频，探测 fps/宽高/帧数，起 decode+present 两个线程，初始暂停于帧 0
+p.open(path, headers="", cookies="")   # 打开视频，探测 fps/宽高/帧数，起 decode+present 两个
+                                       # 线程，初始暂停于帧 0。headers/cookies 仅供网络源：
+                                       # 浏览器页捕获的请求上下文（FFmpeg "headers"/"cookies"
+                                       # 选项），本地/普通直链 open 一律留空
+p.reopen(path, headers="", cookies="") # 运行时换片（present/窗口不重建），参数同上
 p.play() / p.pause() / p.is_playing()
 actual_frame = p.seek(frame_num)   # 见下文，返回真正落地的帧号（锚定真实解码 PTS，I5）
 p.push_ai_frame(frame_num, cuda_dev_ptr, width, height, pitch_bytes)
 p.current_frame() / p.frame_count() / p.fps() / p.dims()
 p.ai_hit_rate() / p.stats() / p.present_stats() / p.dump_present_trace(path)
-p.pump_messages() / p.should_quit()   # Win32 消息泵，需在主线程周期调用
+p.pump_messages() / p.should_quit()   # Win32 消息泵，需在主线程周期调用（WebView2 的异步
+                                      # 回调也只在这条消息泵上派发）
+# ---- 浏览器页（URL 页 + WebView2 内嵌页）----
+p.request_open_url_popup()  # 进入浏览器页（首屏/顶栏入口；不再弹 modal），记录 browser_enter
+p.exit_browser_page()       # 退出浏览器页（隐藏子窗口），记录 browser_exit
+p.browser_navigate(url)     # 地址栏「访问」：媒体直链走原生 open，其余交给 WebView2 导航
+p.browser_play_native()     # 地址栏「原生播放」：取页面捕获的媒体地址 + Referer/UA + cookies
+                            # 后写 open_path/open_headers/open_cookies
+p.browser_state()           # 页视图状态 dict（page/web/available/failed/url/candidate/
+                            # referer/loading/muted/cookie_pending）
 p.set_park_on_close(on)      # 关窗驻留开关：on 时 X/ESC 不再直接退出，而是经
                              # take_ui_intents() 的 close_request 交给 Python 决定驻留/退出
 p.hide_window() / p.show_window()   # 驻留：隐藏窗口 / 恢复并前台化（present 保持运行，
@@ -66,6 +89,69 @@ finally 真正退出（此时才"卸载模型"）。
 注意：驻留期间 present 线程保持正常运行（向隐藏窗口渲染 splash，开销可忽略）。曾尝试让 present
 在隐藏时空转休眠，结果驻留后的 open 稳定报 `DXGI_ERROR_DEVICE_REMOVED` /
 `CUDA_ERROR_INVALID_HANDLE`（需 torch 驻留才复现）——不要改回。
+
+## 内嵌浏览器页（WebView2）
+
+URL 页（首屏「打开 URL」/ 顶栏 link 图标）不是弹窗，而是独立页面：主标题栏 + 地址栏 +
+页面区；页面区可以是 WebView2 的 windowed child window。实现分两半：
+
+- `native/src/browser_view.h/.cpp`：唯一的 WebView2 使用者。`CreateCoreWebView2Environment-
+  WithOptions` → `CreateCoreWebView2Controller(parent_hwnd)`，一次只建一个 controller；
+  只做只读导航 + 只读请求观测（`WebResourceRequested`，不改响应/不改请求）。不注入 JS、
+  不注册 web message、不开 host object，`AreHostObjectsAllowed/IsWebMessageEnabled` 显式关闭。
+- Player 侧（`player_session.cpp` 状态机 + `build_browser_page()` 布局）：页面进出、
+  地址栏/表单 buffer、打开交接与 loading/cancel 状态。
+
+**构建 / 运行依赖**：构建期用 NuGet SDK（`Microsoft.Web.WebView2`，CMake 依次查
+`native/third_party/webview2/package`、`%NUGET_PACKAGES%`、`%USERPROFILE%\.nuget\packages`，
+都没有就按固定版本下载解压到 `native/third_party/webview2`，见 `native/CMakeLists.txt`），
+链接**静态** `WebView2LoaderStatic.lib`；运行期只依赖系统 Evergreen WebView2 Runtime，包内
+不携带任何 WebView2 DLL（见 `docs/packaging.md`）。
+
+**线程与生命周期**：controller 的创建、所有事件回调、销毁全部在 Python 主线程（消息泵在
+`pump_messages()`）。`BrowserView` 内部不跨线程加锁：WebView2 把异步回调派发到创建它的
+线程。`Player::close()` 在 `ui_shutdown()`/`DestroyWindow` **之前**调 `BrowserView::shutdown()`
+（`controller->Close()` + 事件注销 + COM 反初始化），并把共享的 alive 标志置 false，晚到的
+回调直接返回。COM 按 `CoInitializeEx(STA)` 的返回值配对：`S_OK`/`S_FALSE` 才在退出时
+`CoUninitialize`，`RPC_E_CHANGED_MODE` 报告页面不可用而**不**去反初始化别人的 apartment。
+
+**Cookie 交接不走回调**：`request_cookies()` 发起 `CookieManager::GetCookies`，结果存在
+BrowserView 自己的槽里，由 Player 每帧 `take_cookies()` 取。回调因此永远不触碰 Player
+（关闭/换页后晚到的答案只会在自己的槽里被丢弃），比"回调里写 Player 成员"少一整类生命周期
+风险。生命周期规则（三条缺一不可）：
+
+- **每个出口都必须收尾**：controller 未就绪、`ICoreWebView2_2`/`CookieManager` 取不到、
+  `GetCookies` 立即失败、`GetCookies` 回调返回错误——全部 `publish_cookies(url, 空 jar)`，
+  照常交给 open 处理。真实"没有 Cookie 可重放"和"查询失败"对下游是同一种结果，绝不会让
+  加载态/播放按钮永久卡住。
+- **代际令牌**：每次 `request_cookies()`/`cancel_cookies()` 都 `++cookie_gen_`，回调捕获发起时
+  的代际，不匹配就静默丢弃。重复请求同一 URL、先取消再请求，都不会被旧答案顶替。
+- **后发动作胜出**：换候选（`record_candidate`）、清候选（`clear_candidate`）、退出网页、
+  `BrowserView::shutdown()`、以及 Player 的 `begin_native_open()`（即任何新的原生 open，
+  含地址栏直链）都会 `cancel_cookies()`——同时作废在飞查询与尚未被取走的答案。Player 侧
+  `browser_cookie_pending_` 每帧还会用 `browser_cookie_url_` 与当前候选比对，不一致或
+  BrowserView 已不再等待时立即停止等待，不会残留 true。
+
+**页面视图的静音联动**：`set_visible()`/`apply_bounds()` 在切换可见性时同时调用
+`ICoreWebView2_8::put_IsMuted(!visible)`——加载卡片/关闭网页/窗口驻留时网页自身的声音必须停，
+否则会和恢复的旧视频或新起的原生播放叠在一起；重新显示即取消静音（取不到该接口的老
+Runtime 安全跳过，`browser_state()['muted']` 反映最后一次成功应用的状态）。
+
+**媒体候选**：`WebResourceRequested` 里按 `browser::looks_like_media_url()` 过滤（http(s)
+且**路径**扩展名属 mp4/m3u8/mpd/webm/mov/mkv；查询串/域名不参与判定；m4s/ts 等分片不算），
+记录最新一条的 URL + `Referer` + `User-Agent`（缺 Referer 时用当前页地址）。用户点「原生
+播放」时才取 Cookie，然后写 `UiIntents.open_path/open_headers/open_cookies`；地址栏里直接
+输入的媒体直链走同一 open 通道但不带这些头。
+
+**打开/失败语义**：原生 open 期间页面显示原 loading（spinner + Cancel，`cancel_open_url()`
+仍中断阻塞中的 `avformat_open_input`）；`notify_open_url_finished(True)` 退出浏览器页（视频
+接管客户区），失败则留在页面上显示 `open_url_load_failed`（网页可见时是地址栏下方一条
+独立错误行，网页整体下移它的高度——因为子窗口盖不住 ImGui）。进入浏览器页记
+`browser_enter`，Python 据此暂停并记住"进入前是否在播"；退出记 `browser_exit`，仅当仍是
+同一会话且仍未播放时恢复。
+
+**不可用降级**：Runtime 缺失/创建失败只会让页面显示 `browser_unavailable` 一行文字；
+Player 构造、退出、本地文件与媒体直链的原生打开都不经过 WebView2。
 
 ## 线程/锁模型（继承 Spike 2，新增 `decoder_mutex_`/`trace_mutex_`）
 

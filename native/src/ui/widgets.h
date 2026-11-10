@@ -135,7 +135,7 @@ void EndCard();
 // height == 0 uses the standard frame height.
 void ProgressBar(float frac, float width = 0.0f, float height = 0.0f, const char* overlay = "");
 
-// Rotating-arc spinner (extracted from the open-URL modal's loading card). Radius is
+// Rotating-arc spinner (extracted from the retired open-URL modal's loading card). Radius is
 // frame-height derived; `id` only feeds the layout item's ID.
 void Spinner(const char* id);
 

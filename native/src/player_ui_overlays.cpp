@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
+#include "browser_view.h" // BrowserView (page-view placement + media candidate)
 #include "imgui_internal.h" // ImGui::GetInputTextState -- URL field right-click menu
 
 // ---- product UI (M3) -- built on the main thread inside ui_tick(), between NewFrame()
@@ -19,6 +20,13 @@ void Player::build_ui(){
         build_export_screen(top_bar_h);
         build_export_preset_editor(); // modal above the screen (when open)
         build_status_float();
+        return;
+    }
+    // Embedded browser page: the title bar stays, the page owns everything below it (its own
+    // address bar + the WebView2 child window / first-screen form). Nothing else may draw
+    // into that area -- the page view is a real child window and would cover it.
+    if (browser_page_) {
+        build_browser_page();
         return;
     }
     // M-C1 / warmup-UX: no session open yet (or one was just closed) -- the normal
@@ -45,7 +53,6 @@ void Player::build_ui(){
         if (ui_settings_open_) build_settings_panel(top_bar_h);
         build_bottom_bar();
     }
-    build_open_url_popup(); // modal above chrome; first-screen + live session both use it
     build_stream_popup(); // web-stream server modal (port + root + start/stop)
     build_status_float(); // model-warmup status line -- drawn in every branch above
 }
@@ -240,176 +247,32 @@ void Player::build_open_prompt_overlay(float top_bar_h){
     ImGui::PopStyleColor(); // WindowBg (kPanelBg first-screen background)
 }
 
-// Open-URL modal: first-screen "打开 URL" button and top-bar link icon both call
-// request_open_url_popup(). Confirm trims the buffer, requires http(s)://, then writes
-// ui_intents_.open_path so Python reuses the existing drop/open path (do_open/do_reopen).
-// Popup stays open in a loading state until Python calls notify_open_url_finished -- keeps
-// the float responsive during network open (no main-thread freeze). Loading-state Cancel
-// interrupts the blocked FFmpeg open (cancel_open_url → Decoder AVIOInterruptCB); the worker
-// then unwinds through the normal failure path and Python reaps it as a SILENT cancellation
-// (open_url_cancel_requested()) -- back to the form with the URL kept, no load-error line.
-// (No loading-state Esc: window-level WM_KEYDOWN VK_ESCAPE is a deliberate global quit/park
-// escape hatch that must never be swallowed by a widget, see player_window.cpp.)
-// Popup id uses ### so the i18n title can change without breaking OpenPopup matching.
-// Form chrome is the shared ui::BeginModal/EndModal (title strip + close X + border);
-// the loading state keeps its own compact chromeless card (deliberately no title strip).
-void Player::build_open_url_popup(){
-    if (open_url_popup_) {
-        ImGui::OpenPopup("###sumu_open_url");
-        open_url_popup_ = false; // OpenPopup is sticky until EndPopup; re-arm only on next request
+// ---- shared single-line URL field ---------------------------------------------------------
+// The browser page's address bar and its first-screen form each own a buffer + ImGui id and
+// both render through this one helper: the right-click menu (Cut/Copy/Paste/Paste&Open/Select
+// All, drawn in the combo dropdown language -- the stock MenuItem popup looks off-theme) is
+// written once instead of twice. Two separate buffers (not one shared field) is deliberate:
+// a single buffer would give the two fields two ImGuiInputTextStates over the same text, so a
+// cursor/selection edit in one would be clobbered by the other's stale state in the same frame.
+// Right-click does NOT activate an ImGui field, so a null state falls back to whole-buffer
+// operations; selection indices are byte offsets into the buffer.
+Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, float width,
+                                         bool* focus_pending, bool* select_all_pending){
+    UrlFieldResult out;
+    const bool want_select_all = select_all_pending && *select_all_pending;
+    // "Select All" from an inactive field's menu: focus now, select next frame (the state only
+    // exists once the field is active) -- the same two-frame pattern the focus flag uses.
+    if ((focus_pending && *focus_pending) || want_select_all) ImGui::SetKeyboardFocusHere();
+    if (focus_pending) *focus_pending = false;
+
+    bool enter = ui::TextInput(id, buf, cap, nullptr, width, ImGuiInputTextFlags_EnterReturnsTrue);
+    const ImGuiID item_id = ImGui::GetItemID();
+    out.active = ImGui::GetActiveID() == item_id;
+    if (want_select_all) {
+        *select_all_pending = false;
+        if (ImGuiInputTextState* st = ImGui::GetInputTextState(item_id)) st->SelectAll();
     }
 
-    // ---- loading: compact card -- centered spinner + Cancel (aborts the network open) ----
-    if (open_url_loading_) {
-        ImGuiIO& io = ImGui::GetIO();
-        // Fixed width + auto height (Cancel button below the spinner grew the card beyond
-        // the old 112px square); force center every frame or the card stays stuck at the
-        // form's old top-left.
-        const float card_w = ui_s(200.0f);
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSizeConstraints(ImVec2(card_w, 0.0f), ImVec2(card_w, FLT_MAX));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(ui::theme::kRadiusWindow));
-        // Horizontal padding stays 0 so the manual centering math below is in window coords.
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, ui_s(28.0f)));
-        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f); // border self-drawn below
-        ImGui::PushStyleColor(ImGuiCol_PopupBg, ui::theme::kPanelBg);
-        // ModalWindowDimBg needs no push: apply_theme() already installed theme::kDimBg.
-        ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_AlwaysAutoResize;
-        // Same "###sumu_open_url" ID as the form's BeginModal title below (same window).
-        if (ImGui::BeginPopupModal("###sumu_open_url", nullptr, flags)) {
-            // Center the spinner; its layout item is 2r+th on a side (see ui::Spinner).
-            const float r = ImGui::GetFrameHeight() * 0.65f;
-            const float d = r * 2.0f + std::max(1.5f, r / 6.0f);
-            ImGui::SetCursorPosX((card_w - d) * 0.5f);
-            ui::Spinner("##open_url_spinner");
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            // Cancel: interrupt the blocked FFmpeg open; the card stays up (button greyed)
-            // until the worker unwinds and Python calls notify_open_url_finished().
-            const bool cancelling = open_cancel_requested_.load(std::memory_order_relaxed);
-            const float btn_w = ui_s(88.0f);
-            ImGui::SetCursorPosX((card_w - btn_w) * 0.5f);
-            ImGui::BeginDisabled(cancelling);
-            if (ui::Button(
-                    ui_str_.open_url_cancel.empty() ? "Cancel" : ui_str_.open_url_cancel.c_str(),
-                    ui::ButtonVariant::Secondary, ui::ControlSize::Regular, btn_w)) {
-                cancel_open_url();
-            }
-            ImGui::EndDisabled();
-
-            // Same self-drawn 1px border language as ui::EndModal (foreground list).
-            const ImVec2 a = ImGui::GetWindowPos();
-            const ImVec2 b(a.x + ImGui::GetWindowSize().x, a.y + ImGui::GetWindowSize().y);
-            ImGui::GetForegroundDrawList()->AddRect(
-                ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
-                ui::theme::border_strong_u32(), ui_s(ui::theme::kRadiusWindow), 0, 1.0f);
-            ImGui::EndPopup();
-        }
-        ImGui::PopStyleColor(1);
-        ImGui::PopStyleVar(3);
-        return;
-    }
-
-    // ---- input form (title strip + field + buttons) via the shared modal chrome ----
-    // ID after ### matches OpenPopup("###sumu_open_url"); BeginModal strips it for display.
-    bool open = true;
-    const std::string modal_title =
-        (ui_str_.open_url_title.empty() ? std::string("Open URL") : ui_str_.open_url_title)
-        + "###sumu_open_url";
-    if (!ui::BeginModal(modal_title.c_str(), &open)) return;
-    if (!open) { // closed via the strip's X or Esc
-        open_url_show_error_ = false;
-        open_url_show_load_error_ = false;
-    }
-
-    // Success path: close after the modal is open this frame (CloseCurrentPopup is frame-local).
-    if (open_url_close_pending_) {
-        open_url_close_pending_ = false;
-        ImGui::CloseCurrentPopup();
-    }
-
-    // BeginModal pins the window width and insets the body by kPaddingContainer on all
-    // four sides, and presets the item width to the full content column.
-    const float pad = ui_s(ui::theme::kPaddingContainer);
-    const float content_w = ui_s(ui::theme::kModalContentW);
-
-    auto trim_url = [](const char* raw) -> std::string {
-        std::string s(raw ? raw : "");
-        // Strip leading/trailing whitespace and common surrounding quotes from paste.
-        auto is_ws = [](unsigned char c) {
-            return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-        };
-        size_t a = 0, b = s.size();
-        while (a < b && is_ws(static_cast<unsigned char>(s[a]))) ++a;
-        while (b > a && is_ws(static_cast<unsigned char>(s[b - 1]))) --b;
-        s = s.substr(a, b - a);
-        if (s.size() >= 2) {
-            char q0 = s.front(), q1 = s.back();
-            if ((q0 == '"' && q1 == '"') || (q0 == '\'' && q1 == '\''))
-                s = s.substr(1, s.size() - 2);
-        }
-        return s;
-    };
-    auto looks_http = [](const std::string& s) {
-        if (s.size() < 8) return false;
-        // Case-insensitive scheme check without locale-dependent tolower on the whole string.
-        auto eq_ci = [](char a, char b) {
-            auto up = [](char c) {
-                return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-            };
-            return up(a) == up(b);
-        };
-        const char* http = "http://";
-        const char* https = "https://";
-        bool is_http = true, is_https = true;
-        for (int i = 0; http[i]; ++i)
-            if (i >= static_cast<int>(s.size()) || !eq_ci(s[static_cast<size_t>(i)], http[i]))
-                is_http = false;
-        for (int i = 0; https[i]; ++i)
-            if (i >= static_cast<int>(s.size()) || !eq_ci(s[static_cast<size_t>(i)], https[i]))
-                is_https = false;
-        return is_http || is_https;
-    };
-
-    if (!ui_str_.open_url_hint.empty()) {
-        ImGui::PushFont(nullptr, kFontSizeSm); // secondary copy (hint)
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + content_w);
-        ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
-        ImGui::Spacing();
-    }
-
-    if (open_url_focus_ || open_url_select_all_pending_) {
-        ImGui::SetKeyboardFocusHere();
-        open_url_focus_ = false;
-    }
-    bool enter = ui::TextInput("##open_url_input", open_url_buf_, sizeof(open_url_buf_),
-        nullptr, 0.0f, ImGuiInputTextFlags_EnterReturnsTrue);
-    const ImGuiID url_input_id = ImGui::GetItemID();
-    if (open_url_select_all_pending_) {
-        // Deferred "Select All" from the context menu on an inactive field: the keyboard
-        // focus above just activated it this frame, so the state exists now.
-        open_url_select_all_pending_ = false;
-        if (ImGuiInputTextState* st = ImGui::GetInputTextState(url_input_id))
-            st->SelectAll();
-    }
-
-    // Right-click context menu: Cut/Copy/Paste/Paste&Open/Select All, drawn in the ui::Combo
-    // dropdown language (rounded kPanelBg panel, 4px padding, flat rows with a hover fill,
-    // self-drawn hairline border) -- the stock MenuItem popup looks off-theme. Only
-    // currently-actionable items are listed (unavailable ones are hidden, not greyed), so
-    // the menu simply does not open when nothing applies. ImGui's InputText has Ctrl+X/C/V
-    // but no built-in menu; ImGuiInputTextState (imgui_internal.h) exposes the cursor and
-    // selection for precise edits -- selection indices are byte offsets into the buffer.
-    // Right-click does NOT activate the field (ImGui activates on left click only), so a
-    // NULL state falls back to whole-buffer operations.
     const char* cut_label = ui_str_.input_cut.empty() ? "Cut" : ui_str_.input_cut.c_str();
     const char* copy_label = ui_str_.input_copy.empty() ? "Copy" : ui_str_.input_copy.c_str();
     const char* paste_label = ui_str_.input_paste.empty() ? "Paste" : ui_str_.input_paste.c_str();
@@ -417,58 +280,60 @@ void Player::build_open_url_popup(){
         ui_str_.input_paste_open.empty() ? "Paste & Open" : ui_str_.input_paste_open.c_str();
     const char* sel_all_label =
         ui_str_.input_select_all.empty() ? "Select All" : ui_str_.input_select_all.c_str();
-    ImGuiInputTextState* url_st = ImGui::GetInputTextState(url_input_id);
-    const bool url_has_sel = url_st && url_st->HasSelection();
-    const size_t url_buf_len = std::strlen(open_url_buf_);
-    const char* url_clip = ImGui::GetClipboardText();
-    const bool url_clip_avail = url_clip && url_clip[0];
+    ImGuiInputTextState* st = ImGui::GetInputTextState(item_id);
+    const bool has_sel = st && st->HasSelection();
+    const size_t buf_len = std::strlen(buf);
+    const char* clip = ImGui::GetClipboardText();
+    const bool clip_avail = clip && clip[0];
 
+    // Only currently-actionable items are listed (unavailable ones are hidden, not greyed), so
+    // the menu simply does not open when nothing applies.
     struct CtxItem { const char* label; int action; };
-    CtxItem ctx_items[5];
-    int ctx_item_count = 0;
-    if (url_has_sel) ctx_items[ctx_item_count++] = { cut_label, 0 };
-    if (url_has_sel || url_buf_len > 0) ctx_items[ctx_item_count++] = { copy_label, 1 };
-    if (url_clip_avail) {
-        ctx_items[ctx_item_count++] = { paste_label, 2 };
-        ctx_items[ctx_item_count++] = { paste_open_label, 4 };
+    CtxItem items[5];
+    int item_count = 0;
+    if (has_sel) items[item_count++] = { cut_label, 0 };
+    if (has_sel || buf_len > 0) items[item_count++] = { copy_label, 1 };
+    if (clip_avail) {
+        items[item_count++] = { paste_label, 2 };
+        items[item_count++] = { paste_open_label, 4 };
     }
-    if (url_buf_len > 0) ctx_items[ctx_item_count++] = { sel_all_label, 3 };
+    if (buf_len > 0) items[item_count++] = { sel_all_label, 3 };
 
-    // Shared by 粘贴 (replace selection / append when inactive) and 粘贴并打开 (whole field).
+    // Replace the selection (or the whole field for 粘贴并打开; append when the field was never
+    // activated, since InputText re-reads the buffer every frame in that case).
     auto paste_clipboard = [&](bool replace_all) {
-        // Single-line field: strip CR/LF from the clipboard text before inserting.
-        std::string ins(url_clip);
+        std::string ins(clip);
         ins.erase(std::remove_if(ins.begin(), ins.end(),
                       [](char c) { return c == '\r' || c == '\n'; }),
             ins.end());
-        std::string s(open_url_buf_);
+        std::string s(buf);
         size_t cursor;
         if (replace_all) {
             s = ins;
             cursor = s.size();
-        } else if (url_st) {
-            const int a = url_st->GetSelectionStart(), b = url_st->GetSelectionEnd();
+        } else if (st) {
+            const int a = st->GetSelectionStart(), b = st->GetSelectionEnd();
             s.replace(static_cast<size_t>(a), static_cast<size_t>(b - a), ins);
             cursor = static_cast<size_t>(a) + ins.size();
         } else {
-            s += ins; // inactive field: append (InputText re-reads buf every frame)
+            s += ins;
             cursor = s.size();
         }
-        if (s.size() >= sizeof(open_url_buf_)) {
-            s.resize(sizeof(open_url_buf_) - 1);
+        if (s.size() >= cap) {
+            s.resize(cap - 1);
             cursor = std::min(cursor, s.size());
         }
-        std::memcpy(open_url_buf_, s.c_str(), s.size() + 1);
-        if (url_st) {
-            url_st->WantReloadUserBuf = true;
-            url_st->ReloadSelectionStart = url_st->ReloadSelectionEnd = static_cast<int>(cursor);
+        std::memcpy(buf, s.c_str(), s.size() + 1);
+        if (st) {
+            st->WantReloadUserBuf = true;
+            st->ReloadSelectionStart = st->ReloadSelectionEnd = static_cast<int>(cursor);
         }
     };
 
     const float ctx_pad_x = ui_s(10.0f);
     float ctx_label_w = 0.0f;
-    for (int i = 0; i < ctx_item_count; ++i)
-        ctx_label_w = std::max(ctx_label_w, ImGui::CalcTextSize(ctx_items[i].label).x);
+    for (int i = 0; i < item_count; ++i)
+        ctx_label_w = std::max(ctx_label_w, ImGui::CalcTextSize(items[i].label).x);
     const float ctx_menu_w = ctx_label_w + ctx_pad_x * 2.0f + ui_s(4.0f) * 2.0f; // + WindowPadding
     ImGui::SetNextWindowSizeConstraints(ImVec2(ctx_menu_w, 0.0f), ImVec2(ctx_menu_w, FLT_MAX));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(4.0f), ui_s(4.0f)));
@@ -476,17 +341,17 @@ void Player::build_open_url_popup(){
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f); // border self-drawn below
     ImGui::PushStyleColor(ImGuiCol_PopupBg, ui::theme::kPanelBg);
     int ctx_action = -1; // 0=cut 1=copy 2=paste 3=select-all 4=paste&open; applied below
-    if (ctx_item_count > 0 && ImGui::BeginPopupContextItem("##open_url_ctx")) {
+    if (item_count > 0 && ImGui::BeginPopupContextItem("##url_ctx")) {
         ImDrawList* pdl = ImGui::GetWindowDrawList();
         const float row_h = ImGui::GetFrameHeight();
         const float row_w = ImGui::GetContentRegionAvail().x;
         const float th = ImGui::GetTextLineHeight();
-        for (int i = 0; i < ctx_item_count; ++i) {
+        for (int i = 0; i < item_count; ++i) {
             ImGui::PushID(i);
             ImGui::InvisibleButton("##row", ImVec2(row_w, row_h));
             const bool rhover = ImGui::IsItemHovered();
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                ctx_action = ctx_items[i].action;
+                ctx_action = items[i].action;
                 ImGui::CloseCurrentPopup();
             }
             const ImVec2 rmin = ImGui::GetItemRectMin();
@@ -494,7 +359,7 @@ void Player::build_open_url_popup(){
                 pdl->AddRectFilled(rmin, ImGui::GetItemRectMax(),
                     ui::theme::hover_fill_u32(), ui_s(ui::theme::kRadiusControl));
             pdl->AddText(ImVec2(rmin.x + ctx_pad_x, rmin.y + (row_h - th) * 0.5f),
-                ui::theme::text_u32(), ctx_items[i].label);
+                ui::theme::text_u32(), items[i].label);
             ImGui::PopID();
         }
         // Hairline outline, same language as the combo popup / modal border.
@@ -508,89 +373,324 @@ void Player::build_open_url_popup(){
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(3);
 
-    if (ctx_action == 0) { // cut (only offered with a selection, so url_st is valid)
-        const int a = url_st->GetSelectionStart(), b = url_st->GetSelectionEnd();
-        std::string s(open_url_buf_);
+    if (ctx_action == 0) { // cut (only offered with a selection, so st is valid)
+        const int a = st->GetSelectionStart(), b = st->GetSelectionEnd();
+        std::string s(buf);
         ImGui::SetClipboardText(s.substr(a, b - a).c_str());
         s.erase(static_cast<size_t>(a), static_cast<size_t>(b - a));
-        std::memcpy(open_url_buf_, s.c_str(), s.size() + 1);
-        url_st->WantReloadUserBuf = true;
-        url_st->ReloadSelectionStart = url_st->ReloadSelectionEnd = a;
+        std::memcpy(buf, s.c_str(), s.size() + 1);
+        st->WantReloadUserBuf = true;
+        st->ReloadSelectionStart = st->ReloadSelectionEnd = a;
     } else if (ctx_action == 1) { // copy
-        if (url_has_sel) {
-            const int a = url_st->GetSelectionStart(), b = url_st->GetSelectionEnd();
-            ImGui::SetClipboardText(std::string(open_url_buf_).substr(a, b - a).c_str());
+        if (has_sel) {
+            const int a = st->GetSelectionStart(), b = st->GetSelectionEnd();
+            ImGui::SetClipboardText(std::string(buf).substr(a, b - a).c_str());
         } else {
-            ImGui::SetClipboardText(open_url_buf_);
+            ImGui::SetClipboardText(buf);
         }
     } else if (ctx_action == 2) { // paste
         paste_clipboard(false);
-    } else if (ctx_action == 3) { // select all
-        // Always defer: the context menu takes focus, and a selection set on a field
-        // that is about to deactivate would vanish with its InputTextState. Re-focus
-        // and select on the next frame (same two-frame pattern as open_url_focus_).
-        open_url_select_all_pending_ = true;
+    } else if (ctx_action == 3) { // select all -- defer, see above
+        if (select_all_pending) *select_all_pending = true;
     } else if (ctx_action == 4) { // paste & open: replace the field, then act as Enter
         paste_clipboard(true);
-        enter = true; // falls into the do_ok trim/validate/submit path below
+        out.submit_paste = true;
     }
-    if (open_url_show_error_ && !ui_str_.open_url_invalid.empty()) {
+    out.submit = enter;
+    return out;
+}
+
+// ---- embedded browser page -----------------------------------------------------------------
+// First-screen "打开 URL" and the top bar's link icon both call request_open_url_popup(), which
+// now ENTERS this page (no modal). Layout: the shared title bar on top, then a minimal address
+// bar, then the page area. The page area is either the first-screen form (nothing loaded yet),
+// the loading card, the browser_unavailable placeholder, or the live WebView2 child window --
+// which is a REAL child HWND, so nothing ImGui draws can appear on top of it: the chrome strips
+// are laid out above its rectangle and the page view is hidden while the loading card or the
+// error line is up.
+//
+// Address bar: [close page] [URL field] [go] [native play]. Media direct links (see
+// browser::looks_like_media_url) skip the page entirely and go through the normal async native
+// open; any other URL is a page for the embedded engine. Native play hands the page's own media
+// request -- URL + Referer/User-Agent + cookies -- to the same async open, which is what makes
+// hotlink/token-protected pages work without a downloader.
+void Player::build_browser_page(){
+    ImGuiIO& io = ImGui::GetIO();
+
+    // A successful open closes the page (the video owns the client area again); this runs on
+    // the tick Python's notify_open_url_finished(True) landed.
+    if (browser_close_pending_) {
+        browser_close_pending_ = false;
+        exit_browser_page();
+        return;
+    }
+    sync_browser_page();
+
+    float top_bar_h = 0.0f;
+    build_top_bar(top_bar_h);
+
+    const float addr_h = addr_bar_h();
+    const float pad = ui_s(ui::theme::kSpaceXS);
+    const float ctrl_h = std::max(1.0f, addr_h - 2.0f * pad);
+    const float ctrl_w = ctrl_h; // square icon buttons, same beat as the title bar
+    const float content_y = top_bar_h + addr_h;
+    const float content_h = std::max(0.0f, io.DisplaySize.y - content_y);
+    const bool busy = open_url_loading_;
+
+    // ---- address bar -------------------------------------------------------------------
+    {
+        ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, addr_h));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoBackground;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+            ImVec2(pad, ImGui::GetStyle().ItemSpacing.y));
+        ImGui::Begin("##sumu_browser_bar", nullptr, flags);
+        { // Bar fill + bottom hairline: same panel tone as the title bar above it.
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 p0 = ImGui::GetWindowPos();
+            const ImVec2 p1(p0.x + ImGui::GetWindowSize().x,
+                p0.y + ImGui::GetWindowSize().y);
+            dl->AddRectFilled(p0, p1, ui::theme::panel_bg_u32());
+            dl->AddLine(ImVec2(p0.x, p1.y - 0.5f), ImVec2(p1.x, p1.y - 0.5f),
+                ui::theme::border_u32());
+        }
+        ImGui::SetCursorPosY((addr_h - ctrl_h) * 0.5f);
+        { // close page (destructive-neutral: goes back to the player)
+            IconButtonResult r = icon_button("##browser_close", ImVec2(ctrl_w, ctrl_h),
+                ui::AppIcon::Close, busy);
+            if (r.clicked) exit_browser_page();
+            if (ImGui::IsItemHovered() && !ui_str_.browser_close.empty())
+                ImGui::SetTooltip("%s", ui_str_.browser_close.c_str());
+        }
+        ImGui::SameLine();
+        const float right_w = 2.0f * (ctrl_w + pad);
+        float field_w = ImGui::GetContentRegionAvail().x - right_w;
+        if (field_w < ui_s(80.0f)) field_w = ui_s(80.0f);
+        UrlFieldResult field;
+        ImGui::BeginDisabled(busy);
+        field = url_field("##browser_addr", browser_addr_buf_, sizeof(browser_addr_buf_),
+            field_w, &browser_addr_focus_, &browser_addr_select_all_);
+        browser_addr_active_ = field.active;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        { // go: navigate / open the address
+            IconButtonResult r = icon_button("##browser_go", ImVec2(ctrl_w, ctrl_h),
+                ui::AppIcon::OpenUrl, busy);
+            if (r.clicked) field.submit = true;
+            if (ImGui::IsItemHovered() && !ui_str_.browser_go.empty())
+                ImGui::SetTooltip("%s", ui_str_.browser_go.c_str());
+        }
+        ImGui::SameLine();
+        { // native play: only meaningful once the page requested a media URL
+            const bool have_media = browser_ && browser_->candidate().valid();
+            const bool disabled = busy || !have_media || browser_cookie_pending_;
+            IconButtonResult r = icon_button("##browser_play", ImVec2(ctrl_w, ctrl_h),
+                ui::AppIcon::Play, disabled);
+            if (r.clicked) browser_play_native();
+            if (ImGui::IsItemHovered() && !ui_str_.browser_play.empty())
+                ImGui::SetTooltip("%s", ui_str_.browser_play.c_str());
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        if (field.submit || field.submit_paste) browser_submit(browser_addr_buf_);
+    }
+
+    // A live page is only shown when nothing else has to be readable in that area; the load
+    // error line below it is a strip of its own so the page can stay up behind the message.
+    const bool show_web = browser_web_ && browser_ && browser_->ready() && !browser_failed_ &&
+        !busy;
+    float err_h = 0.0f;
+    if (show_web && open_url_show_load_error_) {
+        ImGui::PushFont(nullptr, kFontSizeSm);
+        err_h = ImGui::GetTextLineHeight() + 2.0f * pad;
+        ImGui::PopFont();
+        ImGui::SetNextWindowPos(ImVec2(0, content_y));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, err_h));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+            ImVec2(ui_s(ui::theme::kPaddingContainer), pad));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
+        ImGuiWindowFlags err_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoInputs;
+        ImGui::Begin("##sumu_browser_err", nullptr, err_flags);
+        ImGui::PushFont(nullptr, kFontSizeSm);
         ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
-        ImGui::TextUnformatted(ui_str_.open_url_invalid.c_str());
+        ImGui::TextUnformatted(ui_str_.open_url_load_failed.empty()
+            ? "Could not open this URL" : ui_str_.open_url_load_failed.c_str());
         ImGui::PopStyleColor();
-    } else if (open_url_show_load_error_) {
-        const char* err = !ui_str_.open_url_load_failed.empty()
-            ? ui_str_.open_url_load_failed.c_str()
-            : "Could not open this URL";
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
-        ImGui::TextUnformatted(err);
-        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        ImGui::End();
+        ImGui::PopStyleColor(); // WindowBg
+        ImGui::PopStyleVar();
     }
 
-    ImGui::Spacing();
-    const float btn_w = ui_s(100.0f);
-    const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
-    // Absolute X: left pad + center within content column.
-    ImGui::SetCursorPosX(pad + std::max(0.0f, (content_w - row_w) * 0.5f));
+    // ---- page area ----------------------------------------------------------------------
+    const float page_y = content_y + err_h;
+    const float page_h = std::max(0.0f, content_h - err_h);
+    if (!show_web) {
+        ImGui::SetNextWindowPos(ImVec2(0, page_y));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, page_h));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        // Same card color as the first screen (kPanelBg) -- the page area is one surface.
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
+        ImGui::Begin("##sumu_browser_page", nullptr, flags);
 
-    bool do_ok = enter;
-    if (ui::Button(ui_str_.open_url_ok.empty() ? "Open" : ui_str_.open_url_ok.c_str(),
-            ui::ButtonVariant::Primary, ui::ControlSize::Regular, btn_w)) {
-        do_ok = true;
-    }
-    ImGui::SameLine();
-    if (ui::Button(ui_str_.open_url_cancel.empty() ? "Cancel" : ui_str_.open_url_cancel.c_str(),
-            ui::ButtonVariant::Secondary, ui::ControlSize::Regular, btn_w)) {
-        open_url_show_error_ = false;
-        open_url_show_load_error_ = false;
-        ImGui::CloseCurrentPopup();
-    }
-
-    if (do_ok) {
-        std::string url = trim_url(open_url_buf_);
-        if (!looks_http(url)) {
-            open_url_show_error_ = true;
-            open_url_show_load_error_ = false;
+        if (busy) {
+            // Loading state (native open in flight): spinner + Cancel, centered. Cancel
+            // interrupts the blocked FFmpeg open (cancel_open_url -> AVIOInterruptCB); the
+            // button greys out until Python calls notify_open_url_finished().
+            const float card_w = ui_s(200.0f);
+            const float r = ImGui::GetFrameHeight() * 0.65f;
+            const float d = r * 2.0f + std::max(1.5f, r / 6.0f);
+            const float btn_w = ui_s(88.0f);
+            const float block_h = d + ui_s(ui::theme::kSpaceL) * 2.0f +
+                ui::theme::kControlHeight * ui_s(1.0f);
+            float y = (page_h - block_h) * 0.5f;
+            if (y < 0.0f) y = 0.0f;
+            ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - d) * 0.5f, y));
+            ui::Spinner("##browser_loading");
+            const bool cancelling = open_cancel_requested_.load(std::memory_order_relaxed);
+            ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - btn_w) * 0.5f,
+                y + d + ui_s(ui::theme::kSpaceL) * 2.0f));
+            ImGui::BeginDisabled(cancelling);
+            if (ui::Button(ui_str_.open_url_cancel.empty() ? "Cancel"
+                                                          : ui_str_.open_url_cancel.c_str(),
+                    ui::ButtonVariant::Secondary, ui::ControlSize::Regular, btn_w))
+                cancel_open_url();
+            ImGui::EndDisabled();
+        } else if (browser_failed_) {
+            const char* text = ui_str_.browser_unavailable.empty()
+                ? "Embedded browser unavailable" : ui_str_.browser_unavailable.c_str();
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
+            const ImVec2 tsize = ImGui::CalcTextSize(text);
+            ImGui::SetCursorPos(ImVec2(std::max(0.0f, (io.DisplaySize.x - tsize.x) * 0.5f),
+                std::max(0.0f, (page_h - tsize.y) * 0.5f)));
+            ImGui::TextUnformatted(text);
+            ImGui::PopStyleColor();
         } else {
-            // Keep popup open → spinner loading card; Python opens async and calls
-            // notify_open_url_finished when done.
-            open_url_show_error_ = false;
-            open_url_show_load_error_ = false;
-            open_url_loading_ = true;
-            if (url.size() >= sizeof(open_url_buf_))
-                url.resize(sizeof(open_url_buf_) - 1);
-            std::memcpy(open_url_buf_, url.c_str(), url.size() + 1);
-            record_open_path(url);
+            // First-screen form (the old URL modal's content, now a page): title, hint, field,
+            // open/cancel. Purely local state -- nothing here touches the page view.
+            const float form_w = ui_s(ui::theme::kModalContentW);
+            const float hint_w = form_w;
+            const float btn_w = ui_s(100.0f);
+            const float row_w = btn_w * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+            const float gap = ui_s(ui::theme::kSpaceM);
+
+            const char* title = ui_str_.open_url_title.empty() ? "Open network URL"
+                                                              : ui_str_.open_url_title.c_str();
+            ImGui::PushFont(nullptr, kFontSizeBase);
+            const ImVec2 tsize = ImGui::CalcTextSize(title);
+            ImGui::PopFont();
+            float hint_h = 0.0f;
+            if (!ui_str_.open_url_hint.empty()) {
+                ImGui::PushFont(nullptr, kFontSizeSm);
+                hint_h = ImGui::CalcTextSize(ui_str_.open_url_hint.c_str(), nullptr, false,
+                    hint_w).y;
+                ImGui::PopFont();
+            }
+            const float field_h = ImGui::GetFrameHeight();
+            const float err_line_h = (open_url_show_error_ || open_url_show_load_error_)
+                ? ImGui::GetTextLineHeightWithSpacing() : 0.0f;
+            const float block_h = tsize.y + gap + hint_h + gap + field_h + err_line_h +
+                gap * 2.0f + ui_s(ui::theme::kControlHeight);
+            float y = (page_h - block_h) * 0.5f;
+            if (y < 0.0f) y = 0.0f;
+
+            const float x0 = (io.DisplaySize.x - form_w) * 0.5f;
+            ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, y));
+            ImGui::TextUnformatted(title);
+            y += tsize.y + gap;
+
+            if (hint_h > 0.0f) {
+                ImGui::PushFont(nullptr, kFontSizeSm);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
+                ImGui::PushTextWrapPos(x0 + hint_w);
+                ImGui::SetCursorPos(ImVec2(x0, y));
+                ImGui::TextUnformatted(ui_str_.open_url_hint.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+                y += hint_h + gap;
+            }
+
+            ImGui::SetCursorPos(ImVec2(x0, y));
+            UrlFieldResult field = url_field("##browser_home", browser_home_buf_,
+                sizeof(browser_home_buf_), form_w, &browser_home_focus_,
+                &browser_home_select_all_);
+            y += field_h;
+
+            if (open_url_show_error_) {
+                ImGui::PushFont(nullptr, kFontSizeSm);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
+                ImGui::SetCursorPos(ImVec2(x0, y));
+                ImGui::TextUnformatted(ui_str_.open_url_invalid.empty()
+                    ? "Enter a URL starting with http:// or https://"
+                    : ui_str_.open_url_invalid.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+            } else if (open_url_show_load_error_) {
+                ImGui::PushFont(nullptr, kFontSizeSm);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kError);
+                ImGui::SetCursorPos(ImVec2(x0, y));
+                ImGui::TextUnformatted(ui_str_.open_url_load_failed.empty()
+                    ? "Could not open this URL" : ui_str_.open_url_load_failed.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+            }
+            y += err_line_h + gap * 2.0f;
+
+            ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - row_w) * 0.5f, y));
+            bool submit = field.submit || field.submit_paste;
+            if (ui::Button(ui_str_.open_url_ok.empty() ? "Open" : ui_str_.open_url_ok.c_str(),
+                    ui::ButtonVariant::Primary, ui::ControlSize::Regular, btn_w))
+                submit = true;
+            ImGui::SameLine();
+            if (ui::Button(ui_str_.open_url_cancel.empty() ? "Cancel"
+                                                          : ui_str_.open_url_cancel.c_str(),
+                    ui::ButtonVariant::Secondary, ui::ControlSize::Regular, btn_w))
+                exit_browser_page();
+            if (submit) {
+                // The form submits through the address bar: same validation, same
+                // navigate-vs-native-open decision, and the bar mirrors what was submitted.
+                const size_t n = std::min(std::strlen(browser_home_buf_),
+                    sizeof(browser_addr_buf_) - 1);
+                std::memcpy(browser_addr_buf_, browser_home_buf_, n);
+                browser_addr_buf_[n] = '\0';
+                browser_submit(browser_addr_buf_);
+            }
+        }
+
+        ImGui::End();
+        ImGui::PopStyleColor(); // WindowBg
+    }
+
+    // ---- page view placement -------------------------------------------------------------
+    // The child window covers exactly the page area, below the chrome strips. Bounds/visibility
+    // are pushed every frame (both are no-ops when unchanged) so resize, DPI change, loading and
+    // hide/show transitions all land on the next tick without extra plumbing.
+    if (browser_) {
+        if (show_web) {
+            browser_->set_bounds(0, static_cast<int>(page_y),
+                static_cast<int>(io.DisplaySize.x), static_cast<int>(page_h));
+            browser_->set_visible(true);
+        } else {
+            browser_->set_visible(false);
         }
     }
-    // Esc is handled by ui::BeginModal (it closes the popup and clears `open`; the flags
-    // are reset at the top of this body when that happens).
-
-    ui::EndModal();
 }
 
 // Web-stream server modal (Phase 2): port + video-root folder + 启动/停止. Chrome is the
-// shared ui::BeginModal/EndModal (same as the open-URL modal's form: title strip + close X,
+// shared ui::BeginModal/EndModal (same chrome as every other modal: title strip + close X,
 // 8px rounding + 1px border, centered footer buttons). While running it shows the access URL
 // as a clickable link (TextLinkOpenURL → default browser) instead of the form -- no
 // persistent status float.

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
+#include "browser_view.h" // BrowserView + browser::looks_like_media_url (page view state)
 
+#include <cctype>
 #include <cstdlib>
 
 // ---- error helpers -----------------------------------------------------------------------
@@ -61,9 +63,10 @@ Player::Player(int width_hint, int height_hint, bool maximized){
 
 Player::~Player() { close(); }
 
-void Player::open(const std::string& video_path){
+void Player::open(const std::string& video_path, const std::string& headers,
+                  const std::string& cookies){
     if (opened_) throw std::runtime_error("Player.open() called twice on the same Player");
-    open_session(video_path);
+    open_session(video_path, headers, cookies);
 }
 
 // M-C1: the actual session-layer setup, split out of open() so open() can stay a thin,
@@ -73,7 +76,8 @@ void Player::open(const std::string& video_path){
 // calls this a second time on the same Player (open()'s opened_ guard above still forbids
 // it) -- runtime reopen is M-C2's job, layered on top of this split without needing to
 // revisit it.
-void Player::open_session(const std::string& video_path){
+void Player::open_session(const std::string& video_path, const std::string& headers,
+                          const std::string& cookies){
     // open()/reopen() may run off the Python main thread (async network open). Make cu_ctx_
     // current on whichever thread is building the session -- same pattern as push_ai_frame().
     if (cu_ctx_)
@@ -82,7 +86,9 @@ void Player::open_session(const std::string& video_path){
     video_path_ = video_path; // UI displays basename_of(video_path_) in the top bar
 
     std::string decode_err;
-    if (!decoder_.open(video_path, device_.Get(), decode_err))
+    // headers/cookies: the browser page's captured request context (empty for local files and
+    // plain URL opens). They only reach FFmpeg's HTTP protocol options -- never the log.
+    if (!decoder_.open(video_path, device_.Get(), decode_err, headers, cookies))
         throw std::runtime_error("decoder.open failed: " + decode_err);
     source_fps_ = decoder_.fps();
     source_frame_count_ = decoder_.frame_count();
@@ -464,7 +470,8 @@ void Player::close_session(){
 // the open-prompt overlay returns -- Python catches the exception and shows "无法打开"
 // rather than exiting the process. Deliberately does NOT try to restore the previous file
 // (would need a full re-open of a path we no longer hold a live session for).
-int64_t Player::reopen(const std::string& video_path){
+int64_t Player::reopen(const std::string& video_path, const std::string& headers,
+                       const std::string& cookies){
     require_open(); // reopen is "open a different file into an already-open Player"
 
     session_active_.store(false, std::memory_order_release);
@@ -483,7 +490,7 @@ int64_t Player::reopen(const std::string& video_path){
 
     close_session();
     try {
-        open_session(video_path);
+        open_session(video_path, headers, cookies);
     } catch (...) {
         // Previous session already closed; new one never became active. Drop opened_ so
         // play()/seek()/etc. refuse cleanly and the splash shows the open-prompt again.
@@ -540,6 +547,15 @@ void Player::close(){
 
     // Present thread (the only ImGui-touching thread) has now joined -- safe to tear down
     // ImGui's device objects/context before DestroyWindow below.
+    // The page view is closed FIRST: its child window and WebView2 process must be gone before
+    // the parent HWND is destroyed, and its async callbacks are cancelled by the same call.
+    if (browser_) {
+        browser_->shutdown();
+        browser_.reset();
+    }
+    browser_page_ = false;
+    browser_web_ = false;
+
     ui_shutdown();
 
     if (cu_ctx_) { cuCtxSetCurrent(nullptr); cuDevicePrimaryCtxRelease(cu_dev_); cu_ctx_ = nullptr; }
@@ -883,6 +899,7 @@ void Player::record_close_request() { ui_intents_.close_request = true; }
 void Player::hide_window(){
     // Just hide. Do NOT idle present_loop() here -- see park_on_close_'s comment in
     // player.h for the device-removed/invalid-handle failure that caused.
+    if (browser_) browser_->set_visible(false); // no page view floating over a hidden window
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
 }
 
@@ -1008,39 +1025,270 @@ void Player::set_export_snapshot(const py::dict& d){
     }
 }
 
+// ---- embedded browser page (URL bar + WebView2) ------------------------------------------
+//
+// request_open_url_popup() keeps the old name because it is the one entry point both the
+// first-screen button and the top bar's link icon already call; it now ENTERS the browser
+// page instead of opening a modal. The page's own state lives in player.h's browser_page_*
+// block; this section owns the transitions, the layout lives in build_browser_page()
+// (player_ui_overlays.cpp).
 void Player::request_open_url_popup(){
-    // Don't clobber an in-flight URL open (popup is already open in loading state).
-    if (open_url_loading_) return;
-    open_url_popup_ = true;
-    open_url_focus_ = true;
+    if (open_url_loading_) return; // an open is already in flight from this page
+    if (browser_page_) {           // already there: just put the caret in the address bar
+        browser_addr_focus_ = true;
+        return;
+    }
+    browser_page_ = true;
+    browser_failed_ = false;
+    browser_pending_nav_.clear();
+    browser_page_url_seen_.clear();
+    browser_addr_submitted_.clear();
+    browser_addr_focus_ = false;
+    browser_home_focus_ = false;
+    browser_addr_select_all_ = false;
+    browser_home_select_all_ = false;
+    browser_close_pending_ = false;
+    browser_cookie_pending_ = false;
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
-    open_url_close_pending_ = false;
-    open_url_select_all_pending_ = false;
     open_cancel_requested_.store(false, std::memory_order_relaxed);
-    open_url_buf_[0] = '\0';
+    browser_addr_buf_[0] = '\0';
+    browser_home_buf_[0] = '\0';
+    ensure_browser();
+    // Continuity: a page already loaded (the user closed the page earlier) comes back as-is;
+    // otherwise the page opens on its first-screen form.
+    browser_web_ = browser_ && browser_->ready() && !browser_->page_url().empty();
+    if (!browser_web_) browser_home_focus_ = true;
+    ui_intents_.browser_enter = true; // Python pauses the old session and remembers it
+}
+
+void Player::exit_browser_page(){
+    if (!browser_page_) return;
+    browser_page_ = false;
+    browser_web_ = false;
+    browser_pending_nav_.clear();
+    browser_page_url_seen_.clear();
+    browser_addr_submitted_.clear();
+    browser_close_pending_ = false;
+    browser_cookie_pending_ = false;
+    browser_cookie_url_.clear();
+    browser_addr_focus_ = false;
+    browser_home_focus_ = false;
+    open_url_show_error_ = false;
+    open_url_show_load_error_ = false;
+    if (browser_) {
+        browser_->set_visible(false);
+        browser_->clear_candidate(); // also retires any cookie handoff still in flight
+    }
+    ui_intents_.browser_exit = true; // Python restores playback if it had paused it
+}
+
+void Player::ensure_browser(){
+    if (browser_ && browser_->failed()) {
+        browser_failed_ = true;
+        return;
+    }
+    if (!browser_) browser_ = std::make_unique<BrowserView>();
+    browser_->ensure_started(hwnd_);
+    if (browser_->failed()) browser_failed_ = true;
+}
+
+// Per-frame poll of the page view (main thread, inside ui_tick()): creation result, the page
+// URL the address bar mirrors, a navigation queued while the controller was still starting,
+// and the answer to a native-play cookie lookup. Nothing here blocks.
+void Player::sync_browser_page(){
+    if (!browser_) return;
+    if (browser_->failed()) browser_failed_ = true;
+
+    // Navigation submitted before the controller finished starting.
+    if (!browser_pending_nav_.empty() && browser_->ready() && !browser_failed_) {
+        browser_->navigate(browser_pending_nav_);
+        browser_pending_nav_.clear();
+        browser_web_ = true;
+    }
+
+    // Address bar mirrors the page the engine is actually on (SourceChanged /
+    // NavigationCompleted), including redirects after a submitted address. Skipped only when
+    // the field holds text the USER typed since submitting, so a load finishing mid-edit can
+    // never yank the caret out from under them.
+    const std::string& page_url = browser_->page_url();
+    if (page_url != browser_page_url_seen_) {
+        browser_page_url_seen_ = page_url;
+        const bool user_owns_field = browser_addr_active_ &&
+            std::strcmp(browser_addr_buf_, browser_addr_submitted_.c_str()) != 0;
+        if (!page_url.empty() && !user_owns_field) {
+            const size_t n = std::min(page_url.size(), sizeof(browser_addr_buf_) - 1);
+            std::memcpy(browser_addr_buf_, page_url.c_str(), n);
+            browser_addr_buf_[n] = '\0';
+        }
+    }
+
+    // CookieManager answer for the native-play button: only consumed when it still belongs to
+    // the page and the candidate this request was made for. BrowserView retires staler answers
+    // itself (generation token), so anything that no longer names `browser_cookie_url_` is
+    // dropped here too -- a candidate/navigation switch must never leave this waiting forever.
+    if (browser_cookie_pending_) {
+        std::string url, cookies;
+        const BrowserMediaCandidate cand = browser_->candidate();
+        if (browser_->take_cookies(url, cookies)) {
+            browser_cookie_pending_ = false;
+            if (browser_page_ && cand.valid() && cand.url == url &&
+                url == browser_cookie_url_) {
+                begin_native_open(cand.url,
+                    browser_media_headers(cand.referer, cand.user_agent), cookies);
+            } else {
+                browser_cookie_url_.clear();
+            }
+        } else if (!browser_->cookie_pending() || cand.url != browser_cookie_url_) {
+            // The lookup was cancelled or belongs to a candidate that is gone: stop waiting.
+            browser_cookie_pending_ = false;
+            browser_cookie_url_.clear();
+        }
+    }
+}
+
+std::string Player::browser_media_headers(const std::string& referer,
+                                          const std::string& user_agent){
+    // FFmpeg's HTTP protocol "headers" value: CRLF-terminated "Name: value" lines.
+    std::string h;
+    if (!referer.empty()) h += "Referer: " + referer + "\r\n";
+    if (!user_agent.empty()) h += "User-Agent: " + user_agent + "\r\n";
+    return h;
+}
+
+// Hands `url` to the normal async open path (Python's do_open/do_reopen) with the request
+// context it needs, and puts the page into its loading state until Python calls
+// notify_open_url_finished(). Used by both a direct media link typed into the address bar
+// (no headers/cookies) and the native-play button (referer/UA/cookies from the page).
+void Player::begin_native_open(const std::string& url, const std::string& headers,
+                              const std::string& cookies){
+    if (url.empty()) return;
+    // Any cookie lookup still in flight belongs to the action this one supersedes (a native-play
+    // click, or an older candidate): retire it so its late answer can never start a second open
+    // and overwrite the URL/headers that are handed over right here.
+    browser_cookie_pending_ = false;
+    browser_cookie_url_.clear();
+    if (browser_) browser_->cancel_cookies();
+    const size_t n = std::min(url.size(), sizeof(browser_addr_buf_) - 1);
+    std::memcpy(browser_addr_buf_, url.c_str(), n);
+    browser_addr_buf_[n] = '\0';
+    browser_addr_submitted_ = url;
+    open_url_show_error_ = false;
+    open_url_show_load_error_ = false;
+    open_url_loading_ = true;
+    open_cancel_requested_.store(false, std::memory_order_relaxed);
+    ui_intents_.open_path = url;
+    ui_intents_.open_headers = headers;
+    ui_intents_.open_cookies = cookies;
+}
+
+// Address bar Go / first-screen form Open. A http(s) direct link whose path is a supported
+// container/playlist goes straight to the native decoder (no page view involved); everything
+// else is a page the embedded browser has to load.
+void Player::browser_submit(const std::string& raw){
+    std::string url(raw);
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    size_t a = 0, b = url.size();
+    while (a < b && is_ws(static_cast<unsigned char>(url[a]))) ++a;
+    while (b > a && is_ws(static_cast<unsigned char>(url[b - 1]))) --b;
+    url = url.substr(a, b - a);
+    // Surrounding quotes from a paste ("…"/'…').
+    if (url.size() >= 2 && ((url.front() == '"' && url.back() == '"') ||
+                            (url.front() == '\'' && url.back() == '\'')))
+        url = url.substr(1, url.size() - 2);
+
+    auto starts_with_ci = [](const std::string& s, const char* prefix) {
+        const size_t n = std::char_traits<char>::length(prefix);
+        if (s.size() < n) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower(static_cast<unsigned char>(s[i])) !=
+                std::tolower(static_cast<unsigned char>(prefix[i])))
+                return false;
+        return true;
+    };
+    if (!starts_with_ci(url, "http://") && !starts_with_ci(url, "https://")) {
+        open_url_show_error_ = true;
+        open_url_show_load_error_ = false;
+        return;
+    }
+    open_url_show_error_ = false;
+    open_url_show_load_error_ = false;
+
+    const size_t n = std::min(url.size(), sizeof(browser_addr_buf_) - 1);
+    std::memcpy(browser_addr_buf_, url.c_str(), n);
+    browser_addr_buf_[n] = '\0';
+    browser_addr_submitted_ = url; // the bar may follow this navigation (redirects included)
+    browser_page_url_seen_.clear(); // let the navigation result re-sync the bar
+
+    if (browser::looks_like_media_url(url)) {
+        begin_native_open(url, std::string(), std::string());
+        return;
+    }
+
+    ensure_browser();
+    if (browser_failed_ || !browser_) return; // page shows browser_unavailable
+    if (browser_->ready()) {
+        browser_->navigate(url);
+        browser_web_ = true;
+    } else {
+        browser_pending_nav_ = url; // controller still starting: navigate as soon as it is up
+        browser_web_ = true;
+    }
+}
+
+void Player::browser_navigate(const std::string& url){
+    if (!browser_page_) return;
+    browser_submit(url);
+}
+
+void Player::browser_play_native(){
+    if (!browser_page_ || !browser_ || browser_cookie_pending_ || open_url_loading_) return;
+    const BrowserMediaCandidate cand = browser_->candidate();
+    if (!cand.valid()) return;
+    browser_cookie_pending_ = true;
+    browser_cookie_url_ = cand.url;
+    browser_->request_cookies(cand.url);
+}
+
+py::dict Player::browser_state() const {
+    py::dict d;
+    d["page"] = browser_page_;
+    d["web"] = browser_web_;
+    d["available"] = browser_ && browser_->ready();
+    d["failed"] = browser_failed_ || (browser_ && browser_->failed());
+    d["url"] = browser_ ? browser_->page_url() : std::string();
+    d["candidate"] = browser_ ? browser_->candidate().url : std::string();
+    d["referer"] = browser_ ? browser_->candidate().referer : std::string();
+    d["loading"] = open_url_loading_;
+    // Page-view audio follows visibility (muted while hidden), and a cookie handoff is in
+    // flight while either side still waits -- both observable for scripted checks.
+    d["muted"] = browser_ && browser_->muted();
+    d["cookie_pending"] = browser_cookie_pending_ ||
+        (browser_ && browser_->cookie_pending());
+    return d;
 }
 
 // Loading-state Cancel (see player.h). The atomic store + decoder interrupt are safe to
 // do from the UI thread while the worker blocks inside avformat_open_input; the worker then
 // unwinds through the normal failure path and Python reaps it as a silent cancellation
-// (open_url_cancel_requested()). No popup close here -- the loading card greys out its
+// (open_url_cancel_requested()). No page close here -- the loading card greys out its
 // Cancel button until notify_open_url_finished() lands.
 void Player::cancel_open_url(){
     open_cancel_requested_.store(true, std::memory_order_relaxed);
     decoder_.request_interrupt();
 }
 
-// Python calls this on the main thread when an async URL open finishes. Loading keeps the
-// modal open; success closes it on the next build_open_url_popup frame; failure restores the
-// input form with a load-error line (上一步) -- unless the user cancelled (loading-state
-// loading state), which returns to the form silently. No-op if the user already cancelled
-// the modal.
+// Python calls this on the main thread when an async open finishes. Success leaves the page
+// (the new video takes over the client area); failure keeps it up showing
+// open_url_load_failed -- unless the user cancelled, which silently returns to the page.
 void Player::notify_open_url_finished(bool ok){
     const bool cancelled = open_cancel_requested_.load(std::memory_order_relaxed);
     if (ok) {
-        if (open_url_loading_)
-            open_url_close_pending_ = true;
+        // Any successful open (page handover, direct media link, or a file dropped while the
+        // page was up) hands the client area back to the video.
+        if (browser_page_) browser_close_pending_ = true;
         open_url_loading_ = false;
         open_url_show_error_ = false;
         open_url_show_load_error_ = false;
@@ -1145,6 +1393,10 @@ void Player::set_ui_strings(const py::dict& d){
     take("open_url_invalid", ui_str_.open_url_invalid);
     take("open_url_loading", ui_str_.open_url_loading);
     take("open_url_load_failed", ui_str_.open_url_load_failed);
+    take("browser_unavailable", ui_str_.browser_unavailable);
+    take("browser_go", ui_str_.browser_go);
+    take("browser_play", ui_str_.browser_play);
+    take("browser_close", ui_str_.browser_close);
     take("input_cut", ui_str_.input_cut);
     take("input_copy", ui_str_.input_copy);
     take("input_paste", ui_str_.input_paste);
@@ -1245,7 +1497,11 @@ py::dict Player::take_ui_intents(){
     d["lead"] = ui_intents_.lead.has_value() ? py::cast(*ui_intents_.lead) : py::none();
     d["target_fps"] = ui_intents_.target_fps.has_value() ? py::cast(*ui_intents_.target_fps) : py::none();
     d["open_path"] = ui_intents_.open_path; // M-C2: "" == no drop pending
+    d["open_headers"] = ui_intents_.open_headers; // page-captured HTTP headers ("" == none)
+    d["open_cookies"] = ui_intents_.open_cookies; // page-captured cookies ("" == none)
     d["open_dialog"] = ui_intents_.open_dialog; // M-C2: top-bar "open" button clicked
+    d["browser_enter"] = ui_intents_.browser_enter; // URL page opened -> pause the old session
+    d["browser_exit"] = ui_intents_.browser_exit;   // URL page closed -> restore playback
     d["close_request"] = ui_intents_.close_request; // park_on_close: X/ESC -> Python decides park vs quit
     d["compile_engine"] = ui_intents_.compile_engine; // first-screen TRT compile / retry click
     d["stream_start"] = ui_intents_.stream_start; // web-stream server: start with port/root

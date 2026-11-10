@@ -1,11 +1,16 @@
 # SPDX-FileCopyrightText: sumu Authors
 # SPDX-License-Identifier: AGPL-3.0
 #
-# Modal-padding forensics: opens each ui::BeginModal dialog (open-URL, web-server,
-# preset editor), screenshots it, and measures window width + left/right content
-# margins in PHYSICAL pixels. Baseline expectation at 150% DPI (s=1.5):
+# Modal-padding forensics: opens each ui::BeginModal dialog (web-server, preset editor),
+# screenshots it, and measures window width + left/right content margins in PHYSICAL
+# pixels. Baseline expectation at 150% DPI (s=1.5):
 #   pad = kPaddingContainer(12) * 1.5 = 18px on every side
-#   URL/web window width = 440*1.5 + 36 = 696; preset editor = 480*1.5 + 36 = 756
+#   web window width = 440*1.5 + 36 = 696; preset editor = 480*1.5 + 36 = 756
+# (On the export page the bbox scan also catches the page's OWN panel-colored cards behind
+#  the dim, so the preset-editor win_x/left numbers over-report; read its width off the PNG.)
+#
+# The open-URL form is no longer a modal -- it is the browser page (address bar + in-page
+# form + WebView2 child window), covered by scripts/shot_browser.py instead.
 #
 # The modal is the only UNDIMMED panel-colored region in the central band, so the
 # bbox of kPanelBg pixels in cx±700/cy±450 is the modal rect.
@@ -147,21 +152,14 @@ def main():
     ty = rc.top + int(18 * SCALE)
     park = (rc.left + 900, rc.top + 900)
 
-    # 1. open-URL modal (icon index 2)
-    click(icon_x(2), ty)
-    run(p, 0.8)
-    user32.SetCursorPos(*park); run(p, 0.3)
-    grab("modal_url.png")
-    escape(); run(p, 0.5)
-
-    # 2. web-server modal (icon index 3)
+    # 1. web-server modal (icon index 3; index 2 is the URL page, see shot_browser.py)
     click(icon_x(3), ty)
     run(p, 0.8)
     user32.SetCursorPos(*park); run(p, 0.3)
     grab("modal_stream.png")
     escape(); run(p, 0.5)
 
-    # 3. preset editor: enter export page directly, then click the first preset card
+    # 2. preset editor: enter export page directly, then click the first preset card
     apply_export(p)
     run(p, 1.0)
     shot = ImageGrab.grab(bbox=(rc.left, rc.top, rc.right, rc.bottom)).convert("RGB")
@@ -190,8 +188,8 @@ def main():
 
     p.close()
 
-    print("measurements (physical px, expected pad=18; win_w: url/stream=696, preset=756):")
-    for n in ("modal_url.png", "modal_stream.png", "modal_preset.png"):
+    print("measurements (physical px, expected pad=18; win_w: stream=696, preset=756):")
+    for n in ("modal_stream.png", "modal_preset.png"):
         measure(os.path.join(OUTDIR, n))
 
 

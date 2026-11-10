@@ -29,6 +29,57 @@ set(CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3"
 set(FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../spikes/spike0_d3d11_present/third_party/ffmpeg" CACHE PATH "FFmpeg dev package root (reused from spike0, not duplicated)")
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui" CACHE PATH "Vendored Dear ImGui root (see third_party/imgui/README.sumu.md)")
 
+# ---- WebView2 SDK (build-time only; the app ships NO WebView2 DLL) ---------------------------
+# The URL page's embedded browser uses the system Evergreen WebView2 Runtime at run time and
+# the NuGet SDK only for headers + the STATIC loader at link time. Resolution order (first hit
+# wins) keeps a clean tree reproducible without pinning one user's absolute path:
+#   1. -DWEBVIEW2_ROOT=<extracted nupkg>
+#   2. native/third_party/webview2/package            (gitignored fetch target, see below)
+#   3. %NUGET_PACKAGES% / %USERPROFILE%\.nuget\packages \ microsoft.web.webview2\<version>
+#   4. download + extract that exact nupkg into native/third_party/webview2/package
+set(WEBVIEW2_VERSION "1.0.3179.45" CACHE STRING "Microsoft.Web.WebView2 NuGet package version")
+set(WEBVIEW2_ROOT "" CACHE PATH "Extracted Microsoft.Web.WebView2 package root (empty = auto-resolve)")
+if(NOT WEBVIEW2_ROOT)
+  set(_wv2_fetch "${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2")
+  if(EXISTS "${_wv2_fetch}/package/build/native/include/WebView2.h")
+    set(WEBVIEW2_ROOT "${_wv2_fetch}/package")
+  endif()
+  if(NOT WEBVIEW2_ROOT)
+    foreach(_root "$ENV{NUGET_PACKAGES}" "$ENV{USERPROFILE}/.nuget/packages" "$ENV{HOME}/.nuget/packages")
+      if(_root AND EXISTS "${_root}/microsoft.web.webview2/${WEBVIEW2_VERSION}/build/native/include/WebView2.h")
+        set(WEBVIEW2_ROOT "${_root}/microsoft.web.webview2/${WEBVIEW2_VERSION}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(NOT WEBVIEW2_ROOT)
+    set(_wv2_nupkg "${_wv2_fetch}.nupkg")
+    message(STATUS "WebView2 SDK not found locally -- downloading ${WEBVIEW2_VERSION}")
+    file(DOWNLOAD
+      "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/${WEBVIEW2_VERSION}"
+      "${_wv2_nupkg}" STATUS _wv2_status SHOW_PROGRESS TLS_VERIFY ON)
+    list(GET _wv2_status 0 _wv2_code)
+    if(NOT _wv2_code EQUAL 0)
+      list(GET _wv2_status 1 _wv2_msg)
+      file(REMOVE "${_wv2_nupkg}")
+      message(FATAL_ERROR "WebView2 SDK download failed (${_wv2_msg}). Install the "
+        "Microsoft.Web.WebView2 ${WEBVIEW2_VERSION} NuGet package or pass "
+        "-DWEBVIEW2_ROOT=<extracted package dir>.")
+    endif()
+    file(MAKE_DIRECTORY "${_wv2_fetch}/package")
+    file(ARCHIVE_EXTRACT INPUT "${_wv2_nupkg}" DESTINATION "${_wv2_fetch}/package")
+    file(REMOVE "${_wv2_nupkg}")
+    set(WEBVIEW2_ROOT "${_wv2_fetch}/package")
+  endif()
+endif()
+if(NOT EXISTS "${WEBVIEW2_ROOT}/build/native/include/WebView2.h")
+  message(FATAL_ERROR "WEBVIEW2_ROOT does not look like an extracted Microsoft.Web.WebView2 "
+    "package: ${WEBVIEW2_ROOT}")
+endif()
+message(STATUS "WebView2 SDK: ${WEBVIEW2_ROOT}")
+set(WEBVIEW2_INCLUDE_DIR "${WEBVIEW2_ROOT}/build/native/include")
+set(WEBVIEW2_LOADER_LIB "${WEBVIEW2_ROOT}/build/native/x64/WebView2LoaderStatic.lib")
+
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 
@@ -98,6 +149,7 @@ pybind11_add_module(sumu_core
     src/player_ui_bars.cpp
     src/player_ui_export.cpp
     src/player_pybind.cpp
+    src/browser_view.cpp
     src/ui_util.cpp
     src/ui/theme.cpp
     src/ui/widgets.cpp
@@ -120,6 +172,7 @@ target_include_directories(sumu_core PRIVATE
     "${FFMPEG_ROOT}/include"
     "${IMGUI_DIR}"
     "${IMGUI_DIR}/backends"
+    "${WEBVIEW2_INCLUDE_DIR}"
 )
 target_link_directories(sumu_core PRIVATE "${FFMPEG_ROOT}/lib")
 
@@ -132,11 +185,17 @@ target_link_libraries(sumu_core PRIVATE
     dwmapi
     comdlg32
     ole32
+    oleaut32
+    advapi32
+    shlwapi
+    version
     avcodec
     avformat
     avutil
     swresample
     "${CUDA_TOOLKIT_ROOT}/lib/x64/cuda.lib"
+    # Static WebView2 loader: no runtime DLL to stage next to the .pyd/onedir bundle.
+    "${WEBVIEW2_LOADER_LIB}"
 )
 
 # Disable MSVC link-time code generation. /LTCG offers nothing for a pybind11 module but makes

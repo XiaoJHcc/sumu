@@ -96,7 +96,9 @@ class _CompileState:
 class _OpenState:
     """Cross-thread handoff for async open/reopen (network URLs). open()/reopen() release the GIL
     and may run tens of seconds on FFmpeg network IO; doing them on the main loop freezes the URL
-    float. Worker writes the terminal result once; main applies play/error + notify_open_url_finished."""
+    page. Worker writes the terminal result once; main applies play/error +
+    notify_open_url_finished. headers/cookies are the browser page's captured request context
+    (empty unless the page handed the media URL over)."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -106,6 +108,8 @@ class _OpenState:
         self.error = None
         self.path = None
         self.is_reopen = False
+        self.headers = ""
+        self.cookies = ""
 
 
 # Native compile-UI states pushed via player.set_compile_ui(state, progress, text).
@@ -123,11 +127,14 @@ _SEEK_ERROR_HOLD_S = 3.0
 
 def _open_worker(ostate: "_OpenState", player, path: str, is_reopen: bool) -> None:
     """Blocking player.open/reopen off the main thread. GIL is released inside the native call."""
+    with ostate.lock:
+        headers = ostate.headers
+        cookies = ostate.cookies
     try:
         if is_reopen:
-            player.reopen(path)
+            player.reopen(path, headers=headers, cookies=cookies)
         else:
-            player.open(path)
+            player.open(path, headers=headers, cookies=cookies)
         with ostate.lock:
             ostate.ok = True
             ostate.done = True
@@ -592,7 +599,7 @@ def main():
             pass
 
     def _finish_open_failed(path, err, is_reopen):
-        """Main-thread failure path: restore open-prompt / URL float form (上一步)."""
+        """Main-thread failure path: back to the open-prompt / URL page with the error line."""
         nonlocal opened, current_path
         if is_reopen:
             # Native close_session() already ran; open_session() failed -> no live session.
@@ -605,7 +612,7 @@ def main():
             pass
 
     def _finish_open_cancelled(path, is_reopen):
-        """URL float loading-state Cancel: native interrupted the blocked FFmpeg open
+        """URL page loading-state Cancel: native interrupted the blocked FFmpeg open
         (cancel_open_url → AVIOInterruptCB) and the worker landed in the failure path. Same
         bookkeeping as a failed open, but silent -- no 无法打开 float, no load-error line."""
         nonlocal opened, current_path
@@ -630,19 +637,20 @@ def main():
             scheduler.stop()
             scheduler = None
 
-    def do_open(path):
+    def do_open(path, headers="", cookies=""):
         """First-ever open (opened is False): player.open() is decode-only and fast (no model
         dependency), so this starts original/passthrough playback immediately -- the Scheduler
         is deliberately NOT built here, only once warmup finishes (see the main loop's
-        "延迟建 scheduler" step below)."""
+        "延迟建 scheduler" step below). headers/cookies carry the browser page's captured
+        request context for a network source (empty for local files / plain URL opens)."""
         try:
-            player.open(path)
+            player.open(path, headers=headers, cookies=cookies)
         except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
             _finish_open_failed(path, e, is_reopen=False)
             return
         _finish_open_success(path, is_reopen=False)
 
-    def do_reopen(path):
+    def do_reopen(path, headers="", cookies=""):
         """Same semantics as the old apply_ui_intents' reopen path (run_player.py:183 /
         player.cpp's Player::reopen()): swap the playing file without tearing down
         present_thread_/the window. The scheduler (if any -- warmup may still be in flight) is
@@ -654,7 +662,7 @@ def main():
         open-prompt comes back and the user can pick another file -- never crash the process."""
         _prepare_reopen()
         try:
-            player.reopen(path)
+            player.reopen(path, headers=headers, cookies=cookies)
         except Exception as e:  # noqa: BLE001 -- bad/partial files must not kill the player
             _finish_open_failed(path, e, is_reopen=True)
             return
@@ -697,8 +705,12 @@ def main():
         seek_error_until = 0.0
         _sched_notify(player.current_frame() if landed is None else landed)
 
-    # Async network open: keeps pump_messages/ui_tick alive so the URL float can show loading.
+    # Async network open: keeps pump_messages/ui_tick alive so the URL page can show loading.
     open_state = None
+
+    # Browser page pause bookkeeping: (path, was_playing) captured when the page opened, or
+    # None. See the browser_enter/browser_exit handling in the loop below.
+    browser_resume = None
 
     # Close-parking state: parked=True while the window is hidden post-close, waiting out
     # _PARK_SECONDS for a single-instance relaunch to forward a new video (zero-warmup
@@ -759,7 +771,7 @@ def main():
                     if os_ok:
                         _finish_open_success(os_path, is_reopen=os_reopen)
                     else:
-                        # A loading-state Cancel in the URL float interrupts the blocked
+                        # A loading-state Cancel in the URL page interrupts the blocked
                         # FFmpeg open, so the worker lands here with an error -- reap it as a
                         # silent cancellation, not a failure.
                         try:
@@ -908,6 +920,26 @@ def main():
 
             intents = player.take_ui_intents()
 
+            # Embedded browser page (URL page): entering it pauses whatever was playing and
+            # remembers that fact; leaving it resumes only when the SAME session is still open
+            # and it was the page that paused it (an open from the page replaces the session,
+            # and its own auto-play must not be undone or doubled here).
+            if intents.get("browser_enter"):
+                if browser_resume is None:
+                    browser_resume = (
+                        current_path,
+                        bool(opened and player.is_playing()),
+                    )
+                    if opened and player.is_playing():
+                        player.pause()
+            if intents.get("browser_exit"):
+                resume = browser_resume
+                browser_resume = None
+                if (resume is not None and resume[1] and opened
+                        and current_path == resume[0] and not player.is_playing()
+                        and open_state is None):
+                    player.play()
+
             # Close-parking (native park_on_close routes X/ESC here instead of quitting):
             # tear down everything the finally block would EXCEPT player.close(), hide the
             # window, and keep the warm models resident for _PARK_SECONDS. A relaunch inside
@@ -991,8 +1023,10 @@ def main():
                         player.play()
 
             path = None
+            open_headers = ""
+            open_cookies = ""
             if opening:
-                # Ignore further open intents while a network open is in flight (URL float
+                # Ignore further open intents while a network open is in flight (URL page
                 # loading). pending_open_path stays until free so a CLI seed is not dropped.
                 pass
             elif intents["open_dialog"]:
@@ -1000,6 +1034,11 @@ def main():
                                                  # current video (or the open-prompt) meanwhile
             elif intents["open_path"]:
                 path = intents["open_path"]
+                # Request context captured by the browser page (Referer/User-Agent + cookies);
+                # empty for drops, the file dialog and direct media links typed into the bar.
+                # Passed straight to open/reopen -- never persisted, never logged.
+                open_headers = intents.get("open_headers") or ""
+                open_cookies = intents.get("open_cookies") or ""
             elif pending_open_path:
                 path = pending_open_path
                 pending_open_path = None
@@ -1007,7 +1046,7 @@ def main():
             if path and not opening:
                 # Open/reopen first so a same-tick seek intent (from the previous file's
                 # seekbar) cannot land on the new session. open_session always starts at 0.
-                # Network URLs open on a worker so the URL float stays responsive (loading state).
+                # Network URLs open on a worker so the URL page stays responsive (loading state).
                 is_reopen = opened
                 if settings_mod._is_network_url(path):
                     if is_reopen:
@@ -1016,6 +1055,8 @@ def main():
                     open_state.running = True
                     open_state.path = path
                     open_state.is_reopen = is_reopen
+                    open_state.headers = open_headers
+                    open_state.cookies = open_cookies
                     threading.Thread(
                         target=_open_worker,
                         args=(open_state, player, path, is_reopen),
@@ -1024,9 +1065,9 @@ def main():
                     print(f"== open async == {'reopen' if is_reopen else 'open'} {path!r}",
                           file=sys.stderr)
                 elif not opened:
-                    do_open(path)
+                    do_open(path, open_headers, open_cookies)
                 else:
-                    do_reopen(path)
+                    do_reopen(path, open_headers, open_cookies)
             elif not opening:
                 seek = intents["seek"]
                 if seek is not None and opened:

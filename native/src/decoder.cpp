@@ -164,6 +164,8 @@ void Decoder::close()
     discontinuity_offset_ = 0.0;
     d3d_device_ = nullptr;
     is_network_ = false;
+    http_headers_.clear();
+    http_cookies_.clear();
 }
 
 AVPixelFormat Decoder::get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts)
@@ -358,7 +360,8 @@ bool Decoder::looks_like_network_url(const std::string& path)
     return starts_with_ci(path, "http://") || starts_with_ci(path, "https://");
 }
 
-bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& error)
+bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& error,
+                   const std::string& headers, const std::string& cookies)
 {
     static std::once_flag log_once;
     std::call_once(log_once, [] { av_log_set_callback(&Decoder::log_callback); });
@@ -368,6 +371,10 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     close();
     d3d_device_ = device;
     is_network_ = looks_like_network_url(path);
+    // Keep the request context for reconnect_to_frame() (a mid-playback reconnect must replay
+    // the same Referer/Cookie or a hotlink-protected source answers 403). Never logged.
+    http_headers_ = is_network_ ? headers : std::string();
+    http_cookies_ = is_network_ ? cookies : std::string();
     // Fresh slate for the interrupt flag -- the callback installed below also gates
     // av_read_frame() during normal decode, so a stale "cancelled" from a previous aborted
     // open must not leak into the new session.
@@ -375,7 +382,7 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
 
     // Pre-allocate the format context so we can install AVIOInterruptCB BEFORE
     // avformat_open_input: request_interrupt() then aborts a blocked network open at
-    // FFmpeg's next IO checkpoint instead of waiting out rw_timeout (URL float cancel).
+    // FFmpeg's next IO checkpoint instead of waiting out rw_timeout (URL page cancel).
     // avformat_close_input() frees the context on every exit path, opened or not.
     fmt_ctx_ = avformat_alloc_context();
     if (!fmt_ctx_) {
@@ -401,7 +408,15 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
         av_dict_set(&fmt_opts, "analyzeduration", "2000000", 0);      // 2s (µs)
         // Hint that HTTP Range seeks are expected (DirectPlay / static file servers).
         av_dict_set(&fmt_opts, "seekable", "1", 0);
-        fprintf(stderr, "[sumu] decoder open network URL (timeout/reconnect/shallow probe)\n");
+        // Browser-page request context: FFmpeg's HTTP protocol takes extra header lines
+        // ("Name: value\r\n"…) and the Cookie header value separately. Only non-empty values are
+        // set, so a plain URL open keeps FFmpeg's defaults. Never echoed to the log.
+        if (!http_headers_.empty())
+            av_dict_set(&fmt_opts, "headers", http_headers_.c_str(), 0);
+        if (!http_cookies_.empty())
+            av_dict_set(&fmt_opts, "cookies", http_cookies_.c_str(), 0);
+        fprintf(stderr, "[sumu] decoder open network URL (timeout/reconnect/shallow probe%s)\n",
+            (http_headers_.empty() && http_cookies_.empty()) ? "" : ", page request context");
     }
 
     if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, &fmt_opts) < 0) {
@@ -757,6 +772,12 @@ bool Decoder::reconnect_to_frame(int64_t target_frame, DecodedFrame& out, std::s
     av_dict_set(&options, "seekable", "1", 0);
     av_dict_set(&options, "probesize", "1048576", 0);
     av_dict_set(&options, "analyzeduration", "2000000", 0);
+    // Same request context as the original open() (see http_headers_/http_cookies_): a
+    // reconnect that dropped them would be rejected by a referer/cookie-guarded source.
+    if (!http_headers_.empty())
+        av_dict_set(&options, "headers", http_headers_.c_str(), 0);
+    if (!http_cookies_.empty())
+        av_dict_set(&options, "cookies", http_cookies_.c_str(), 0);
     int ret = avformat_open_input(&replacement, fmt_ctx_->url, nullptr, &options);
     av_dict_free(&options);
     if (ret >= 0) ret = avformat_find_stream_info(replacement, nullptr);

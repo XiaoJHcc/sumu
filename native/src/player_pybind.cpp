@@ -25,14 +25,27 @@ PYBIND11_MODULE(sumu_core, m)
             py::call_guard<py::gil_scoped_release>())
         // gil_scoped_release: network open/reopen can block tens of seconds; Python's main loop
         // (and async open worker) must keep pumping UI. CUDA context is rebound inside open_session.
-        .def("open", &Player::open, py::arg("path"),
+        // headers/cookies: optional HTTP request context for a network source -- the browser
+        // page's captured Referer/User-Agent and cookies (see UiIntents::open_headers). Keyword
+        // args with empty defaults keep every existing open(path)/reopen(path) call working.
+        .def("open", &Player::open, py::arg("path"), py::arg("headers") = std::string(""),
+            py::arg("cookies") = std::string(""),
             py::call_guard<py::gil_scoped_release>())
         .def("reopen", &Player::reopen, py::arg("path"), // M-C2: runtime file swap, present never stops
+            py::arg("headers") = std::string(""), py::arg("cookies") = std::string(""),
             py::call_guard<py::gil_scoped_release>())
         .def("is_network", &Player::is_network) // http(s) session: shallow ring, scrub off
         .def("notify_open_url_finished", &Player::notify_open_url_finished, py::arg("ok"))
         .def("open_url_cancel_requested", &Player::open_url_cancel_requested) // loading-state Cancel
-        .def("cancel_open_url", &Player::cancel_open_url) // URL float Cancel; scripted cancel tests use it too
+        .def("cancel_open_url", &Player::cancel_open_url) // URL page Cancel; scripted cancel tests use it too
+        // Embedded browser page (URL bar + WebView2). request_open_url_popup() stays the entry
+        // point the UI uses; browser_navigate/browser_play_native are the address bar's Go and
+        // native-play actions, exposed so scripts/verify_browser.py drives the real code paths.
+        .def("request_open_url_popup", &Player::request_open_url_popup)
+        .def("exit_browser_page", &Player::exit_browser_page)
+        .def("browser_navigate", &Player::browser_navigate, py::arg("url"))
+        .def("browser_play_native", &Player::browser_play_native)
+        .def("browser_state", &Player::browser_state)
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)

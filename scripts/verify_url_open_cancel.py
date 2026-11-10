@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: sumu Authors
 # SPDX-License-Identifier: AGPL-3.0
 #
-# Verification for the URL-float loading-state cancel (Cancel -> Player::cancel_open_url
+# Verification for the URL page's loading-state cancel (Cancel -> Player::cancel_open_url
 # -> Decoder AVIOInterruptCB) plus a regression check that a normal URL open still works:
 #
 #   1. stall   -- a TCP server that accepts but never responds: player.open() blocks inside

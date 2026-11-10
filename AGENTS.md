@@ -17,6 +17,7 @@ sumu（澄む）是一个**时钟驱动、全程 GPU** 的实时去马赛克预�
 
 - **呈现**：原生 **D3D11 flip-model swapchain**（DWM 原生、免撕裂）。present loop 跑原生线程，不吃 GIL。
 - **宿主**：极简 **Win32 窗口**，UI 覆盖层走 **Dear ImGui**（进度条 / scrub 缩略图 / 窗口 chrome / 设置旋钮 / 导出页 / 流媒体模态框）。
+- **网页**：URL 页内嵌 **WebView2**（系统 Evergreen Runtime，windowed child window 只覆盖地址栏以下；SDK 仅构建期，静态 loader，包内无 WebView2 DLL）。
 - **语言**：**C++（VS2022 BuildTools）+ pybind11**，原生内核编译为模块 `sumu_core`（类 `Player`）暴露给 Python。
 - **解码**：基线走 **D3D11 硬解**（FFmpeg d3d11va）→ NV12 纹理 → shader → present，**基线不碰 CUDA**；AI 路径 NVDEC → torch，靠 **D3D11↔CUDA 零拷贝互操作**接起来。
 - **音频**：WASAPI，以 QPC 主时钟为准的**纯附加从属时钟**，不扰动 present 节奏。
@@ -37,7 +38,8 @@ native/                  C++ 原生内核，构建产物 sumu_core.cp313-win_amd
                          player_session / player_window / player_pybind /
                          player_ui_overlays / player_ui_bars / player_ui_export / decoder /
                          video_normalizer（GPU 色彩/HDR/旋转归一化）/
-                         headless_decode（Web 转码用无窗口解码）
+                         headless_decode（Web 转码用无窗口解码）/
+                         browser_view（内嵌 WebView2 页视图，SDK 头只在这里）
   src/ui/                ImGui 设计系统（theme / widgets / icons）
   shaders/present.hlsl   NV12→RGB 着色器
   cmake/                 HLSL/logo/图标图集的嵌入脚本
@@ -89,6 +91,7 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `native\smoke_player.py {smoothness\|seek\|pause\|all}` | native Player 冒烟：4K60 流畅度 / 长片 seek 风暴 / pause 帧号冻结 |
 | `scripts\run_player.py [video] --seconds N [--seek-test] [--correctness]` | 端到端冒烟：接 Player+Scheduler，打印 ai_hit_rate / present；`--correctness` 用 PyAV CPU 解码交叉校验 RGBA 通道序与「马赛克确实被改」 |
 | `verify_i18n.py` / `verify_settings.py` / `verify_weights_resolve.py` | 无 GPU 快速检查：文案键对齐 / 设置往返与原子写 / 权重目录解析 |
+| `scripts/verify_browser.py` | 浏览器页 e2e：真实 WebView2 加载本地页面 → 捕获媒体 URL + Referer/UA + Cookie → 交接 UiIntents → 用这些头真的打开并推进帧 |
 | `scripts\verify_video_formats.py` | GPU 色彩/格式归一化：BT.601/709、limited/full、10-bit、PQ/HLG、旋转/镜像；CUDA 输出对照公式与独立 FFmpeg，`--ai` 检查 AI 输入/呈现桥 |
 | `scripts\verify_playback_timeline.py` | VFR 时间网格与持帧内容、seek、fps_div、CFR/短视频、拼接 TS 防回退覆盖边界 |
 | `scripts\verify_network_recovery.py` | 本地 HTTP Range 主动断流/503 后恢复、真实 EOF 不重试、关窗打断挂起读取 |
@@ -111,6 +114,7 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `shot_running_app.py out.png [cx cy]` | 按标题 "sumu" 找已运行窗口，置顶/截图，可选按比例坐标发真实鼠标点击 |
 | `shot_bottom_bar.py` / `shot_buttons.py` | 空播放器底栏布局 / 导出页按钮、关闭键 hover 红、Web 服务器模态框 |
 | `shot_export_ui.py` / `shot_export_drag.py` | 导出页整体布局（合成快照）/ 队列真实鼠标拖拽排序 |
+| `shot_browser.py` | 浏览器页：首屏页内表单 / 真实网页 / 捕获媒体后原生播放按钮点亮（`native/trace/browser_*.png`） |
 | `shot_modals.py` / `calib_button_center.py` | 模态框 padding 像素级取证 / 按钮文字居中标定 |
 
 改 UI 后跑对应脚本目检 PNG；规范来源见 `docs/ui_design.md`「布局验证」。

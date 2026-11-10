@@ -134,6 +134,10 @@ extern "C" {
 namespace py = pybind11;
 using Microsoft::WRL::ComPtr;
 
+// Embedded browser page (WebView2). Only ever held by unique_ptr, so the WebView2 SDK's COM
+// headers stay confined to browser_view.cpp (see that file's header comment).
+class BrowserView;
+
 // ---- error helpers (defined in player_session.cpp) -----------------------------
 void check_hr(HRESULT hr, const char* what);
 void check_cu(CUresult res, const char* what);
@@ -188,6 +192,12 @@ struct UiDrawSnapshot {
 struct UiIntents {
     std::optional<int64_t> seek;
     bool toggle_play = false;
+    // Embedded browser page (URL bar + WebView2). browser_enter is recorded the tick the page
+    // opens (Python pauses what it was playing and remembers whether it was playing so
+    // browser_exit can restore it); browser_exit when the page closes for any reason. Both are
+    // edges, not levels -- the drain happens the same tick they were recorded.
+    bool browser_enter = false;
+    bool browser_exit = false;
     std::optional<int> clip_length;
     std::optional<int> max_regions;
     std::optional<float> cold_start_s; // cold-start skip seconds (0–3); Python clamps
@@ -200,6 +210,13 @@ struct UiIntents {
     // same as every other field here).
     std::string open_path;
     bool open_dialog = false;
+    // Request context for open_path, when the URL page hands a media URL over to the native
+    // open (empty for every other path: a dropped file, the file dialog, a direct address-bar
+    // link). headers = FFmpeg "headers" value ("Referer: …\r\nUser-Agent: …\r\n"), cookies =
+    // the Cookie header value ("a=1; b=2"). Python passes them to open/reopen untouched -- they
+    // are replayed to get the same bytes the page got, never persisted or logged.
+    std::string open_headers;
+    std::string open_cookies;
     // Title-bar X / ESC while park_on_close_ is set: the user asked to close the window, but
     // native no longer decides to quit -- Python drains this and chooses between parking
     // (hide window, keep the warm models for a fast reopen) and a real exit. See app.py's
@@ -335,6 +352,11 @@ public:
     // resize_window_for_video() (adds it to the target client height).
     static constexpr float kTopBarHBase = 36.0f;
 
+    // Base (96-DPI) height of the browser page's address bar -- same metric as the title bar
+    // so the two strips read as one piece of chrome. addr_bar_h() tracks ui_dpi_scale_.
+    static constexpr float kAddrBarHBase = 36.0f;
+    float addr_bar_h() const { return ui_s(kAddrBarHBase); }
+
     // Font size ladder (unscaled base @ 96 DPI). FontScaleDpi multiplies at runtime -- pass
     // these to AddFontFromFileTTF / PushFont(NULL, size), never GetFontSize() (would double-scale).
     //   kFontSizeBase -- body / chrome labels / buttons (default)
@@ -355,13 +377,18 @@ public:
 
     // ---- lifecycle -------------------------------------------------------------------------
 
-    void open(const std::string& video_path);
+    // headers/cookies: optional HTTP request context for a network source (see
+    // UiIntents::open_headers). Empty for every local file / plain URL open.
+    void open(const std::string& video_path, const std::string& headers = std::string(),
+              const std::string& cookies = std::string());
 
-    void open_session(const std::string& video_path);
+    void open_session(const std::string& video_path, const std::string& headers = std::string(),
+                      const std::string& cookies = std::string());
 
     void close_session();
 
-    int64_t reopen(const std::string& video_path);
+    int64_t reopen(const std::string& video_path, const std::string& headers = std::string(),
+                   const std::string& cookies = std::string());
 
     void close_current_session();
 
@@ -497,8 +524,33 @@ public:
 
     void set_export_snapshot(const py::dict& d);
 
+    // ---- embedded browser page (URL bar + WebView2) -----------------------------------------
+    //
+    // Entered by the first-screen "打开 URL" button and the top bar's link icon
+    // (request_open_url_popup -- kept as the entry point's name for compatibility, it no
+    // longer opens a modal): the title bar stays, a minimal address bar appears under it and
+    // the client area below becomes a page view. The address bar closes the page, navigates,
+    // and hands the page's own media URL to the native decoder ("原生播放"). See
+    // build_browser_page() (player_ui_overlays.cpp) for the layout and
+    // docs/native_core.md for the design.
     void request_open_url_popup();
 
+    void exit_browser_page();
+
+    // Same action as the address bar's Go: a supported media direct link goes straight to the
+    // native open, anything else navigates the page view. Exposed for scripts/verify_browser.py.
+    void browser_navigate(const std::string& url);
+
+    // Same action as the address bar's native-play button: replays the captured media URL
+    // (with the page's Referer/User-Agent and its cookies) through the normal async open.
+    void browser_play_native();
+
+    // Test/debug view of the page state (no side effects).
+    py::dict browser_state() const;
+
+    // Python calls this on the main thread when an async open finishes. Success closes the
+    // browser page (the video takes over); failure keeps it up with the open_url_load_failed
+    // line, unless the user cancelled -- then it silently returns to the page as it was.
     void notify_open_url_finished(bool ok);
 
     // Loading-state Cancel: flag the cancellation and interrupt the blocked FFmpeg
@@ -587,7 +639,29 @@ private:
 
     void build_open_prompt_overlay(float top_bar_h);
 
-    void build_open_url_popup();
+    void build_browser_page();
+
+    // Browser-page internals (player_session.cpp for state, player_ui_overlays.cpp for layout).
+    void ensure_browser();                                  // create BrowserView + start WebView2
+    void browser_submit(const std::string& raw);            // address bar Go / page form Open
+    void begin_native_open(const std::string& url, const std::string& headers,
+                           const std::string& cookies);
+    void sync_browser_page();                               // per-frame poll of the page view
+    static std::string browser_media_headers(const std::string& referer,
+                                             const std::string& user_agent);
+
+    // Shared single-line URL field: ui::TextInput plus the right-click menu
+    // (Cut/Copy/Paste/Paste&Open/SelectAll) the old URL modal carried. Both the address bar
+    // and the page form use it; each owns its own buffer + ImGui id, so the two fields can
+    // never fight over one ImGui InputText state in the same frame.
+    struct UrlFieldResult {
+        bool submit = false;          // Enter pressed
+        bool submit_paste = false;    // context menu "Paste & Open" (already pasted)
+        bool active = false;          // the field owned keyboard focus this frame
+    };
+
+    UrlFieldResult url_field(const char* id, char* buf, size_t cap, float width,
+                             bool* focus_pending, bool* select_all_pending);
 
     void build_stream_popup();
 
@@ -796,6 +870,11 @@ private:
         std::string open_url_invalid;
         std::string open_url_loading;
         std::string open_url_load_failed;
+        // Embedded browser page (address bar labels/tooltips + the unavailable placeholder).
+        std::string browser_unavailable;
+        std::string browser_go;
+        std::string browser_play;
+        std::string browser_close;
         // URL field right-click context menu (Cut/Copy/Paste/Select All).
         std::string input_cut;
         std::string input_copy;
@@ -887,22 +966,39 @@ private:
         std::string export_status_cancelled;
         std::string export_status_interrupted;
     } ui_str_;
-    // Open-URL modal (ImGui popup). Main-thread only, same discipline as ui_settings_open_.
-    // Confirm writes a trimmed http(s) URL into ui_intents_.open_path (Python reuses the drop path)
-    // and flips open_url_loading_ so the float stays open until notify_open_url_finished().
-    bool open_url_popup_ = false;
-    bool open_url_focus_ = false;
-    char open_url_buf_[2048] = {};
+    // ---- embedded browser page (URL bar + WebView2 child window). Main-thread only, same
+    // discipline as ui_settings_open_. The page view itself is optional: when WebView2 is
+    // missing the page shows browser_unavailable and nothing else in the player is affected.
+    std::unique_ptr<BrowserView> browser_;
+    bool browser_page_ = false;   // the browser page owns the area below the title bar
+    bool browser_web_ = false;    // a page is loaded/navigating (its child window is shown)
+    bool browser_failed_ = false; // WebView2 unavailable -> page shows browser_unavailable
+    char browser_addr_buf_[2048] = {};  // address bar field (always present on this page)
+    char browser_home_buf_[2048] = {};  // first-screen in-page form field
+    bool browser_addr_focus_ = false;
+    bool browser_home_focus_ = false;
+    bool browser_addr_active_ = false;   // previous frame: the address field had keyboard focus
+    bool browser_addr_select_all_ = false;
+    bool browser_home_select_all_ = false;
+    std::string browser_page_url_seen_;  // last page URL already reflected in the address bar
+    std::string browser_addr_submitted_; // text this page submitted (the bar owns it until edited)
+    std::string browser_pending_nav_;    // navigation requested before the controller was ready
+    bool browser_close_pending_ = false; // open succeeded -> leave the page on the next build
+    // CookieManager lookup in flight for the native-play handover, and the URL it was made
+    // for. Cleared as soon as the answer is consumed, the lookup is cancelled (any newer
+    // action: direct media link, page leave, candidate switch) -- sync_browser_page() also
+    // clears it when the candidate no longer matches, so it can never stay true forever.
+    bool browser_cookie_pending_ = false;
+    std::string browser_cookie_url_;
+    // Open-URL loading state (spinner + Cancel) shared by the page form, the address bar and
+    // the native open it starts; cleared by notify_open_url_finished().
     bool open_url_show_error_ = false;      // client-side scheme validation
     bool open_url_show_load_error_ = false; // server/open failure after async open
     bool open_url_loading_ = false;
-    bool open_url_close_pending_ = false;   // success → close on next build_open_url_popup
     // Loading-state cancel: set by cancel_open_url() (UI thread), polled by Python's reap
     // (open_url_cancel_requested()) to suppress the load-error surfaces for a cancellation.
     std::atomic<bool> open_cancel_requested_{ false };
-    // Right-click "Select All" on an inactive URL field: focus + select on the next frame
-    // (same two-frame pattern as open_url_focus_).
-    bool open_url_select_all_pending_ = false;
+
     // Web-stream server / offline export popups (Phase 2). Main-thread only, same discipline.
     bool stream_popup_ = false;
     int stream_port_edit_ = 8080;

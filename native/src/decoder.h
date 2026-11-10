@@ -69,7 +69,12 @@ public:
     // Returns false + fills `error` on failure. Populates fps()/width()/height()/frame_count().
     // `path` may be a local filesystem path OR an http(s) URL (FFmpeg network protocols).
     // Network URLs get timeout/reconnect/smaller probe options; see is_network().
-    bool open(const std::string& path, ID3D11Device* device, std::string& error);
+    // `headers` / `cookies` are the optional HTTP request context the browser page captured for
+    // this URL ("Referer: …\r\nUser-Agent: …\r\n" / "a=1; b=2"), applied to the HTTP protocol
+    // only -- never for local files, never logged, and replayed by reconnect_to_frame().
+    bool open(const std::string& path, ID3D11Device* device, std::string& error,
+              const std::string& headers = std::string(),
+              const std::string& cookies = std::string());
 
     // True when the last successful open() treated `path` as a network URL (http/https).
     // Player uses this to pick the shallow IO profile (smaller ring, no scrub second open).
@@ -278,6 +283,12 @@ private:
     // Set in open() from looks_like_network_url(path); cleared in close(). Drives FFmpeg
     // format options (timeout/reconnect/probesize) and is read by Player for IO profile.
     bool is_network_ = false;
+
+    // HTTP request context captured by the browser page (see open()). Kept for the session so
+    // reconnect_to_frame() can re-open the same URL with the same credentials -- dropping them
+    // would turn a mid-playback reconnect into a 403. Cleared in close().
+    std::string http_headers_;
+    std::string http_cookies_;
 
     // ---- audio (spike, additive) -----------------------------------------------------------
     int audio_stream_idx_ = -1; // -1 == no audio stream (legitimate, silent)
