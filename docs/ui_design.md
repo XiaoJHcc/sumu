@@ -293,35 +293,58 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
 ### 浏览器页（`build_browser_page`）
 
 首屏「打开 URL」与顶栏 link 图标进入的页面（`request_open_url_popup()`，名字沿用，
-不再是弹窗）。三层竖排，全部满宽：
+不再是弹窗）。三层竖排，全部满宽；**地址栏恒定存在**，页面只换内容：
 
 1. **主标题栏**（`build_top_bar`，原样保留）。页面打开时它的下圆角改为方角，让地址栏
    与它拼成一条连续的 chrome。
 2. **地址栏**（`##sumu_browser_bar`，高度 `kAddrBarHBase = 36`，与标题栏同高同底色
-   `kPanelBg` + 下边缘 `kBorder` 发丝线）。控件行 32px 高、按 `kSpaceXS` 内缩，从左到右
-   只有四个元素：关闭网页（Close glyph）· URL 输入框（占满剩余宽）· 访问（OpenUrl
-   glyph）· 原生播放（Play glyph，仅在页面已捕获到媒体地址时可用）。没有标签页、
-   书签、历史、前进后退。
-3. **页面区**（标题栏 + 地址栏以下）。四种互斥形态：
-   - **首屏页内表单**：标题（`open_url_title`）+ hint（`open_url_hint`，小字次级色）+
-     输入框 + 错误行 + [打开(Primary)][取消(Secondary)]，整体在页面区居中。
-   - **加载态**：`ui::Spinner` + Cancel（原生 open 进行中；Cancel 走
-     `cancel_open_url()`），卡片宽 200px。
-   - **`browser_unavailable`**：居中一行次级色文本（WebView2 运行时缺失/创建失败）。
-   - **网页本体**：WebView2 的 windowed child window，覆盖整个页面区。
+   `kPanelBg` + 下边缘 `kBorder` 发丝线）。**Native 内容下它是悬浮 chrome**：只在光标进入
+   顶部 reveal 区（与全屏标题栏同一条规则）或地址输入正在使用时出现，隐藏时不占布局、不移动
+   视频 viewport；Web/Home/Loading 等状态它仍常驻。控件行 32px 高、按 `kSpaceXS` 内缩，从左到右：
+   **后退**（arrow-left）· **前进**（arrow-right）· **刷新**（rotate-cw）· URL 输入框
+   （占满剩余宽）· 访问（OpenUrl）· 播放（Play）。**没有「关闭网页」X**（已删除：页面内唯一的
+   退出口是首屏表单的 Cancel），也没有标签页、书签、历史面板；历史按钮按引擎真实可用状态
+   启用（无历史时禁用），刷新在 Native 内容下禁用（重载会丢掉当前会话认证用的地址）、在
+   Home（没有已加载页面）时也禁用。播放按钮与「访问」的区别是语义而非样式：访问 = 交给
+   WebView2 导航，播放 = 把地址栏当前 URL 交给原生解码器（`.flv`/带 query/无后缀都照收）。
+3. **页面内容**（`Player::browser_content_kind()`，优先级从高到低，五种互斥形态）：
+   - **Loading**：原生 open 进行中，`ui::Spinner` + Cancel（走 `cancel_open_url()`）。
+   - **Native**：播放中的会话就是页面内容——视频用普通播放的 viewport（只扣标题栏，
+     地址栏是悬浮 chrome 不占高度）按 1:1 letterbox，底栏（播放/进度/音量）照常可用，
+     页面区不再画任何底色。
+   - **Web**：WebView2 的 windowed child window，覆盖整个页面区。
+   - **Unavailable**：居中一行 `browser_unavailable` 次级色文本。
+   - **Home**：首屏页内表单（标题 + hint + 输入框 + 打开/取消）。
 
 **布局铁律**：网页本体是**真实子窗口**，ImGui 画在它下面的一切都看不见。因此标题栏/
-地址栏必须排在它的矩形之上；加载卡片与首屏表单出现时 `set_visible(false)` 隐藏子窗口；
-open 失败提示是地址栏正下方一条独立的错误行窗口——子窗口的上沿随之下移它的高度，
-而不是把文字叠在网页上。地址栏与其上的标题栏是仅有的两块自绘 chrome。
+地址栏必须排在它的矩形之上；Loading / Home / Unavailable 出现时、以及设置面板与 Web
+串流模态框打开期间、导出页接管窗口期间，子窗口一律 `set_visible(false)`（同时静音），
+关闭后恢复同一页面。open 失败提示是地址栏正下方一条独立的错误行窗口（Web/Native 下
+页面整体/网页上沿下移它的高度）。
+
+**页面只由自己关闭**：地址栏 Close 或首屏 Cancel 是唯一的出口（也是唯一会产生
+`browser_exit` 的地方）。原生打开成功、设置、打开文件、Web 串流、导出都**不**离开本页；
+导出是独占覆盖层，退出后回到仍在的同一页。
+
+**不离开页面的覆盖层**：设置面板从 `top_bar + addr_bar`（地址栏隐藏时从 `top_bar`）开始画在
+页面内，且**画在网页快照底图之上**——打开设置时先 `CapturePreview` 抓一张当前网页 PNG 作
+底图，再隐藏活视图、把面板叠上去，页面本身不重建；抓图未就绪时网页保持可见、面板晚一帧，
+失败则退回「隐藏活视图」的旧表现。Web 串流模态框仍是让位（隐藏+静音）行为，关闭即恢复。
 
 **两个输入框**：地址栏与首屏表单各持独立 buffer + 独立 ImGui id，共用
 `Player::url_field()`（输入框 + 右键菜单）。不共享同一个 buffer —— 同一段文本被两个
 `ImGuiInputTextState` 分别跟踪会互相覆盖光标/选区。地址栏内容由
-`SourceChanged`/`NavigationCompleted` 同步（用户正在输入时跳过，避免抢字）。
+`SourceChanged`/`NavigationCompleted` 同步（用户正在输入时跳过；Native/加载中则固定显示
+交接过去的媒体地址）。
 
-改动本页后跑 `scripts/shot_browser.py` 目检三张图（首屏表单 / 真实网页 / 捕获媒体后
-原生播放按钮点亮），功能链路由 `scripts/verify_browser.py` 断言。
+**输入与窗口**：页面视图是子窗口，键盘焦点会跑到它那里——点击本窗口任何 chrome 都会
+`SetFocus` 收回（见 `WndProc` 的 WM_LBUTTONDOWN）；边缘缩放由
+`Player::poll_page_view_border()` 接管（见 `docs/native_core.md`），不能靠给网页留
+padding 绕过。
+
+改动本页后跑 `scripts/shot_browser.py` 目检六张图（首屏表单 / 真实网页 / 播放按钮 /
+Native 内容（bar 露出）/ Native 内容（bar 隐藏）/ 设置叠在页面快照上），功能链路与真实输入
+分别由 `scripts/verify_browser.py`、`scripts/verify_browser_input.py` 断言。
 
 ### 导出页（`build_export_screen`）
 
@@ -384,6 +407,12 @@ open 失败提示是地址栏正下方一条独立的错误行窗口——子窗
   （间距用 Dummy/间距刻度表达）。
 - **Don't**：不改行为——intents 记录、校验、字段读写、可见性条件保持原样；设计系统
   只负责"调用哪个函数、用哪个颜色"。
+- **Don't**：把 `SetNextWindowSize` / `SetNextWindowSizeConstraints` / `PushStyleVar`
+  这类"下一个窗口"的提示留在**没有 `Begin` 的路径**上。ImGui 会把它一直带到本帧的下一个
+  `Begin()`（`BeginPopup`/`BeginPopupModal` 会主动清掉，`BeginPopupContextItem` 在没有
+  弹出时会不清），于是别的窗口被套上别人的尺寸——URL 页首屏就曾因此把页面底窗压成右键
+  菜单宽度，整块表单被裁掉。给弹出框设样式/尺寸前先判断它这一帧真的会打开
+  （`IsPopupOpen(...)` 或右键点击）。
 - **例外（现存且合理）**：seekbar/音量条、导出队列的六点拖拽 grip 是既定手绘媒体
   观感，保留 ImDrawList 画法；颜色仍取主题常量。seekbar 悬停缩略图
   卡片同样保留手绘，但底色 = `kPanelBg` @ 0.90、圆角 = `kRadiusControl`、内边距 =
@@ -397,6 +426,7 @@ open 失败提示是地址栏正下方一条独立的错误行窗口——子窗
 检查：滚动条条数、垂直居中、label 列对齐、四边 12px 边距。
 
 改了浏览器页/地址栏布局后跑 `scripts/shot_browser.py`（`native/trace/browser_home.png`
-`browser_page.png` `browser_play.png`）：检查标题栏与地址栏是否拼成一条连续 chrome、
-地址栏四个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于地址栏下沿（不遮挡
-任何自绘 chrome）、首屏表单是否居中。
+`browser_page.png` `browser_play.png` `browser_native.png`）：检查标题栏与地址栏是否
+拼成一条连续 chrome、地址栏七个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于
+地址栏下沿（不遮挡任何自绘 chrome）、首屏表单是否居中、Native 内容下视频是否从地址栏
+下沿开始且底栏可见。

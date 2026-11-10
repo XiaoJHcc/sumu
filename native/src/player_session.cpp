@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
-#include "browser_view.h" // BrowserView + browser::looks_like_media_url (page view state)
+#include "browser_view.h" // BrowserView (page view state, cookie lookup, snapshots)
+
+#include <wincodec.h> // settings-overlay backdrop: decode the captured page PNG on the CPU
+#pragma comment(lib, "windowscodecs.lib")
 
 #include <cctype>
 #include <cstdlib>
@@ -428,6 +431,9 @@ void Player::close_session(){
     scrub_decoder_.close();
 
     session_active_.store(false, std::memory_order_relaxed);
+    // The page's Native content is gone with the session (explicit teardown, export entry, or a
+    // failed reopen): fall back to whatever else the page has (Web / Home), never a stale video.
+    set_browser_native(false);
 }
 
 // M-C2: runtime file swap -- present_thread_ (and the window) is NEVER stopped/rebuilt for
@@ -593,6 +599,8 @@ std::string Player::pick_open_file(){
     ofn.hwndOwner = hwnd_;
     // Double-NUL-terminated filter; labels come from the i18n string table.
     // Must stay alive until GetOpenFileNameW returns (local wstring is fine).
+    // Deliberately NO media-extension filter: whether a file is playable is FFmpeg's container
+    // probe, not a filename list (that list would silently hide FLV/TS/anything new).
     std::wstring filter;
     auto append_filter_pair = [&](const std::string& label_utf8, const wchar_t* patterns) {
         std::wstring label = utf8_to_wide(label_utf8);
@@ -601,8 +609,6 @@ std::string Player::pick_open_file(){
         filter.append(patterns);
         filter.push_back(L'\0');
     };
-    append_filter_pair(ui_str_.dialog_video_files,
-        L"*.mp4;*.mkv;*.mov;*.avi;*.hevc;*.h265;*.ts");
     append_filter_pair(ui_str_.dialog_all_files, L"*.*");
     filter.push_back(L'\0');
     ofn.lpstrFilter = filter.c_str();
@@ -661,6 +667,144 @@ void Player::pump_messages(){
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    poll_page_view_border();
+}
+
+// ---- page-view edge drags ------------------------------------------------------------------
+// Forensics (measured on this machine, see docs/native_core.md): the WebView2 controller's window
+// chain is
+//   Sumu_Player_WndClass -> Chrome_WidgetWin_0            (OUR process: subclassable)
+//                        -> Chrome_WidgetWin_1           (WebView2 browser process)
+//                        -> Chrome_RenderWidgetHostHWND  (WebView2 browser process)
+//                        -> Intermediate D3D Window      (WebView2 GPU process)
+// The three deepest windows belong to other processes, so SetWindowSubclass (see
+// browser_view.cpp's child_subclass_proc) can only cover the outermost one -- and the OS
+// hit-tests the DEEPEST window, so a mouse-down over the page view never reaches this window's
+// WM_NCHITTEST and the resize bands are dead. The OS sizing loop cannot be borrowed either:
+// the click (and the mouse capture) belongs to the page view's process.
+//
+// So the drag is driven from here, as a per-tick state machine: while the cursor sits in one of
+// this window's resize bands AND the button is down over the page view, each tick moves/resizes
+// the window with SetWindowPos (which drives WM_SIZE -> on_resize() + ui_tick(), so the swapchain
+// and the page view follow live) until the button is released. Nothing is added around the page
+// (no padding, no dead strip) and nothing is intercepted while the cursor is elsewhere.
+void Player::poll_page_view_border(){
+    const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool usable = hwnd_ && browser_ && browser_->visible() &&
+        !fullscreen_.load(std::memory_order_relaxed) && !IsZoomed(hwnd_);
+
+    if (page_resize_active_) {
+        if (!down || !usable) { // released (or the page is gone): the drag is over
+            page_resize_active_ = false;
+            page_resize_armed_ = false;
+            return;
+        }
+        POINT cur{};
+        if (!GetCursorPos(&cur)) return;
+        const int dx = cur.x - page_resize_start_cursor_.x;
+        const int dy = cur.y - page_resize_start_cursor_.y;
+        set_resize_cursor(page_resize_hit_);
+        if (std::abs(dx) < 2 && std::abs(dy) < 2) return; // a plain click must not nudge
+        RECT r = page_resize_start_rect_;
+        const LRESULT hit = page_resize_hit_;
+        if (hit == HTLEFT || hit == HTTOPLEFT || hit == HTBOTTOMLEFT) r.left += dx;
+        if (hit == HTRIGHT || hit == HTTOPRIGHT || hit == HTBOTTOMRIGHT) r.right += dx;
+        if (hit == HTTOP || hit == HTTOPLEFT || hit == HTTOPRIGHT) r.top += dy;
+        if (hit == HTBOTTOM || hit == HTBOTTOMLEFT || hit == HTBOTTOMRIGHT) r.bottom += dy;
+        const UINT dpi = GetDpiForWindow(hwnd_);
+        const int min_w = MulDiv(240, dpi, 96);
+        const int min_h = MulDiv(135, dpi, 96);
+        if (r.right - r.left < min_w) {
+            if (hit == HTLEFT || hit == HTTOPLEFT || hit == HTBOTTOMLEFT) r.left = r.right - min_w;
+            else r.right = r.left + min_w;
+        }
+        if (r.bottom - r.top < min_h) {
+            if (hit == HTTOP || hit == HTTOPLEFT || hit == HTTOPRIGHT) r.top = r.bottom - min_h;
+            else r.bottom = r.top + min_h;
+        }
+        if (r.left != page_resize_applied_.left || r.top != page_resize_applied_.top ||
+            r.right != page_resize_applied_.right || r.bottom != page_resize_applied_.bottom) {
+            SetWindowPos(hwnd_, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            page_resize_applied_ = r;
+        }
+        return;
+    }
+
+    if (!down) {
+        // Hover arming: the arm flag is only ever (re)computed while the button is UP, so a
+        // press that began inside the page (text selection, dragging a slider) can never arm --
+        // moving to the edge with the button held stays a page drag, not a window resize.
+        const LRESULT hover = usable ? page_view_border_at_cursor() : HTNOWHERE;
+        page_resize_armed_ = hover != HTNOWHERE;
+        if (page_resize_armed_) set_resize_cursor(hover);
+        return;
+    }
+    // Button is down: a drag may only start from a press that began in the band.
+    if (!page_resize_armed_ || !usable) {
+        page_resize_armed_ = false;
+        return;
+    }
+    const LRESULT hit = page_view_border_at_cursor();
+    if (hit == HTNOWHERE) {
+        page_resize_armed_ = false;
+        return;
+    }
+    POINT screen{};
+    if (!GetCursorPos(&screen)) return;
+    page_resize_armed_ = false;
+    page_resize_active_ = true;
+    page_resize_hit_ = hit;
+    page_resize_start_cursor_ = screen;
+    if (!GetWindowRect(hwnd_, &page_resize_start_rect_)) {
+        page_resize_active_ = false;
+        return;
+    }
+    page_resize_applied_ = page_resize_start_rect_;
+    set_resize_cursor(hit);
+}
+
+// Which resize band (if any) the cursor is in -- but only where the page view covers the
+// client area: everywhere else the window's own WM_NCHITTEST already does the job.
+LRESULT Player::page_view_border_at_cursor() const {
+    if (!hwnd_ || !browser_ || !browser_->visible()) return HTNOWHERE;
+    POINT screen{};
+    if (!GetCursorPos(&screen)) return HTNOWHERE;
+    POINT client = screen;
+    if (!ScreenToClient(hwnd_, &client)) return HTNOWHERE;
+    RECT rc{};
+    if (!GetClientRect(hwnd_, &rc)) return HTNOWHERE;
+    int bounds[4] = { 0, 0, 0, 0 };
+    browser_->bounds(bounds);
+    if (client.x < bounds[0] || client.x >= bounds[0] + bounds[2] ||
+        client.y < bounds[1] || client.y >= bounds[1] + bounds[3])
+        return HTNOWHERE;
+
+    const int margin = MulDiv(8, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
+    const bool left = client.x < margin;
+    const bool right = client.x >= rc.right - margin;
+    const bool bottom = client.y >= rc.bottom - margin;
+    // The top band is always above the page view (address bar), so it never needs the rescue.
+    if (bottom && left) return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    if (bottom) return HTBOTTOM;
+    return HTNOWHERE;
+}
+
+// The page view's own window proc keeps resetting the cursor to an arrow, so the resize cursor
+// has to be re-asserted every tick while hovering/ dragging a band. (Wide resource IDs: this
+// translation unit is ANSI, so the IDC_* macros would be narrow.)
+void Player::set_resize_cursor(LRESULT hit){
+    int id = 32645; // IDC_SIZENS
+    switch (hit) {
+    case HTLEFT: case HTRIGHT: id = 32644; break;             // IDC_SIZEWE
+    case HTTOPLEFT: case HTBOTTOMRIGHT: id = 32642; break;    // IDC_SIZENWSE
+    case HTTOPRIGHT: case HTBOTTOMLEFT: id = 32643; break;    // IDC_SIZENESW
+    default: break;
+    }
+    SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(id)));
 }
 
 // ---- window resize (WM_SIZE) -- main-thread-only (called from WndProc via
@@ -714,6 +858,8 @@ void Player::resize_window_for_video(){
 
     const float sw = static_cast<float>(src_width_);
     const float sh = static_cast<float>(src_height_);
+    // Same strip math as fit_viewport(): only the title bar strip is reserved (the URL page's
+    // address bar is floating chrome).
     const float bar = top_bar_h();
 
     // Budgets: width <= 80% of work area; total client height <= work area height, which
@@ -948,6 +1094,12 @@ void Player::set_stream_defaults(int port, const std::string& root, bool no_toke
 void Player::set_export_mode(bool on){
     export_mode_ = on;
     if (on) export_clip_edit_init_ = false; // re-seed the clip slider on entry
+    // The export screen owns the whole window while it is up: the page view (a real child
+    // window) must step aside -- hidden and muted -- or it would paint over the screen and keep
+    // its audio running. Leaving export mode needs no counterpart: the next
+    // build_browser_page() tick re-applies the page's own visibility.
+    if (on && browser_) browser_->set_visible(false);
+    if (on) stream_popup_open_ = false; // the modal cannot survive the screen swap
     // Never carry a drag across screen transitions (a stale id would commit a phantom
     // move on the first frame back).
     export_drag_id_ = -1;
@@ -1047,8 +1199,8 @@ void Player::request_open_url_popup(){
     browser_home_focus_ = false;
     browser_addr_select_all_ = false;
     browser_home_select_all_ = false;
-    browser_close_pending_ = false;
     browser_cookie_pending_ = false;
+    reset_page_backdrop_state();
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
     open_cancel_requested_.store(false, std::memory_order_relaxed);
@@ -1056,8 +1208,11 @@ void Player::request_open_url_popup(){
     browser_home_buf_[0] = '\0';
     ensure_browser();
     // Continuity: a page already loaded (the user closed the page earlier) comes back as-is;
-    // otherwise the page opens on its first-screen form.
+    // otherwise the page opens on its first-screen form. A live session is NOT adopted as the
+    // page content on entry -- entering the page always means "the page, not the video", which
+    // is why browser_enter asks Python to pause.
     browser_web_ = browser_ && browser_->ready() && !browser_->page_url().empty();
+    set_browser_native(false);
     if (!browser_web_) browser_home_focus_ = true;
     ui_intents_.browser_enter = true; // Python pauses the old session and remembers it
 }
@@ -1066,21 +1221,145 @@ void Player::exit_browser_page(){
     if (!browser_page_) return;
     browser_page_ = false;
     browser_web_ = false;
+    set_browser_native(false);
     browser_pending_nav_.clear();
     browser_page_url_seen_.clear();
     browser_addr_submitted_.clear();
-    browser_close_pending_ = false;
     browser_cookie_pending_ = false;
     browser_cookie_url_.clear();
+    reset_page_backdrop_state();
     browser_addr_focus_ = false;
     browser_home_focus_ = false;
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
     if (browser_) {
         browser_->set_visible(false);
-        browser_->clear_candidate(); // also retires any cookie handoff still in flight
+        browser_->cancel_cookies(); // a lookup for a page that is gone must not start an open
     }
     ui_intents_.browser_exit = true; // Python restores playback if it had paused it
+}
+
+// Native content: the playing session is what the page shows. The address bar turns into
+// floating chrome in this state (see build_browser_page()), so no layout space is reserved for
+// it anywhere -- the video viewport is identical whether the bar is revealed or hidden.
+void Player::set_browser_native(bool on){
+    browser_native_ = on;
+    // The address bar is floating chrome in this state: it reserves no layout space and the
+    // video viewport is unchanged by showing/hiding it, so nothing here touches the window or
+    // the viewport.
+}
+
+// Native -> Web: the page view takes the content back and the session must stop rendering its
+// clock behind it. Reusing browser_enter is deliberate -- Python pauses whatever is playing and
+// remembers it (browser_resume is cleared on every successful native open, so the *new* video
+// is what gets recorded here).
+void Player::browser_enter_web(){
+    if (!browser_native_) return;
+    set_browser_native(false);
+    browser_page_url_seen_.clear(); // let the address bar resync to the page the view is on
+    if (browser_) browser_->cancel_cookies();
+    ui_intents_.browser_enter = true;
+}
+
+bool Player::browser_overlay_open() const {
+    // Only the web-stream modal still replaces the page view with the player background; the
+    // settings panel is drawn OVER a captured snapshot of the page (see build_browser_page()).
+    return stream_popup_open_;
+}
+
+// One reveal rule for the floating top chrome (title bar in fullscreen, address bar whenever the
+// page shows the native video): the cursor inside the top 10% of the client area. Two copies of
+// this test used to drift apart; keep it here.
+bool Player::mouse_in_top_reveal_zone() const {
+    const ImGuiIO& io = ImGui::GetIO();
+    const float zone_y = io.DisplaySize.y * 0.10f;
+    return io.MousePos.y >= 0.0f && io.MousePos.y <= zone_y &&
+        io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
+}
+
+// One source of truth for "what is the page showing", used by both the layout and the
+// scripted state view. Priority: a native open in flight covers everything (its spinner), then
+// the native session video, then the page view, then the unavailable placeholder, then Home.
+int Player::browser_content_kind() const {
+    if (open_url_loading_) return 2;                                    // Loading
+    if (browser_native_) return 3;                                      // Native
+    if (browser_web_ && browser_ && browser_->ready() && !browser_failed_) return 1; // Web
+    if (browser_failed_ || (browser_ && browser_->failed())) return 4;  // Unavailable
+    return 0;                                                           // Home
+}
+
+// ---- settings overlay: captured-page backdrop -------------------------------------------
+// The settings panel is drawn ON the page instead of replacing it. WebView2's windowed
+// controller owns a real child HWND, so the page is captured (BrowserView::request_snapshot)
+// and decoded here into a D3D11 texture that ImGui can draw; the live view is only hidden once
+// that texture is ready, and closing the panel brings the same controller back unchanged.
+void Player::reset_page_backdrop_state(){
+    browser_backdrop_state_ = 0;
+    browser_backdrop_requested_ = false;
+    browser_backdrop_url_.clear();
+    // The texture is kept: an ImGui draw snapshot from the previous frame may still reference
+    // its SRV, and it is cheap device-level memory (freed with the device).
+}
+
+bool Player::upload_page_backdrop(const std::vector<uint8_t>& png){
+    if (png.empty() || !device_) return false;
+    // WIC: PNG bytes -> 32bpp BGRA. (COM apartment: this is the UI thread, already STA because
+    // the page view initializes it.)
+    ComPtr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory))) || !factory)
+        return false;
+    ComPtr<IWICStream> stream;
+    if (FAILED(factory->CreateStream(&stream)) || !stream) return false;
+    if (FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(png.data()),
+            static_cast<DWORD>(png.size()))))
+        return false;
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(factory->CreateDecoderFromStream(stream.Get(), nullptr,
+            WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder)
+        return false;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) return false;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(factory->CreateFormatConverter(&converter)) || !converter) return false;
+    if (FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
+        return false;
+    UINT w = 0, h = 0;
+    if (FAILED(converter->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+
+    const size_t stride = static_cast<size_t>(w) * 4;
+    std::vector<uint8_t> pixels(stride * h);
+    if (FAILED(converter->CopyPixels(nullptr, static_cast<UINT>(stride),
+            static_cast<UINT>(pixels.size()), pixels.data())))
+        return false;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = pixels.data();
+    init.SysMemPitch = static_cast<UINT>(stride);
+    ComPtr<ID3D11Texture2D> tex;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    {
+        // Device-level work shared with every other thread that touches the device.
+        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        if (FAILED(device_->CreateTexture2D(&td, &init, &tex)) || !tex) return false;
+        if (FAILED(device_->CreateShaderResourceView(tex.Get(), nullptr, &srv)) || !srv)
+            return false;
+        browser_backdrop_tex_ = tex;
+        browser_backdrop_srv_ = srv;
+        browser_backdrop_w_ = w;
+        browser_backdrop_h_ = h;
+    }
+    return true;
 }
 
 void Player::ensure_browser(){
@@ -1099,6 +1378,16 @@ void Player::ensure_browser(){
 void Player::sync_browser_page(){
     if (!browser_) return;
     if (browser_->failed()) browser_failed_ = true;
+    // The settings overlay's backdrop is a picture of ONE page state. A navigation (or leaving
+    // the Web content for loading/native) retires it, and the next build requests exactly one
+    // fresh capture for the new state -- no stale page behind the panel, no per-frame captures.
+    if (browser_backdrop_state_ != 0 &&
+        (browser_content_kind() != 1 || browser_->page_url() != browser_backdrop_url_))
+        reset_page_backdrop_state();
+    // WebView2 creates (and may recreate) its child window tree asynchronously; the edge-resize
+    // forwarding subclass has to reach every one of those windows, so it is refreshed here --
+    // cheap, and idempotent per HWND.
+    browser_->keep_child_subclasses();
 
     // Navigation submitted before the controller finished starting.
     if (!browser_pending_nav_.empty() && browser_->ready() && !browser_failed_) {
@@ -1108,11 +1397,15 @@ void Player::sync_browser_page(){
     }
 
     // Address bar mirrors the page the engine is actually on (SourceChanged /
-    // NavigationCompleted), including redirects after a submitted address. Skipped only when
-    // the field holds text the USER typed since submitting, so a load finishing mid-edit can
-    // never yank the caret out from under them.
+    // NavigationCompleted), including redirects after a submitted address. `browser_page_url_seen_`
+    // is only ever compared/assigned here: a submission does NOT touch it, so the bar keeps the
+    // submitted text until the engine reports landing somewhere else. Skipped while the field
+    // holds text the USER typed since submitting, so a load finishing mid-edit can never yank the
+    // caret out from under them.
+    // While the page shows the session video -- or a native open is still in flight -- the bar
+    // belongs to the URL that was handed over, not to whatever page the view has in its history.
     const std::string& page_url = browser_->page_url();
-    if (page_url != browser_page_url_seen_) {
+    if (!browser_native_ && !open_url_loading_ && page_url != browser_page_url_seen_) {
         browser_page_url_seen_ = page_url;
         const bool user_owns_field = browser_addr_active_ &&
             std::strcmp(browser_addr_buf_, browser_addr_submitted_.c_str()) != 0;
@@ -1123,28 +1416,35 @@ void Player::sync_browser_page(){
         }
     }
 
-    // CookieManager answer for the native-play button: only consumed when it still belongs to
-    // the page and the candidate this request was made for. BrowserView retires staler answers
-    // itself (generation token), so anything that no longer names `browser_cookie_url_` is
-    // dropped here too -- a candidate/navigation switch must never leave this waiting forever.
+    // CookieManager answer for the play button: consumed only while the page is still up and the
+    // answer names the URL the click asked about. BrowserView retires staler answers itself
+    // (generation token), so anything that no longer names `browser_cookie_url_` is dropped here
+    // too -- a navigation or a page leave must never leave this waiting forever.
     if (browser_cookie_pending_) {
         std::string url, cookies;
-        const BrowserMediaCandidate cand = browser_->candidate();
         if (browser_->take_cookies(url, cookies)) {
             browser_cookie_pending_ = false;
-            if (browser_page_ && cand.valid() && cand.url == url &&
-                url == browser_cookie_url_) {
-                begin_native_open(cand.url,
-                    browser_media_headers(cand.referer, cand.user_agent), cookies);
+            if (browser_page_ && url == browser_cookie_url_) {
+                browser_cookie_url_.clear();
+                begin_native_open(url, browser_native_headers(url), cookies);
             } else {
                 browser_cookie_url_.clear();
             }
-        } else if (!browser_->cookie_pending() || cand.url != browser_cookie_url_) {
-            // The lookup was cancelled or belongs to a candidate that is gone: stop waiting.
+        } else if (!browser_->cookie_pending()) {
+            // The lookup was cancelled (page left, newer action): stop waiting.
             browser_cookie_pending_ = false;
             browser_cookie_url_.clear();
         }
     }
+}
+
+// Replay context for a manually started native open: the page the URL came from as Referer
+// (many media hosts reject a bare request), no User-Agent override (FFmpeg's own is fine).
+std::string Player::browser_native_headers(const std::string& url){
+    if (!browser_) return std::string();
+    const std::string& page = browser_->page_url();
+    if (page.empty() || page == url) return std::string();
+    return browser_media_headers(page, std::string());
 }
 
 std::string Player::browser_media_headers(const std::string& referer,
@@ -1158,14 +1458,14 @@ std::string Player::browser_media_headers(const std::string& referer,
 
 // Hands `url` to the normal async open path (Python's do_open/do_reopen) with the request
 // context it needs, and puts the page into its loading state until Python calls
-// notify_open_url_finished(). Used by both a direct media link typed into the address bar
-// (no headers/cookies) and the native-play button (referer/UA/cookies from the page).
+// notify_open_url_finished(). Reached from the address bar's play button, the file picker and
+// a dropped file -- never from a submitted address (that is a navigation, see browser_submit).
 void Player::begin_native_open(const std::string& url, const std::string& headers,
                               const std::string& cookies){
     if (url.empty()) return;
-    // Any cookie lookup still in flight belongs to the action this one supersedes (a native-play
-    // click, or an older candidate): retire it so its late answer can never start a second open
-    // and overwrite the URL/headers that are handed over right here.
+    // Any cookie lookup still in flight belongs to the action this one supersedes (an older play
+    // click): retire it so its late answer can never start a second open and overwrite the
+    // URL/headers that are handed over right here.
     browser_cookie_pending_ = false;
     browser_cookie_url_.clear();
     if (browser_) browser_->cancel_cookies();
@@ -1182,11 +1482,10 @@ void Player::begin_native_open(const std::string& url, const std::string& header
     ui_intents_.open_cookies = cookies;
 }
 
-// Address bar Go / first-screen form Open. A http(s) direct link whose path is a supported
-// container/playlist goes straight to the native decoder (no page view involved); everything
-// else is a page the embedded browser has to load.
-void Player::browser_submit(const std::string& raw){
-    std::string url(raw);
+namespace {
+
+// Address/URL text as the user means it: surrounding whitespace and paste-quotes stripped.
+std::string normalize_url_text(std::string url){
     auto is_ws = [](unsigned char c) {
         return c == ' ' || c == '\t' || c == '\r' || c == '\n';
     };
@@ -1198,17 +1497,39 @@ void Player::browser_submit(const std::string& raw){
     if (url.size() >= 2 && ((url.front() == '"' && url.back() == '"') ||
                             (url.front() == '\'' && url.back() == '\'')))
         url = url.substr(1, url.size() - 2);
+    return url;
+}
 
-    auto starts_with_ci = [](const std::string& s, const char* prefix) {
+bool starts_with_http(const std::string& s){
+    static const char* const kPrefixes[] = { "http://", "https://" };
+    for (const char* prefix : kPrefixes) {
         const size_t n = std::char_traits<char>::length(prefix);
-        if (s.size() < n) return false;
+        if (s.size() < n) continue;
+        bool match = true;
         for (size_t i = 0; i < n; ++i)
             if (std::tolower(static_cast<unsigned char>(s[i])) !=
-                std::tolower(static_cast<unsigned char>(prefix[i])))
-                return false;
-        return true;
-    };
-    if (!starts_with_ci(url, "http://") && !starts_with_ci(url, "https://")) {
+                std::tolower(static_cast<unsigned char>(prefix[i]))) {
+                match = false;
+                break;
+            }
+        if (match) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+// The address bar's text, normalized (see normalize_url_text).
+std::string Player::browser_addr_text() const {
+    return normalize_url_text(std::string(browser_addr_buf_));
+}
+
+// Address bar Go / first-screen form Open: a valid http(s) address goes STRAIGHT to the page
+// view. No native open, no container probing, no fallback -- an ordinary web page appears from
+// the moment it is confirmed, and nothing about it depends on the media decoder.
+void Player::browser_submit(const std::string& raw){
+    const std::string url = normalize_url_text(raw);
+    if (!starts_with_http(url)) {
         open_url_show_error_ = true;
         open_url_show_load_error_ = false;
         return;
@@ -1216,24 +1537,31 @@ void Player::browser_submit(const std::string& raw){
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
 
+    // A navigation is the newest action: retire a play click still waiting for its cookie
+    // answer, so its late handover can never compete with what the user just asked for.
+    browser_cookie_pending_ = false;
+    browser_cookie_url_.clear();
+    if (browser_) browser_->cancel_cookies();
+
     const size_t n = std::min(url.size(), sizeof(browser_addr_buf_) - 1);
     std::memcpy(browser_addr_buf_, url.c_str(), n);
     browser_addr_buf_[n] = '\0';
     browser_addr_submitted_ = url; // the bar may follow this navigation (redirects included)
-    browser_page_url_seen_.clear(); // let the navigation result re-sync the bar
+    // `browser_page_url_seen_` is deliberately NOT touched: it means "the engine's URL the bar
+    // already mirrors", so the bar keeps the submitted text until the page really lands
+    // somewhere. A URL the engine cannot display (a video container it downloads instead of
+    // navigating) would otherwise revert the bar to the previous page one frame later -- and
+    // the play button would hand over the wrong address.
 
-    if (browser::looks_like_media_url(url)) {
-        begin_native_open(url, std::string(), std::string());
-        return;
-    }
-
+    // Native content gives the page back (the session pauses) and the view navigates.
+    browser_enter_web();
     ensure_browser();
-    if (browser_failed_ || !browser_) return; // page shows browser_unavailable
-    if (browser_->ready()) {
-        browser_->navigate(url);
-        browser_web_ = true;
-    } else {
-        browser_pending_nav_ = url; // controller still starting: navigate as soon as it is up
+    if (browser_ && !browser_failed_) {
+        if (browser_->ready()) {
+            browser_->navigate(url);
+        } else {
+            browser_pending_nav_ = url; // controller still starting
+        }
         browser_web_ = true;
     }
 }
@@ -1243,30 +1571,108 @@ void Player::browser_navigate(const std::string& url){
     browser_submit(url);
 }
 
+// The address bar's play button: the URL the user is looking at goes straight to the native
+// decoder, with the page's cookies as its replay jar. No extension or container gate -- whatever
+// FFmpeg can demux opens (query strings, percent-escapes, FLV/HLS/... included). A failure stays
+// a visible open error: this path never falls back to the page view.
 void Player::browser_play_native(){
-    if (!browser_page_ || !browser_ || browser_cookie_pending_ || open_url_loading_) return;
-    const BrowserMediaCandidate cand = browser_->candidate();
-    if (!cand.valid()) return;
+    if (!browser_page_ || open_url_loading_) return;
+    const std::string url = browser_addr_text();
+    if (url.empty()) return;
+    ensure_browser();
+    if (!browser_ || browser_failed_ || !browser_->ready()) {
+        // No engine to lend cookies from: open it anyway (the decoder needs no browser).
+        begin_native_open(url, std::string(), std::string());
+        return;
+    }
     browser_cookie_pending_ = true;
-    browser_cookie_url_ = cand.url;
-    browser_->request_cookies(cand.url);
+    browser_cookie_url_ = url;
+    browser_->request_cookies(url);
+}
+
+// Address-bar history/reload actions. Each one hands the content back to the page view first:
+// from the Native state that means pausing the session (browser_enter) so its audio/video does
+// not keep running behind the page -- and the page the engine is on becomes what gets drawn.
+void Player::browser_go_back(){
+    if (!browser_page_ || !browser_ || !browser_->ready()) return;
+    // No history to go back to: do NOT leave the Native content for nothing.
+    if (!browser_->can_go_back()) return;
+    browser_enter_web();
+    browser_->go_back();
+    browser_web_ = true;
+}
+
+void Player::browser_go_forward(){
+    if (!browser_page_ || !browser_ || !browser_->ready()) return;
+    if (!browser_->can_go_forward()) return;
+    browser_enter_web();
+    browser_->go_forward();
+    browser_web_ = true;
+}
+
+void Player::browser_reload(){
+    // Native: deliberately inert -- reload would drop the URL the live session is authenticated
+    // against, and the button is disabled in that state anyway.
+    if (!browser_page_ || browser_native_ || !browser_ || !browser_->ready()) return;
+    browser_->reload();
+    browser_web_ = true;
 }
 
 py::dict Player::browser_state() const {
     py::dict d;
+    const int kind = browser_content_kind();
     d["page"] = browser_page_;
+    d["native"] = browser_native_;
     d["web"] = browser_web_;
+    d["content"] = kind ? (kind == 1 ? "web" : kind == 2 ? "loading" : kind == 3 ? "native"
+                                                  : "unavailable")
+                        : "home";
     d["available"] = browser_ && browser_->ready();
     d["failed"] = browser_failed_ || (browser_ && browser_->failed());
     d["url"] = browser_ ? browser_->page_url() : std::string();
-    d["candidate"] = browser_ ? browser_->candidate().url : std::string();
-    d["referer"] = browser_ ? browser_->candidate().referer : std::string();
     d["loading"] = open_url_loading_;
     // Page-view audio follows visibility (muted while hidden), and a cookie handoff is in
     // flight while either side still waits -- both observable for scripted checks.
     d["muted"] = browser_ && browser_->muted();
     d["cookie_pending"] = browser_cookie_pending_ ||
         (browser_ && browser_->cookie_pending());
+    // Everything a scripted/real-input check needs to reason about the page's chrome.
+    d["address"] = std::string(browser_addr_buf_);
+    d["web_visible"] = browser_ && browser_->visible();
+    d["settings_open"] = ui_settings_open_;
+    d["stream_open"] = stream_popup_open_;
+    d["export"] = export_mode_;
+    d["can_back"] = browser_ && !open_url_loading_ && browser_->can_go_back();
+    d["can_forward"] = browser_ && !open_url_loading_ && browser_->can_go_forward();
+    // Same predicate the address bar uses for the reload button: something must be loaded, it
+    // must not be the Native content (reloading would drop the session's URL) and no open may
+    // be in flight.
+    d["can_reload"] = browser_ && browser_->ready() && !open_url_loading_ && !browser_native_ &&
+        !browser_->page_url().empty();
+    // Floating-chrome observables (Native hides the address bar unless revealed) and the video
+    // viewport the present thread would use right now (it must not depend on the bar).
+    d["addr_visible"] = browser_addr_visible_;
+    const D3D11_VIEWPORT vp = fit_viewport();
+    d["viewport"] = py::make_tuple(vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height);
+    // Settings overlay: "backdrop" is true only while the captured page is actually fronting
+    // the panel; the raw state is exposed for diagnostics/assertions
+    // (0 idle / 1 capture pending / 2 ready / 3 failed).
+    d["settings_backdrop"] = ui_settings_open_ && browser_backdrop_state_ == 2;
+    d["backdrop_state"] = browser_backdrop_state_;
+    // Which page the current backdrop was captured from (empty when none): lets a script prove a
+    // navigation re-captured instead of keeping the old picture.
+    d["backdrop_url"] = browser_backdrop_state_ == 2 ? browser_backdrop_url_ : std::string();
+    d["fullscreen"] = fullscreen_.load(std::memory_order_relaxed);
+    d["top_bar_visible"] = top_bar_visible_;
+    int b[4] = { 0, 0, 0, 0 };
+    if (browser_) browser_->bounds(b);
+    d["bounds"] = py::make_tuple(b[0], b[1], b[2], b[3]);
+    // Layout observables (see the members' comment): the page surface's rect and the Home form
+    // block's rect. A page surface clamped narrower than the client clips the entire form.
+    d["page_rect"] = py::make_tuple(browser_page_rect_[0], browser_page_rect_[1],
+        browser_page_rect_[2], browser_page_rect_[3]);
+    d["home_rect"] = py::make_tuple(browser_home_rect_[0], browser_home_rect_[1],
+        browser_home_rect_[2], browser_home_rect_[3]);
     return d;
 }
 
@@ -1280,22 +1686,38 @@ void Player::cancel_open_url(){
     decoder_.request_interrupt();
 }
 
-// Python calls this on the main thread when an async open finishes. Success leaves the page
-// (the new video takes over the client area); failure keeps it up showing
-// open_url_load_failed -- unless the user cancelled, which silently returns to the page.
+// Python calls this on the main thread when an async open finishes. Success keeps the page up
+// and turns it into the Native state (the video renders below the address bar, the bottom bar
+// comes back) -- the page is never left implicitly. Failure keeps the previous content with the
+// open_url_load_failed line, unless the user cancelled, which silently returns to it.
 void Player::notify_open_url_finished(bool ok){
-    const bool cancelled = open_cancel_requested_.load(std::memory_order_relaxed);
     if (ok) {
-        // Any successful open (page handover, direct media link, or a file dropped while the
-        // page was up) hands the client area back to the video.
-        if (browser_page_) browser_close_pending_ = true;
         open_url_loading_ = false;
         open_url_show_error_ = false;
         open_url_show_load_error_ = false;
+        // The session's video is now the page content. Only a page that is actually up adopts
+        // it (an ordinary local open keeps the page closed).
+        if (browser_page_) {
+            set_browser_native(true);
+            // The bar names what is now playing, whatever opened it: the address bar's play
+            // button goes through begin_native_open() (which already put the URL there), but a
+            // file picked with the open-file button or dropped on the window does not -- without
+            // this the bar would keep showing the old page URL.
+            const std::string& shown = video_path_;
+            const size_t n = std::min(shown.size(), sizeof(browser_addr_buf_) - 1);
+            std::memcpy(browser_addr_buf_, shown.c_str(), n);
+            browser_addr_buf_[n] = '\0';
+            browser_addr_submitted_ = shown;
+            // Pin the page URL as "already synced" so the page view's own URL cannot overwrite
+            // the native address while the page keeps its history in the background.
+            if (browser_) browser_page_url_seen_ = browser_->page_url();
+        }
     } else if (open_url_loading_) {
         open_url_loading_ = false;
         open_url_show_error_ = false;
-        open_url_show_load_error_ = !cancelled;
+        // A manual native open that failed is reported, never silently re-routed to the page
+        // view: only an explicit Cancel stays silent.
+        open_url_show_load_error_ = !open_cancel_requested_.load(std::memory_order_relaxed);
     }
     open_cancel_requested_.store(false, std::memory_order_relaxed);
 }
@@ -1396,7 +1818,6 @@ void Player::set_ui_strings(const py::dict& d){
     take("browser_unavailable", ui_str_.browser_unavailable);
     take("browser_go", ui_str_.browser_go);
     take("browser_play", ui_str_.browser_play);
-    take("browser_close", ui_str_.browser_close);
     take("input_cut", ui_str_.input_cut);
     take("input_copy", ui_str_.input_copy);
     take("input_paste", ui_str_.input_paste);

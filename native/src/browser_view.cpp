@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0
 //
 // WebView2 implementation of the embedded browser page -- see browser_view.h for the
-// contract (windowed child controller, read-only navigation/observation, main-thread only).
+// contract (windowed child controller, navigation + one-shot capture/cookie lookup,
+// main-thread only).
 
 #include "browser_view.h"
+
+#include <commctrl.h> // SetWindowSubclass / RemoveWindowSubclass (comctl32)
 
 #include <wrl/client.h>
 #include <wrl/implements.h> // Microsoft::WRL::Callback (COM callback → lambda adapter)
 
 #include "WebView2.h"
 
-#include <algorithm>
-#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
@@ -103,38 +104,6 @@ std::wstring user_data_folder(){
     return full;
 }
 
-std::string header_of(ICoreWebView2WebResourceRequest* request, LPCWSTR name){
-    if (!request) return std::string();
-    ComPtr<ICoreWebView2HttpRequestHeaders> headers;
-    if (FAILED(request->get_Headers(&headers)) || !headers) return std::string();
-    LPWSTR value = nullptr;
-    if (FAILED(headers->GetHeader(name, &value)) || !value) return std::string();
-    std::string out = browser::to_utf8(std::wstring(value));
-    CoTaskMemFree(value);
-    return out;
-}
-
-std::string uri_of(ICoreWebView2WebResourceRequest* request){
-    if (!request) return std::string();
-    LPWSTR uri = nullptr;
-    if (FAILED(request->get_Uri(&uri)) || !uri) return std::string();
-    std::string out = browser::to_utf8(std::wstring(uri));
-    CoTaskMemFree(uri);
-    return out;
-}
-
-bool has_media_extension(const std::string& path){
-    static const char* const kExt[] = { ".mp4", ".m3u8", ".mpd", ".webm", ".mov", ".mkv" };
-    const size_t dot = path.find_last_of('.');
-    if (dot == std::string::npos) return false;
-    std::string ext = path.substr(dot);
-    for (char& c : ext)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    for (const char* e : kExt)
-        if (ext == e) return true;
-    return false;
-}
-
 } // namespace
 
 namespace browser {
@@ -157,33 +126,6 @@ std::string to_utf8(const std::wstring& w){
     return s;
 }
 
-bool looks_like_media_url(const std::string& url){
-    // Scheme: http(s) only -- the decoder's own network profile keys off the same prefixes.
-    auto starts_with_ci = [&](const char* prefix) {
-        const size_t n = std::char_traits<char>::length(prefix);
-        if (url.size() < n) return false;
-        for (size_t i = 0; i < n; ++i)
-            if (std::tolower(static_cast<unsigned char>(url[i])) !=
-                std::tolower(static_cast<unsigned char>(prefix[i])))
-                return false;
-        return true;
-    };
-    std::string::size_type host_start = 0;
-    if (starts_with_ci("http://")) host_start = 7;
-    else if (starts_with_ci("https://")) host_start = 8;
-    else return false;
-    // Path only: a query string / fragment must not affect extension detection
-    // ("/stream.mp4?token=…" is a direct file; "/watch?f=movie.mp4" is a page).
-    std::string path = url.substr(host_start);
-    const size_t cut = path.find_first_of("?#");
-    if (cut != std::string::npos) path.resize(cut);
-    // Skip the authority: the extension check must look at the path, not the host
-    // ("https://cdn.mp4.example.com/watch" is not a media file).
-    const size_t slash = path.find('/');
-    if (slash == std::string::npos) return false;
-    return has_media_extension(path.substr(slash));
-}
-
 } // namespace browser
 
 // Every WebView2 COM pointer + event token lives here so browser_view.h stays free of the
@@ -192,13 +134,14 @@ struct BrowserView::Impl {
     ComPtr<ICoreWebView2Environment> env;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> webview;
+    // ICoreWebView2_2 carries the CookieManager (the manual native-play button's replay jar).
+    ComPtr<ICoreWebView2_2> webview2;
     // ICoreWebView2_8 (IsMuted) is queried once; older Evergreen runtimes leave it null and the
     // page simply cannot be muted (everything else keeps working).
     ComPtr<ICoreWebView2_8> webview8;
     EventRegistrationToken tok_source{};
     EventRegistrationToken tok_nav_starting{};
     EventRegistrationToken tok_nav_completed{};
-    EventRegistrationToken tok_web_resource{};
 };
 
 BrowserView::BrowserView()
@@ -285,6 +228,7 @@ void BrowserView::ensure_started(HWND parent){
 // no chrome of its own beyond the address bar.
 void BrowserView::configure_webview(){
     if (FAILED(impl_->webview.As(&impl_->webview8))) impl_->webview8.Reset();
+    if (FAILED(impl_->webview.As(&impl_->webview2))) impl_->webview2.Reset();
     ComPtr<ICoreWebView2Settings> settings;
     if (SUCCEEDED(impl_->webview->get_Settings(&settings)) && settings) {
         settings->put_AreDefaultContextMenusEnabled(FALSE);
@@ -314,29 +258,15 @@ void BrowserView::configure_webview(){
                 if (alive->load()) on_source_maybe_changed();
                 return S_OK;
             }).Get(), &impl_->tok_nav_completed);
-    // Observe (never modify) every request so the page's own media URL + Referer/User-Agent
-    // can be replayed by the native open. Reading the request is all this handler does --
-    // no response, header or body is touched.
-    impl_->webview->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-    impl_->webview->add_WebResourceRequested(
-        MakeHandler<ICoreWebView2WebResourceRequestedEventHandler>(
-            [this, alive](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
-                if (!alive->load() || !args) return S_OK;
-                ComPtr<ICoreWebView2WebResourceRequest> request;
-                if (FAILED(args->get_Request(&request)) || !request) return S_OK;
-                const std::string url = uri_of(request.Get());
-                if (!browser::looks_like_media_url(url)) return S_OK;
-                std::string referer = header_of(request.Get(), L"Referer");
-                const std::string user_agent = header_of(request.Get(), L"User-Agent");
-                if (referer.empty()) referer = page_url_;
-                record_candidate(url, referer, user_agent);
-                return S_OK;
-            }).Get(), &impl_->tok_web_resource);
 }
 
 void BrowserView::on_navigation_started(){
-    // A new document: the previous page's media is no longer what the address bar means.
-    clear_candidate();
+    // A new document: a snapshot taken for the old page must not back the settings overlay any
+    // more.
+    ++snapshot_gen_;
+    snapshot_pending_ = false;
+    snapshot_state_ = Snapshot::None;
+    snapshot_png_.clear();
 }
 
 void BrowserView::on_source_maybe_changed(){
@@ -347,13 +277,109 @@ void BrowserView::on_source_maybe_changed(){
     CoTaskMemFree(raw);
     if (url.empty() || url == page_url_) return;
     page_url_ = std::move(url);
-    clear_candidate(); // SPA/history navigation can skip NavigationStarting
 }
 
 void BrowserView::navigate(const std::string& url){
     if (!controller_ready_ || !impl_->webview || url.empty()) return;
-    clear_candidate();
     impl_->webview->Navigate(browser::to_wide(url).c_str());
+}
+
+void BrowserView::go_back(){
+    if (controller_ready_ && impl_->webview) impl_->webview->GoBack();
+}
+
+void BrowserView::go_forward(){
+    if (controller_ready_ && impl_->webview) impl_->webview->GoForward();
+}
+
+void BrowserView::reload(){
+    if (controller_ready_ && impl_->webview) impl_->webview->Reload();
+}
+
+bool BrowserView::can_go_back() const {
+    if (!controller_ready_ || !impl_->webview) return false;
+    BOOL can = FALSE;
+    return SUCCEEDED(impl_->webview->get_CanGoBack(&can)) && can;
+}
+
+bool BrowserView::can_go_forward() const {
+    if (!controller_ready_ || !impl_->webview) return false;
+    BOOL can = FALSE;
+    return SUCCEEDED(impl_->webview->get_CanGoForward(&can)) && can;
+}
+
+// ---- non-client resize forwarding (best effort) -------------------------------------------
+// See the declaration's comment in browser_view.h: only our-process windows can be subclassed
+// and the OS hit-tests the deepest (cross-process) one, so this cannot make the page view's
+// borders draggable by itself. Player::poll_page_view_border() is the half that does.
+namespace {
+
+constexpr UINT_PTR kChildSubclassId = 0x53554D55; // 'SUMU'
+
+bool is_border_hit(LRESULT hit){
+    switch (hit) {
+    case HTLEFT: case HTRIGHT: case HTTOP: case HTBOTTOM:
+    case HTTOPLEFT: case HTTOPRIGHT: case HTBOTTOMLEFT: case HTBOTTOMRIGHT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+LRESULT CALLBACK BrowserView::child_subclass_proc(HWND hwnd, UINT msg, WPARAM wparam,
+                                                  LPARAM lparam, UINT_PTR id, DWORD_PTR ref){
+    (void)id;
+    HWND parent = reinterpret_cast<HWND>(ref);
+    switch (msg) {
+    case WM_NCHITTEST: {
+        // Ask the parent window the same question it answers for its own chrome: the point
+        // (screen coords) lands on one of its resize bands -> the page view adopts that code,
+        // so dragging the border works even though the child window covers it.
+        const LRESULT hit = SendMessageW(parent, WM_NCHITTEST, wparam, lparam);
+        if (is_border_hit(hit)) return hit;
+        break;
+    }
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONUP:
+    case WM_NCLBUTTONDBLCLK:
+        // Only these three carry a non-client hit code, and they are only sent here because our
+        // WM_NCHITTEST above adopted one -- hand them to the parent so DefWindowProc starts
+        // (or ends) its native sizing/move loop on the toplevel window.
+        return SendMessageW(parent, msg, wparam, lparam);
+    default:
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wparam, lparam);
+}
+
+void BrowserView::install_child_subclasses(){
+    if (!parent_ || !IsWindow(parent_)) return;
+    struct Ctx {
+        HWND parent;
+        std::vector<HWND>* list;
+    } ctx{ parent_, &subclassed_ };
+    EnumChildWindows(parent_, [](HWND child, LPARAM lp) -> BOOL {
+        Ctx* c = reinterpret_cast<Ctx*>(lp);
+        if (child == c->parent) return TRUE;
+        for (HWND known : *c->list)
+            if (known == child) return TRUE; // already subclassed (idempotent)
+        if (SetWindowSubclass(child, &BrowserView::child_subclass_proc, kChildSubclassId,
+                reinterpret_cast<DWORD_PTR>(c->parent)))
+            c->list->push_back(child);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+}
+
+void BrowserView::remove_child_subclasses(){
+    for (HWND child : subclassed_)
+        if (IsWindow(child)) RemoveWindowSubclass(child, &BrowserView::child_subclass_proc, kChildSubclassId);
+    subclassed_.clear();
+}
+
+void BrowserView::keep_child_subclasses(){
+    if (controller_ready_) install_child_subclasses();
 }
 
 void BrowserView::set_bounds(int x, int y, int width, int height){
@@ -385,22 +411,9 @@ void BrowserView::apply_bounds(){
     if (impl_->webview8 &&
         SUCCEEDED(impl_->webview8->put_IsMuted(visible_ ? FALSE : TRUE)))
         muted_ = !visible_;
-}
-
-void BrowserView::record_candidate(const std::string& url, const std::string& referer,
-                                   const std::string& user_agent){
-    if (candidate_.url == url && candidate_.referer == referer) return;
-    candidate_.url = url;
-    candidate_.referer = referer;
-    candidate_.user_agent = user_agent;
-    // Any media switch invalidates the whole cookie handoff -- both the lookup still in flight
-    // AND an answer nobody consumed yet: both belong to the previous URL.
-    cancel_cookies();
-}
-
-void BrowserView::clear_candidate(){
-    candidate_ = BrowserMediaCandidate{};
-    cancel_cookies();
+    // WebView2 builds its child window tree lazily (and may add windows later), so the resize
+    // forwarding subclass is (re)installed here -- every call is idempotent per HWND.
+    install_child_subclasses();
 }
 
 void BrowserView::cancel_cookies(){
@@ -438,13 +451,12 @@ void BrowserView::request_cookies(const std::string& url){
         publish_cookies(url, std::string());
         return;
     }
-    ComPtr<ICoreWebView2_2> webview2;
-    if (FAILED(impl_->webview.As(&webview2)) || !webview2) {
+    if (!impl_->webview2) {
         publish_cookies(url, std::string());
         return;
     }
     ComPtr<ICoreWebView2CookieManager> manager;
-    if (FAILED(webview2->get_CookieManager(&manager)) || !manager) {
+    if (FAILED(impl_->webview2->get_CookieManager(&manager)) || !manager) {
         publish_cookies(url, std::string());
         return;
     }
@@ -454,9 +466,9 @@ void BrowserView::request_cookies(const std::string& url){
         MakeHandler<ICoreWebView2GetCookiesCompletedHandler>(
             [this, alive, url, gen](HRESULT result, ICoreWebView2CookieList* list) -> HRESULT {
                 if (!alive->load()) return S_OK;
-                // Stale answer (page left / navigated / candidate switched / a newer request
-                // was issued since): the generation no longer matches, so drop it silently
-                // instead of publishing it as the current page's cookies.
+                // Stale answer (page left / a newer request was issued since): the generation no
+                // longer matches, so drop it silently instead of publishing it as the current
+                // URL's cookies.
                 if (gen != cookie_gen_) return S_OK;
                 std::string jar;
                 UINT count = 0;
@@ -495,16 +507,97 @@ bool BrowserView::take_cookies(std::string& url, std::string& cookies){
     return true;
 }
 
+// ---- page snapshot (settings overlay backdrop) -------------------------------------------
+// WebView2's windowed controller paints into its own child HWND, so ImGui cannot draw anything
+// on top of the live page. The settings overlay therefore asks the engine for a PNG of the page,
+// draws THAT under the panel and hides the live view -- the page session, history and URL are
+// untouched, and closing the panel brings the same controller back.
+void BrowserView::request_snapshot(){
+    const uint64_t gen = ++snapshot_gen_;
+    snapshot_state_ = Snapshot::None;
+    snapshot_png_.clear();
+    if (!controller_ready_ || !impl_->webview) {
+        snapshot_pending_ = false;
+        snapshot_state_ = Snapshot::Failed;
+        return;
+    }
+    ComPtr<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream) {
+        snapshot_pending_ = false;
+        snapshot_state_ = Snapshot::Failed;
+        return;
+    }
+    snapshot_pending_ = true;
+    const std::shared_ptr<std::atomic<bool>> alive = alive_;
+    HRESULT hr = impl_->webview->CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+        stream.Get(),
+        MakeHandler<ICoreWebView2CapturePreviewCompletedHandler>(
+            [this, alive, stream, gen](HRESULT result) -> HRESULT {
+                if (!alive->load()) return S_OK;
+                if (gen != snapshot_gen_) return S_OK; // retired by a newer request/navigation
+                snapshot_pending_ = false;
+                if (result != S_OK) {
+                    snapshot_state_ = Snapshot::Failed;
+                    return S_OK;
+                }
+                STATSTG stat{};
+                if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart <= 0) {
+                    snapshot_state_ = Snapshot::Failed;
+                    return S_OK;
+                }
+                LARGE_INTEGER zero{};
+                if (FAILED(stream->Seek(zero, STREAM_SEEK_SET, nullptr))) {
+                    snapshot_state_ = Snapshot::Failed;
+                    return S_OK;
+                }
+                std::vector<uint8_t> png(static_cast<size_t>(stat.cbSize.QuadPart));
+                ULONG read = 0;
+                if (FAILED(stream->Read(png.data(), static_cast<ULONG>(png.size()), &read)) ||
+                    read != png.size()) {
+                    snapshot_state_ = Snapshot::Failed;
+                    return S_OK;
+                }
+                publish_snapshot(std::move(png));
+                return S_OK;
+            }).Get());
+    if (FAILED(hr)) {
+        snapshot_pending_ = false;
+        snapshot_state_ = Snapshot::Failed;
+    }
+}
+
+void BrowserView::publish_snapshot(std::vector<uint8_t> png){
+    if (png.empty()) {
+        snapshot_state_ = Snapshot::Failed;
+        return;
+    }
+    snapshot_png_ = std::move(png);
+    snapshot_state_ = Snapshot::Ready;
+}
+
+BrowserView::Snapshot BrowserView::take_snapshot(std::vector<uint8_t>& png){
+    if (snapshot_state_ == Snapshot::None) return Snapshot::None;
+    const Snapshot state = snapshot_state_;
+    snapshot_state_ = Snapshot::None;
+    if (state == Snapshot::Ready) png = std::move(snapshot_png_);
+    snapshot_png_.clear();
+    return state;
+}
+
 void BrowserView::shutdown(){
     if (!alive_) return;
     alive_->store(false);
     cancel_cookies(); // no late answer may be published after teardown
+    ++snapshot_gen_;
+    snapshot_pending_ = false;
+    snapshot_state_ = Snapshot::None;
+    snapshot_png_.clear();
+    remove_child_subclasses(); // before the child windows go away with the controller
     if (impl_) {
         if (impl_->webview) {
             impl_->webview->remove_SourceChanged(impl_->tok_source);
             impl_->webview->remove_NavigationStarting(impl_->tok_nav_starting);
             impl_->webview->remove_NavigationCompleted(impl_->tok_nav_completed);
-            impl_->webview->remove_WebResourceRequested(impl_->tok_web_resource);
             impl_->webview.Reset();
         }
         // Close() (not just Release) tears down the child window/process synchronously --

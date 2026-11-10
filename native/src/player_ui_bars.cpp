@@ -38,22 +38,23 @@ void Player::build_top_bar(float& out_height){
     out_height = bar_h;
 
     // Fullscreen: the title bar auto-hides and only appears when the mouse nears the TOP edge
-    // -- the same mouse-zone reveal the bottom bar uses at the bottom (build_bottom_bar()).
-    // In fullscreen the video fills the whole screen (fit_viewport() reserves no strip), so a
-    // hidden bar means nothing is drawn and the caption drag-rect must be cleared, otherwise
-    // WM_NCHITTEST would still report HTCAPTION over the (now invisible) top strip. In
-    // windowed mode the bar is always shown and its strip is reserved (task: title bar
+    // -- the same reveal rule the URL page's floating address bar uses (Player::
+    // mouse_in_top_reveal_zone()), so the two strips never drift apart. In fullscreen the video
+    // fills the whole screen (fit_viewport() reserves no strip), so a hidden bar means nothing
+    // is drawn AND it occupies no layout space (out_height = 0), and the caption drag-rect must
+    // be cleared, otherwise WM_NCHITTEST would still report HTCAPTION over the invisible strip.
+    // In windowed mode the bar is always shown and its strip is reserved (task: title bar
     // outside the video), so this whole block is skipped.
     if (fullscreen_.load(std::memory_order_relaxed)) {
-        const float show_zone_y = io.DisplaySize.y * 0.10f; // top 10%
-        bool mouse_in_zone = io.MousePos.y >= 0.0f && io.MousePos.y <= show_zone_y &&
-            io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
-        if (!mouse_in_zone) {
+        if (!mouse_in_top_reveal_zone()) {
             caption_drag_x0_ = caption_drag_x1_ = 0.0f; // disable phantom HTCAPTION while hidden
+            out_height = 0.0f;                          // floating chrome: no strip reserved
+            top_bar_visible_ = false;
             return;
         }
     }
 
+    top_bar_visible_ = true;
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, bar_h));
     // NoBackground: the bg is self-drawn right after Begin() with per-corner rounding --
@@ -100,9 +101,8 @@ void Player::build_top_bar(float& out_height){
     { // settings toggle: sliders-horizontal glyph from the lucide atlas (ui::AppIcon)
         IconButtonResult r = icon_button("##settings_btn", ImVec2(btn_w, btn_h), ui::AppIcon::Settings, settings_disabled);
         if (r.clicked) {
-            // The panel is drawn INTO the client area, which the page view covers -- leave the
-            // browser page first so the panel is never half-hidden behind the child window.
-            if (browser_page_) exit_browser_page();
+            // Inside the URL page the panel is drawn as part of the page (below the address
+            // bar) and the page view steps aside for it -- the page itself stays open.
             ui_settings_open_ = !ui_settings_open_;
             if (ui_settings_open_) settings_edit_init_ = false; // resync edit buffers to latest cfg on open
         }
@@ -115,7 +115,8 @@ void Player::build_top_bar(float& out_height){
         IconButtonResult r = icon_button("##open_btn", ImVec2(btn_w, btn_h), ui::AppIcon::OpenFile, export_nav_disabled);
         if (r.clicked) {
             if (export_mode_) ui_intents_.export_exit = true; // open exits the export page first
-            if (browser_page_) exit_browser_page(); // ...and the browser page too
+            // URL page: the picker opens directly; a cancelled picker leaves the page as-is and
+            // a picked file simply becomes the page's Native content (see notify_open_url_*).
             record_open_dialog();
         }
         if (ImGui::IsItemHovered() && !ui_str_.open_file.empty())
@@ -137,8 +138,7 @@ void Player::build_top_bar(float& out_height){
         IconButtonResult r = icon_button("##stream_btn", ImVec2(btn_w, btn_h), ui::AppIcon::WebServer, export_nav_disabled);
         if (r.clicked) {
             if (export_mode_) ui_intents_.export_exit = true; // web server exits the export page first
-            if (browser_page_) exit_browser_page(); // modal would sit behind the page view
-            request_stream_popup();
+            request_stream_popup(); // inside the URL page it opens over the page view
         }
         if (ImGui::IsItemHovered() && !ui_str_.stream_server.empty())
             ImGui::SetTooltip("%s", ui_str_.stream_server.c_str());
@@ -148,7 +148,7 @@ void Player::build_top_bar(float& out_height){
       // when already in it); disabled while an export is running.
         IconButtonResult r = icon_button("##export_btn", ImVec2(btn_w, btn_h), ui::AppIcon::Export, export_nav_disabled);
         if (r.clicked) {
-            if (browser_page_) exit_browser_page(); // export screen replaces the page view
+            // The export screen is an exclusive overlay; the URL page survives it.
             if (export_mode_) ui_intents_.export_exit = true;
             else ui_intents_.export_enter = true;
         }

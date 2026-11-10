@@ -121,7 +121,7 @@ add_custom_command(
 
 # ---- icon atlas embedding (assets/generated/icons_atlas.rgba -> icons_atlas.h) ----
 # Source of truth is assets/icons/lucide/*.svg; scripts/gen_icon_atlas.py rasterizes them
-# into this .rgba strip (18 tightly packed 96px cells; native resamples per-DPI at runtime).
+# into this .rgba strip (21 tightly packed 96px cells; native resamples per-DPI at runtime).
 # Same rationale as the logo embed: no image decoder in native.
 set(ICONS_RGBA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../assets/generated/icons_atlas.rgba")
 set(ICONS_RGBA_HEADER "${GENERATED_DIR}/icons_atlas.h")
@@ -131,7 +131,7 @@ add_custom_command(
         -DIN=${ICONS_RGBA_SRC}
         -DOUT=${ICONS_RGBA_HEADER}
         -DVARNAME=IconsAtlas
-        -DWIDTH=1728
+        -DWIDTH=2016
         -DHEIGHT=96
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
     DEPENDS "${ICONS_RGBA_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake"
@@ -189,6 +189,9 @@ target_link_libraries(sumu_core PRIVATE
     advapi32
     shlwapi
     version
+    comctl32
+    # WIC: decode the WebView2 page snapshot that backs the settings overlay.
+    windowscodecs
     avcodec
     avformat
     avutil

@@ -41,6 +41,9 @@ enum class AppIcon {
     FolderInput,   // folder-input (export path picker)
     Folder,        // folder (web-server root picker)
     Plus,          // plus (icon-text button standard: 新建预设/添加文件)
+    NavBack,       // arrow-left (browser page: back)
+    NavForward,    // arrow-right (browser page: forward)
+    Reload,        // rotate-cw (browser page: reload)
 };
 
 namespace icons {
@@ -49,7 +52,7 @@ namespace icons {
 // of kIconSrcPx (4x the 24px lucide grid, so the 2.5px stroke is a whole 10px -- the runtime
 // area resample always starts from a clean, integer-stroked image).
 inline constexpr int kIconSrcPx = 96;
-inline constexpr int kIconCount = static_cast<int>(AppIcon::Plus) + 1;
+inline constexpr int kIconCount = static_cast<int>(AppIcon::Reload) + 1;
 
 // Records the D3D11 device; per-size glyph textures are built lazily on first draw. Call
 // once after the device exists (Player::ui_init), pair with shutdown() before device

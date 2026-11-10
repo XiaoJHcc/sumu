@@ -13,7 +13,6 @@
   "browser_unavailable": "ウェブページを表示できません（WebView2 ランタイムなし）",
   "browser_go": "移動",
   "browser_play": "ネイティブ再生",
-  "browser_close": "ページを閉じる",
   "input_cut": "切り取り",
   "input_copy": "コピー",
   "input_paste": "貼り付け",

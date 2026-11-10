@@ -97,8 +97,8 @@ class _OpenState:
     """Cross-thread handoff for async open/reopen (network URLs). open()/reopen() release the GIL
     and may run tens of seconds on FFmpeg network IO; doing them on the main loop freezes the URL
     page. Worker writes the terminal result once; main applies play/error +
-    notify_open_url_finished. headers/cookies are the browser page's captured request context
-    (empty unless the page handed the media URL over)."""
+    notify_open_url_finished. headers/cookies are the replay context of a manually started
+    native open from the URL page (empty for every other open)."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -574,7 +574,7 @@ def main():
     def _finish_open_success(path, is_reopen):
         """Shared post-open bookkeeping after player.open/reopen succeeded (main thread)."""
         nonlocal opened, current_path, open_error_text, open_error_until, video_meta
-        nonlocal sched_failed_path, seek_error_text, seek_error_until
+        nonlocal sched_failed_path, seek_error_text, seek_error_until, browser_resume
         apply_target_fps_for_open()
         print(f"== player.{'reopen' if is_reopen else 'open'} == "
               f"fps={player.fps():.4f} frames={player.frame_count()} "
@@ -593,6 +593,10 @@ def main():
         sched_failed_path = None
         settings.push_recent(current_path)
         player.play()  # open_session() starts paused at frame 0; auto-play from the start.
+        # A successful open replaces whatever the URL page had paused for: the page now shows
+        # this new session as its Native content, so the NEXT hand-back to the web view must
+        # record/pause THIS video (not the stale pre-page one).
+        browser_resume = None
         try:
             player.notify_open_url_finished(True)
         except Exception:  # noqa: BLE001 -- older native builds without the method
@@ -605,11 +609,11 @@ def main():
             # Native close_session() already ran; open_session() failed -> no live session.
             opened = False
             current_path = None
-        _report_open_failed(path, err)
         try:
             player.notify_open_url_finished(False)
-        except Exception:  # noqa: BLE001 -- older native builds without the method
+        except Exception:  # noqa: BLE001 -- never let the handoff break the open path
             pass
+        _report_open_failed(path, err)
 
     def _finish_open_cancelled(path, is_reopen):
         """URL page loading-state Cancel: native interrupted the blocked FFmpeg open
@@ -1034,9 +1038,9 @@ def main():
                                                  # current video (or the open-prompt) meanwhile
             elif intents["open_path"]:
                 path = intents["open_path"]
-                # Request context captured by the browser page (Referer/User-Agent + cookies);
-                # empty for drops, the file dialog and direct media links typed into the bar.
-                # Passed straight to open/reopen -- never persisted, never logged.
+                # Replay context of a manually started native open from the URL page (Referer +
+                # cookies); empty for drops, the file dialog and local files. Passed straight to
+                # open/reopen -- never persisted, never logged.
                 open_headers = intents.get("open_headers") or ""
                 open_cookies = intents.get("open_cookies") or ""
             elif pending_open_path:

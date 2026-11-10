@@ -481,6 +481,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
+    // ---- keyboard focus hand-back ------------------------------------------------------
+    // The embedded page view is a child HWND: clicking it (or anything it does internally)
+    // moves the Win32 focus there, and from then on WM_KEYDOWN/WM_CHAR go to the child, not to
+    // this window -- ImGui would still have an active text field but never see a keystroke, so
+    // the address bar looked "untypeable". Any click delivered to the PARENT chrome therefore
+    // takes the focus back (clicks inside the page view never reach here, so the page keeps its
+    // own focus while the user is interacting with it).
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        if (self && GetFocus() != hwnd) SetFocus(hwnd);
+        break;
     case WM_DESTROY:
         if (self) self->set_quit();
         PostQuitMessage(0);

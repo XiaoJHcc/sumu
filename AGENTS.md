@@ -17,7 +17,7 @@ sumu（澄む）是一个**时钟驱动、全程 GPU** 的实时去马赛克预�
 
 - **呈现**：原生 **D3D11 flip-model swapchain**（DWM 原生、免撕裂）。present loop 跑原生线程，不吃 GIL。
 - **宿主**：极简 **Win32 窗口**，UI 覆盖层走 **Dear ImGui**（进度条 / scrub 缩略图 / 窗口 chrome / 设置旋钮 / 导出页 / 流媒体模态框）。
-- **网页**：URL 页内嵌 **WebView2**（系统 Evergreen Runtime，windowed child window 只覆盖地址栏以下；SDK 仅构建期，静态 loader，包内无 WebView2 DLL）。
+- **网页**：URL 页内嵌 **WebView2**（系统 Evergreen Runtime，windowed child window 只覆盖地址栏以下；SDK 仅构建期，静态 loader，包内无 WebView2 DLL）。地址栏常驻（后退/前进/刷新/URL/访问/播放，无关闭 X——页面内唯一退出口是首屏 Cancel），页面内容在 Home/Web/Loading/Native/Unavailable 间切换。**地址栏提交 = 纯导航**：普通网页从确认那刻起由 WebView2 渲染，不启动任何原生 open/探测；网页内的 `<video>`/媒体响应留在网页里播，引擎不观测页面流量，也绝不会自动切 Native。切 Native 只有一个入口——地址栏右侧**播放按钮**，把它当前持有的 URL（带 query/percent 转义/`.flv`/无后缀一律照收，不设扩展名门槛）连同页面 Referer 与 CookieManager 的 cookie 直接交给 FFmpeg，失败按普通打开错误报告、不回退网页；成功后是**页内的 Native 内容**（地址栏转为悬浮 chrome，仅顶部 reveal 区/正在输入时出现，不占布局）。设置面板叠在 CapturePreview 抓取的网页快照之上（系统 WIC 解码，`windowscodecs`）。
 - **语言**：**C++（VS2022 BuildTools）+ pybind11**，原生内核编译为模块 `sumu_core`（类 `Player`）暴露给 Python。
 - **解码**：基线走 **D3D11 硬解**（FFmpeg d3d11va）→ NV12 纹理 → shader → present，**基线不碰 CUDA**；AI 路径 NVDEC → torch，靠 **D3D11↔CUDA 零拷贝互操作**接起来。
 - **音频**：WASAPI，以 QPC 主时钟为准的**纯附加从属时钟**，不扰动 present 节奏。
@@ -91,7 +91,8 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `native\smoke_player.py {smoothness\|seek\|pause\|all}` | native Player 冒烟：4K60 流畅度 / 长片 seek 风暴 / pause 帧号冻结 |
 | `scripts\run_player.py [video] --seconds N [--seek-test] [--correctness]` | 端到端冒烟：接 Player+Scheduler，打印 ai_hit_rate / present；`--correctness` 用 PyAV CPU 解码交叉校验 RGBA 通道序与「马赛克确实被改」 |
 | `verify_i18n.py` / `verify_settings.py` / `verify_weights_resolve.py` | 无 GPU 快速检查：文案键对齐 / 设置往返与原子写 / 权重目录解析 |
-| `scripts/verify_browser.py` | 浏览器页 e2e：真实 WebView2 加载本地页面 → 捕获媒体 URL + Referer/UA + Cookie → 交接 UiIntents → 用这些头真的打开并推进帧 |
+| `scripts/verify_browser.py` | 浏览器页 e2e：真实 WebView2 加载本地页面；断言**地址栏提交只是导航**（不产生任何原生 open）、网页内媒体（`<video>` 与脚本 fetch）不会切 Native、地址栏播放按钮把当前 URL（query token + percent 转义 + 无后缀）连同 cookie jar 交给原生 open 并真的播放推进；含 back/forward/reload、Native 内容与「开成功不关页」、设置（快照底图叠加，开启中导航则旧底图作废重抓）/文件选择/Web 串流/导出都不离开页面，以及「导航作废在飞的 cookie 查询」「Native 地址栏 reveal」 |
+| `scripts/verify_browser_input.py` | 浏览器页真实输入：点击网页后点击地址栏 Ctrl+A 输入并回车真导航（无原生 open）；真实点击后退/前进/刷新按钮，且最左槽位是后退而非已删除的关闭 X；真实点击播放按钮把地址栏 URL 交给原生 open（含把带 query 的 `.flv` 地址打字进去再点播放）；真实点击标题栏全屏键进出全屏、全屏下标题栏与地址栏同步隐藏/顶部唤起且 viewport 不动；网页显示时真实拖动左/右/下边缘改变窗口且页面视图 bounds 跟随，且「页内按下再拖到边缘」不得缩放 |
 | `scripts\verify_video_formats.py` | GPU 色彩/格式归一化：BT.601/709、limited/full、10-bit、PQ/HLG、旋转/镜像；CUDA 输出对照公式与独立 FFmpeg，`--ai` 检查 AI 输入/呈现桥 |
 | `scripts\verify_playback_timeline.py` | VFR 时间网格与持帧内容、seek、fps_div、CFR/短视频、拼接 TS 防回退覆盖边界 |
 | `scripts\verify_network_recovery.py` | 本地 HTTP Range 主动断流/503 后恢复、真实 EOF 不重试、关窗打断挂起读取 |
@@ -114,7 +115,7 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `shot_running_app.py out.png [cx cy]` | 按标题 "sumu" 找已运行窗口，置顶/截图，可选按比例坐标发真实鼠标点击 |
 | `shot_bottom_bar.py` / `shot_buttons.py` | 空播放器底栏布局 / 导出页按钮、关闭键 hover 红、Web 服务器模态框 |
 | `shot_export_ui.py` / `shot_export_drag.py` | 导出页整体布局（合成快照）/ 队列真实鼠标拖拽排序 |
-| `shot_browser.py` | 浏览器页：首屏页内表单 / 真实网页 / 捕获媒体后原生播放按钮点亮（`native/trace/browser_*.png`） |
+| `shot_browser.py` | 浏览器页目检：首屏页内表单 / 真实网页（含播放按钮）/ Native 内容（bar 露出与隐藏）/ 设置叠在页面快照上（`native/trace/browser_*.png`） |
 | `shot_modals.py` / `calib_button_center.py` | 模态框 padding 像素级取证 / 按钮文字居中标定 |
 
 改 UI 后跑对应脚本目检 PNG；规范来源见 `docs/ui_design.md`「布局验证」。

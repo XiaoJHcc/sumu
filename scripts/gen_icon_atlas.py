@@ -51,6 +51,9 @@ ICONS = [
     "folder-input",    # FolderInput (export path picker)
     "folder",          # Folder (web-server root picker)
     "plus",            # Plus (icon-text button standard: 新建预设/添加文件)
+    "arrow-left",      # NavBack (browser page address bar)
+    "arrow-right",     # NavForward
+    "rotate-cw",       # Reload
 ]
 
 ICON_PX = 96    # raster size of one glyph (lucide grid is 24 -> 4x, stroke = whole 10px)

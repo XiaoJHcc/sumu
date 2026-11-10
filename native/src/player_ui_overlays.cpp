@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
-#include "browser_view.h" // BrowserView (page-view placement + media candidate)
+#include "browser_view.h" // BrowserView (page-view placement + cookie lookup)
 #include "imgui_internal.h" // ImGui::GetInputTextState -- URL field right-click menu
 
 // ---- product UI (M3) -- built on the main thread inside ui_tick(), between NewFrame()
@@ -11,9 +11,11 @@
 // executor (see take_ui_intents() and scripts/run_player.py).
 void Player::build_ui(){
     // Offline-export mode keeps the normal title bar (build_top_bar) and replaces only the
-    // client area below it with the export screen. The bar's settings button is disabled in
+    // client area below it with the export screen -- it is an EXCLUSIVE OVERLAY, not a
+    // navigation: the URL page (if open) stays alive underneath and build_browser_page() picks
+    // it up again the moment export mode is left. The bar's settings button is disabled in
     // export mode, and open/URL/web + the export toggle are disabled while an export is
-    // running (see build_top_bar) -- that gating replaces the old "返回" exit button.
+    // running (see build_top_bar).
     if (export_mode_) {
         float top_bar_h = 0.0f;
         build_top_bar(top_bar_h);
@@ -262,7 +264,12 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
     const bool want_select_all = select_all_pending && *select_all_pending;
     // "Select All" from an inactive field's menu: focus now, select next frame (the state only
     // exists once the field is active) -- the same two-frame pattern the focus flag uses.
-    if ((focus_pending && *focus_pending) || want_select_all) ImGui::SetKeyboardFocusHere();
+    if ((focus_pending && *focus_pending) || want_select_all) {
+        // ImGui's focus request only moves its own active id; the Win32 focus may still sit in
+        // the page view's child window (which would swallow every keystroke). Take it back.
+        if (hwnd_ && GetFocus() != hwnd_) SetFocus(hwnd_);
+        ImGui::SetKeyboardFocusHere();
+    }
     if (focus_pending) *focus_pending = false;
 
     bool enter = ui::TextInput(id, buf, cap, nullptr, width, ImGuiInputTextFlags_EnterReturnsTrue);
@@ -335,13 +342,27 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
     for (int i = 0; i < item_count; ++i)
         ctx_label_w = std::max(ctx_label_w, ImGui::CalcTextSize(items[i].label).x);
     const float ctx_menu_w = ctx_label_w + ctx_pad_x * 2.0f + ui_s(4.0f) * 2.0f; // + WindowPadding
-    ImGui::SetNextWindowSizeConstraints(ImVec2(ctx_menu_w, 0.0f), ImVec2(ctx_menu_w, FLT_MAX));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(4.0f), ui_s(4.0f)));
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, ui_s(ui::theme::kRadiusWindow));
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f); // border self-drawn below
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, ui::theme::kPanelBg);
+    // The menu's width is pinned through ImGui's "next window" hints (SetNextWindowSizeConstraints
+    // + style pushes). Those hints stick until the NEXT Begin() of the frame, so pushing them on a
+    // frame where the popup cannot appear clamps whatever window happens to be begun next -- in
+    // the URL page that is the page-content window, which then collapses to the menu's width and
+    // drags the whole Home form out of view (horizontal auto-scroll to the focused field). So they
+    // are only pushed when the menu can really open (right-click on the field) or already is open.
+    const bool ctx_open = ImGui::IsPopupOpen("##url_ctx");
+    out.ctx_open = ctx_open;
+    const bool ctx_active = ctx_open ||
+        (item_count > 0 && ImGui::IsItemHovered() &&
+            (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+             ImGui::IsMouseReleased(ImGuiMouseButton_Right)));
+    if (ctx_active) {
+        ImGui::SetNextWindowSizeConstraints(ImVec2(ctx_menu_w, 0.0f), ImVec2(ctx_menu_w, FLT_MAX));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_s(4.0f), ui_s(4.0f)));
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, ui_s(ui::theme::kRadiusWindow));
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0.0f); // border self-drawn below
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, ui::theme::kPanelBg);
+    }
     int ctx_action = -1; // 0=cut 1=copy 2=paste 3=select-all 4=paste&open; applied below
-    if (item_count > 0 && ImGui::BeginPopupContextItem("##url_ctx")) {
+    if (ctx_active && ImGui::BeginPopupContextItem("##url_ctx")) {
         ImDrawList* pdl = ImGui::GetWindowDrawList();
         const float row_h = ImGui::GetFrameHeight();
         const float row_w = ImGui::GetContentRegionAvail().x;
@@ -370,8 +391,10 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
             ui::theme::border_u32(), ui_s(ui::theme::kRadiusWindow), 0, 1.0f);
         ImGui::EndPopup();
     }
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(3);
+    if (ctx_active) {
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(3);
+    }
 
     if (ctx_action == 0) { // cut (only offered with a selection, so st is valid)
         const int a = st->GetSelectionStart(), b = st->GetSelectionEnd();
@@ -402,28 +425,31 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
 
 // ---- embedded browser page -----------------------------------------------------------------
 // First-screen "打开 URL" and the top bar's link icon both call request_open_url_popup(), which
-// now ENTERS this page (no modal). Layout: the shared title bar on top, then a minimal address
-// bar, then the page area. The page area is either the first-screen form (nothing loaded yet),
-// the loading card, the browser_unavailable placeholder, or the live WebView2 child window --
-// which is a REAL child HWND, so nothing ImGui draws can appear on top of it: the chrome strips
-// are laid out above its rectangle and the page view is hidden while the loading card or the
-// error line is up.
+// ENTERS this page (no modal). Layout: the shared title bar on top, then the page content; the
+// address bar is laid out between them as PERMANENT chrome (Home/Web/Loading/Unavailable) or as
+// FLOATING chrome over the video (Native). Content states (Player::browser_content_kind(), same
+// priority here as in browser_state()):
 //
-// Address bar: [close page] [URL field] [go] [native play]. Media direct links (see
-// browser::looks_like_media_url) skip the page entirely and go through the normal async native
-// open; any other URL is a page for the embedded engine. Native play hands the page's own media
-// request -- URL + Referer/User-Agent + cookies -- to the same async open, which is what makes
-// hotlink/token-protected pages work without a downloader.
+//   Loading      native open in flight -> spinner + Cancel over the page background
+//   Native       the playing session IS the content: the video uses exactly the ordinary
+//                viewport (fit_viewport() reserves only the title bar; the address bar reserves
+//                nothing) and the normal bottom bar stays available. The address bar is shown
+//                only while the cursor is in the top reveal strip or the field is in use.
+//   Web          the WebView2 child window (a REAL HWND: nothing ImGui draws can appear on top
+//                of it, so the chrome strips are laid out above its rect and it steps aside
+//                while an overlay, the settings snapshot or the loading card is up)
+//   Unavailable  WebView2 missing/failed -> one centered line
+//   Home         first-screen form (nothing loaded yet)
+//
+// Address bar: [back] [forward] [reload] [URL field] [go] [play]. A submitted http(s) URL is a
+// NAVIGATION -- the page view shows an ordinary web page immediately, with no native open, no
+// media detection and no fallback. The play button is the explicit manual native entry: it hands
+// the bar's URL to the decoder (any container FFmpeg can demux, no extension gate), and a
+// failure there is reported as an open error instead of being re-routed to the page. Nothing
+// here leaves the page implicitly: settings, the web-stream modal, the file picker, the export
+// overlay and a successful native open all keep it alive.
 void Player::build_browser_page(){
     ImGuiIO& io = ImGui::GetIO();
-
-    // A successful open closes the page (the video owns the client area again); this runs on
-    // the tick Python's notify_open_url_finished(True) landed.
-    if (browser_close_pending_) {
-        browser_close_pending_ = false;
-        exit_browser_page();
-        return;
-    }
     sync_browser_page();
 
     float top_bar_h = 0.0f;
@@ -433,18 +459,64 @@ void Player::build_browser_page(){
     const float pad = ui_s(ui::theme::kSpaceXS);
     const float ctrl_h = std::max(1.0f, addr_h - 2.0f * pad);
     const float ctrl_w = ctrl_h; // square icon buttons, same beat as the title bar
-    const float content_y = top_bar_h + addr_h;
-    const float content_h = std::max(0.0f, io.DisplaySize.y - content_y);
     const bool busy = open_url_loading_;
+    const int kind = browser_content_kind();
+    const bool is_web = kind == 1;
+    const bool is_native = kind == 3;
+
+    // The address bar is PERMANENT chrome while the page shows a page/form/loading, but FLOATING
+    // chrome while it shows the native video: then it reserves no space (the video viewport is
+    // exactly the ordinary one) and only appears with the top strip -- same reveal rule as the
+    // title bar in fullscreen -- or while the user is actually using it (typing, right-click
+    // menu). Showing/hiding it never changes layout or resizes anything.
+    const bool addr_pinned = browser_addr_active_ || browser_addr_focus_ ||
+        browser_addr_select_all_ || browser_addr_ctx_open_;
+    const bool addr_visible = !is_native || busy || mouse_in_top_reveal_zone() || addr_pinned;
+    browser_addr_visible_ = addr_visible;
+    const float content_y = top_bar_h + (addr_visible ? addr_h : 0.0f);
+    const float content_h = std::max(0.0f, io.DisplaySize.y - content_y);
+
+    // ---- settings overlay ------------------------------------------------------------------
+    // The panel is drawn ON the page, not instead of it: the page view is captured to a texture
+    // (BrowserView::request_snapshot), which backs the panel while the live view steps aside.
+    // The page session, URL and history are untouched; closing the panel restores the same
+    // controller. While the capture is in flight the live view stays up and the panel waits a
+    // frame; if it fails the panel falls back to the plain player background.
+    const bool settings_wanted = ui_settings_open_ && is_web;
+    if (!ui_settings_open_ && browser_backdrop_requested_) reset_page_backdrop_state();
+    if (settings_wanted && !browser_backdrop_requested_) {
+        browser_backdrop_requested_ = true;
+        browser_backdrop_state_ = 1; // pending
+        browser_backdrop_url_ = browser_ ? browser_->page_url() : std::string();
+        if (browser_) browser_->request_snapshot();
+    }
+    if (browser_backdrop_state_ == 1 && browser_) {
+        std::vector<uint8_t> png;
+        const BrowserView::Snapshot snap = browser_->take_snapshot(png);
+        if (snap == BrowserView::Snapshot::Ready)
+            browser_backdrop_state_ = upload_page_backdrop(png) ? 2 : 3;
+        else if (snap == BrowserView::Snapshot::Failed)
+            browser_backdrop_state_ = 3;
+    }
+    const bool backdrop_ready = settings_wanted && browser_backdrop_state_ == 2 &&
+        browser_backdrop_srv_ != nullptr;
+    const bool backdrop_failed = settings_wanted && browser_backdrop_state_ == 3;
+    const bool settings_pending = settings_wanted && browser_backdrop_state_ == 1;
 
     // ---- address bar -------------------------------------------------------------------
-    {
+    if (addr_visible) {
         ImGui::SetNextWindowPos(ImVec2(0, top_bar_h));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, addr_h));
+        // NoFocusOnAppearing: this chrome appears/disappears with the cursor position, so it can
+        // come back in the same frame a title-bar button is pressed -- an appearing window taking
+        // focus clears that button's ActiveId, and the release then lands nowhere (the click is
+        // silently dropped). Nothing here needs focus-on-appear: the URL field is focused
+        // explicitly (url_field's SetKeyboardFocusHere) when the user actually types.
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
             ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoFocusOnAppearing |
             ImGuiWindowFlags_NoBackground;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
@@ -460,12 +532,31 @@ void Player::build_browser_page(){
                 ui::theme::border_u32());
         }
         ImGui::SetCursorPosY((addr_h - ctrl_h) * 0.5f);
-        { // close page (destructive-neutral: goes back to the player)
-            IconButtonResult r = icon_button("##browser_close", ImVec2(ctrl_w, ctrl_h),
-                ui::AppIcon::Close, busy);
-            if (r.clicked) exit_browser_page();
-            if (ImGui::IsItemHovered() && !ui_str_.browser_close.empty())
-                ImGui::SetTooltip("%s", ui_str_.browser_close.c_str());
+        // History buttons follow the engine's live state; from Native they are the way back to
+        // the page that produced the media, and doing so pauses is handled by browser_enter_web().
+        const bool can_back = browser_ && !busy && browser_->can_go_back();
+        const bool can_forward = browser_ && !busy && browser_->can_go_forward();
+        // Reload needs something loaded to re-fetch (Home with no page has nothing) and stays
+        // disabled on the Native content, where it would drop the URL the session was opened
+        // against.
+        const bool can_reload = browser_ && browser_->ready() && !busy && !is_native &&
+            !browser_->page_url().empty();
+        {
+            IconButtonResult r = icon_button("##browser_back", ImVec2(ctrl_w, ctrl_h),
+                ui::AppIcon::NavBack, !can_back);
+            if (r.clicked) browser_go_back();
+        }
+        ImGui::SameLine();
+        {
+            IconButtonResult r = icon_button("##browser_forward", ImVec2(ctrl_w, ctrl_h),
+                ui::AppIcon::NavForward, !can_forward);
+            if (r.clicked) browser_go_forward();
+        }
+        ImGui::SameLine();
+        {
+            IconButtonResult r = icon_button("##browser_reload", ImVec2(ctrl_w, ctrl_h),
+                ui::AppIcon::Reload, !can_reload);
+            if (r.clicked) browser_reload();
         }
         ImGui::SameLine();
         const float right_w = 2.0f * (ctrl_w + pad);
@@ -476,6 +567,7 @@ void Player::build_browser_page(){
         field = url_field("##browser_addr", browser_addr_buf_, sizeof(browser_addr_buf_),
             field_w, &browser_addr_focus_, &browser_addr_select_all_);
         browser_addr_active_ = field.active;
+        browser_addr_ctx_open_ = field.ctx_open;
         ImGui::EndDisabled();
         ImGui::SameLine();
         { // go: navigate / open the address
@@ -486,9 +578,8 @@ void Player::build_browser_page(){
                 ImGui::SetTooltip("%s", ui_str_.browser_go.c_str());
         }
         ImGui::SameLine();
-        { // native play: only meaningful once the page requested a media URL
-            const bool have_media = browser_ && browser_->candidate().valid();
-            const bool disabled = busy || !have_media || browser_cookie_pending_;
+        { // native play: hands the URL in the bar to the decoder (no extension/container gate)
+            const bool disabled = busy || browser_addr_text().empty() || browser_cookie_pending_;
             IconButtonResult r = icon_button("##browser_play", ImVec2(ctrl_w, ctrl_h),
                 ui::AppIcon::Play, disabled);
             if (r.clicked) browser_play_native();
@@ -500,12 +591,11 @@ void Player::build_browser_page(){
         if (field.submit || field.submit_paste) browser_submit(browser_addr_buf_);
     }
 
-    // A live page is only shown when nothing else has to be readable in that area; the load
-    // error line below it is a strip of its own so the page can stay up behind the message.
-    const bool show_web = browser_web_ && browser_ && browser_->ready() && !browser_failed_ &&
-        !busy;
+    // Failure of a native open: on Home the form shows the line itself; on Web/Native it is a
+    // strip under the address bar (on Native the video stays behind it -- ImGui draws over it).
+    const bool show_err_strip = open_url_show_load_error_ && (is_web || is_native);
     float err_h = 0.0f;
-    if (show_web && open_url_show_load_error_) {
+    if (show_err_strip) {
         ImGui::PushFont(nullptr, kFontSizeSm);
         err_h = ImGui::GetTextLineHeight() + 2.0f * pad;
         ImGui::PopFont();
@@ -531,25 +621,52 @@ void Player::build_browser_page(){
         ImGui::PopStyleVar();
     }
 
-    // ---- page area ----------------------------------------------------------------------
+    // ---- page content -------------------------------------------------------------------
     const float page_y = content_y + err_h;
     const float page_h = std::max(0.0f, content_h - err_h);
-    if (!show_web) {
+    // Settings overlay: the captured page, 1:1 over the area the live view used to cover.
+    if (backdrop_ready) {
         ImGui::SetNextWindowPos(ImVec2(0, page_y));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, page_h));
+        ImGuiWindowFlags bd_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground |
+            ImGuiWindowFlags_NoInputs;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("##sumu_settings_backdrop", nullptr, bd_flags);
+        ImGui::Image((ImTextureID)(intptr_t)browser_backdrop_srv_.Get(),
+            ImVec2(io.DisplaySize.x, page_h));
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+    if (!is_web && !is_native) {
+        ImGui::SetNextWindowPos(ImVec2(0, page_y));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, page_h));
+        // NoFocusOnAppearing, same reason as the address bar above: chrome that can appear while
+        // a title-bar button is being pressed must not steal that button's ActiveId.
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
             ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoFocusOnAppearing;
         // Same card color as the first screen (kPanelBg) -- the page area is one surface.
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
-        ImGui::Begin("##sumu_browser_page", nullptr, flags);
+        const bool page_visible = ImGui::Begin("##sumu_browser_page", nullptr, flags);
+        if (page_visible) { // observable for scripts: the page surface must span the client
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            browser_page_rect_[0] = wp.x;
+            browser_page_rect_[1] = wp.y;
+            browser_page_rect_[2] = ws.x;
+            browser_page_rect_[3] = ws.y;
+        }
 
         if (busy) {
             // Loading state (native open in flight): spinner + Cancel, centered. Cancel
             // interrupts the blocked FFmpeg open (cancel_open_url -> AVIOInterruptCB); the
             // button greys out until Python calls notify_open_url_finished().
-            const float card_w = ui_s(200.0f);
             const float r = ImGui::GetFrameHeight() * 0.65f;
             const float d = r * 2.0f + std::max(1.5f, r / 6.0f);
             const float btn_w = ui_s(88.0f);
@@ -568,7 +685,7 @@ void Player::build_browser_page(){
                     ui::ButtonVariant::Secondary, ui::ControlSize::Regular, btn_w))
                 cancel_open_url();
             ImGui::EndDisabled();
-        } else if (browser_failed_) {
+        } else if (browser_failed_ || (browser_ && browser_->failed())) {
             const char* text = ui_str_.browser_unavailable.empty()
                 ? "Embedded browser unavailable" : ui_str_.browser_unavailable.c_str();
             ImGui::PushStyleColor(ImGuiCol_Text, ui::theme::kTextSecondary);
@@ -578,8 +695,8 @@ void Player::build_browser_page(){
             ImGui::TextUnformatted(text);
             ImGui::PopStyleColor();
         } else {
-            // First-screen form (the old URL modal's content, now a page): title, hint, field,
-            // open/cancel. Purely local state -- nothing here touches the page view.
+            // First-screen form: title, hint, field, open/cancel. Cancel is the page's other
+            // explicit exit (the address bar's close button is the first).
             const float form_w = ui_s(ui::theme::kModalContentW);
             const float hint_w = form_w;
             const float btn_w = ui_s(100.0f);
@@ -607,6 +724,12 @@ void Player::build_browser_page(){
             if (y < 0.0f) y = 0.0f;
 
             const float x0 = (io.DisplaySize.x - form_w) * 0.5f;
+            // Observable layout of the Home block (see browser_state()'s "home_rect"): the form
+            // must sit inside the page surface and be horizontally centered in it.
+            browser_home_rect_[0] = x0;
+            browser_home_rect_[1] = y;
+            browser_home_rect_[2] = form_w;
+            browser_home_rect_[3] = block_h;
             ImGui::SetCursorPos(ImVec2((io.DisplaySize.x - tsize.x) * 0.5f, y));
             ImGui::TextUnformatted(title);
             y += tsize.y + gap;
@@ -672,20 +795,37 @@ void Player::build_browser_page(){
 
         ImGui::End();
         ImGui::PopStyleColor(); // WindowBg
+    } else if (is_native) {
+        // Native: the session video is already on the swapchain behind this page (the ordinary
+        // viewport -- the floating address bar takes no space), so the page paints nothing here;
+        // only the usual bottom bar, so playback controls keep working inside the page.
+        build_bottom_bar();
     }
 
+    // ---- in-page overlays ---------------------------------------------------------------
+    // Both live INSIDE the page (neither navigates back to the player): the settings panel over
+    // the captured page snapshot (skipped for the one frame that capture is still in flight --
+    // the live page is what the user sees then), and the web-stream modal over the plain page
+    // background (the live page view steps aside for it and comes back unchanged).
+    if (ui_settings_open_ && !settings_pending)
+        build_settings_panel(top_bar_h + (addr_visible ? addr_h : 0.0f));
+    build_stream_popup();
+
     // ---- page view placement -------------------------------------------------------------
-    // The child window covers exactly the page area, below the chrome strips. Bounds/visibility
-    // are pushed every frame (both are no-ops when unchanged) so resize, DPI change, loading and
-    // hide/show transitions all land on the next tick without extra plumbing.
+    // The child window covers exactly the page area, below the chrome strips, and only when the
+    // page itself is what should be visible: not loading, not native, not covered by an overlay,
+    // not while the export screen owns the window. Bounds/visibility are pushed every frame
+    // (both are no-ops when unchanged) so resize, DPI change and every transition land on the
+    // next tick without extra plumbing.
     if (browser_) {
-        if (show_web) {
-            browser_->set_bounds(0, static_cast<int>(page_y),
-                static_cast<int>(io.DisplaySize.x), static_cast<int>(page_h));
-            browser_->set_visible(true);
-        } else {
-            browser_->set_visible(false);
-        }
+        // The live page stays up while the settings capture is in flight (no blank flash, and
+        // the engine needs visible frames to capture); once the backdrop is ready -- or the
+        // capture failed -- it steps aside for the panel.
+        const bool web_visible = is_web && !browser_overlay_open() && !export_mode_ &&
+            !backdrop_ready && !backdrop_failed;
+        browser_->set_bounds(0, static_cast<int>(page_y),
+            static_cast<int>(io.DisplaySize.x), static_cast<int>(page_h));
+        browser_->set_visible(web_visible);
     }
 }
 
@@ -695,6 +835,7 @@ void Player::build_browser_page(){
 // as a clickable link (TextLinkOpenURL → default browser) instead of the form -- no
 // persistent status float.
 void Player::build_stream_popup(){
+    stream_popup_open_ = false;
     if (stream_popup_) { ImGui::OpenPopup("###sumu_stream"); stream_popup_ = false; }
     bool open = true;
     // ID after ### matches OpenPopup("###sumu_stream"); BeginModal strips it for display and
@@ -703,6 +844,7 @@ void Player::build_stream_popup(){
         (ui_str_.stream_title.empty() ? std::string("Web stream") : ui_str_.stream_title)
         + "###sumu_stream";
     if (!ui::BeginModal(modal_title.c_str(), &open)) return;
+    stream_popup_open_ = true;
 
     // BeginModal pins the window width and insets the body by kPaddingContainer on all
     // four sides, and presets the item width to the full content column.

@@ -13,7 +13,6 @@
   "browser_unavailable": "无法显示网页（缺少 WebView2 运行时）",
   "browser_go": "访问",
   "browser_play": "原生播放",
-  "browser_close": "关闭网页",
   "input_cut": "剪切",
   "input_copy": "复制",
   "input_paste": "粘贴",

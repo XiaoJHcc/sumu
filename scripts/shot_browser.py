@@ -2,11 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0
 #
 # Visual check for the embedded browser page (native/src/player_ui_overlays.cpp
-# build_browser_page + native/src/browser_view.cpp). Writes three PNGs into native/trace/:
-#   browser_home.png  the page's first-screen form (title bar + address bar + centered form)
-#   browser_page.png  a real WebView2 page at the local server, address bar synced to it
-#   browser_play.png  a page carrying a <video>: the address bar's native-play button turns
-#                     active once the page's own media request has been captured
+# build_browser_page + native/src/browser_view.cpp). Writes four PNGs into native/trace/:
+#   browser_home.png   the page's first-screen form (title bar + address bar + centered form)
+#   browser_page.png   a real WebView2 page at the local server, address bar synced to it
+#   browser_play.png   a page carrying a <video>: the address bar with its (always available)
+#                      play button -- the manual native entry for whatever URL the bar holds
+#   browser_native.png the page's Native content with the floating address bar revealed (cursor
+#                      in the top strip): the video is letterboxed below the bar
+#   browser_native_bottom.png
+#                      the same Native content with the cursor at the bottom: the address bar is
+#                      hidden (floating chrome) and the normal bottom bar is shown
+#   browser_settings.png
+#                      the settings panel drawn OVER a captured snapshot of the live page
 # Layout is eyeballed -- no assertions here; scripts/verify_browser.py owns the functional
 # checks.
 #
@@ -29,6 +36,20 @@ sys.path.insert(0, os.path.join(ROOT, "python", "sumu"))
 
 import sumu_core  # noqa: E402
 from sumu import i18n  # noqa: E402
+
+_failures = 0
+
+
+def url_is(url, want):
+    return (url or "").split("#")[0].rstrip("/") == want.rstrip("/")
+
+
+def check(name, cond, detail=""):
+    global _failures
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}{(' -- ' + detail) if detail else ''}",
+          file=sys.stderr)
+    if not cond:
+        _failures += 1
 
 OUTDIR = os.path.join(ROOT, "native", "trace")
 SCALE = 1.5  # the shot harness runs at SUMU_UI_SCALE=1.5, same as shot_modals.py
@@ -90,6 +111,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/video":
             self._send(200, VIDEO_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if path == "/noext" and os.path.isfile(TEST_VIDEO):
+            self._serve_file(TEST_VIDEO)
+            return
         if path == "/movie.mp4" and os.path.isfile(TEST_VIDEO):
             self._serve_file(TEST_VIDEO)
             return
@@ -132,6 +156,43 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 class _Server(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+
+def navigate(p, url, seconds=3.0):
+    """Submit `url` like the app does: a NAVIGATION only (no native open involved)."""
+    p.browser_navigate(url)
+    run(p, seconds)
+
+
+def play_native(p, flow, seconds=25.0):
+    """Click the address bar's play button and complete the handover like the app: drain the
+    open_path intent, open/reopen with its replay context, report the result."""
+    p.browser_play_native()
+    intents = {}
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 6.0:
+        run(p, 0.05)
+        got = p.take_ui_intents()
+        if got.get("open_path"):
+            intents = got
+            break
+    if not intents:
+        return {}, False
+    ok = False
+    try:
+        args = dict(headers=intents.get("open_headers") or "",
+                    cookies=intents.get("open_cookies") or "")
+        if flow["opened"]:
+            p.reopen(intents["open_path"], **args)
+        else:
+            p.open(intents["open_path"], **args)
+        ok = True
+    except Exception as e:  # noqa: BLE001 -- a failed manual open is the app's error path
+        print(f"  native open failed: {e!r}"[:140], file=sys.stderr)
+    flow["opened"] = ok
+    p.notify_open_url_finished(ok)
+    run(p, seconds if ok else 2.0)
+    return intents, ok
 
 
 def run(p, seconds):
@@ -203,9 +264,22 @@ def main():
     user32.SetCursorPos(*park)
     run(p, 0.3)
     grab("browser_home.png")
+    # Layout guard for the first screen: the page surface must span the client and the Home
+    # form must be centered inside it. (A leaked ImGui "next window" size hint used to clamp the
+    # page surface to the right-click menu width, which clipped the whole form -- the real-app
+    # "Home is scrambled" bug.)
+    st = p.browser_state()
+    prect, hrect = st["page_rect"], st["home_rect"]
+    check("home: page surface spans the client width",
+          abs(prect[0]) <= 1 and prect[2] >= hrect[0] + hrect[2] and prect[2] > 200,
+          f"page_rect={prect} home_rect={hrect}")
+    check("home: form is centered in the page surface",
+          hrect[2] > 100 and abs((hrect[0] + hrect[2] * 0.5) - (prect[0] + prect[2] * 0.5)) <= 2,
+          f"page_rect={prect} home_rect={hrect}")
 
-    # 2. a real (text) page: the address bar's own Go path, then let WebView2 paint it
-    p.browser_navigate(f"{base}/page")
+    # 2. a real (text) page through the address bar (a plain navigation), then let WebView2 paint
+    flow = {"opened": False}
+    navigate(p, f"{base}/page")
     for _ in range(150):
         run(p, 0.1)
         state = p.browser_state()
@@ -216,21 +290,96 @@ def main():
     run(p, 0.3)
     grab("browser_page.png")
 
-    # 3. a page with a <video>: the native-play button lights up once its media request is in
-    p.browser_navigate(f"{base}/video")
+    # 3. a page with a <video>: it keeps playing inside the page (nothing switches to Native) and
+    #    the address bar's play button stays available as the manual native entry
+    navigate(p, f"{base}/video")
     for _ in range(150):
         run(p, 0.1)
-        if p.browser_state()["candidate"]:
+        st = p.browser_state()
+        if st["web_visible"] and st["url"].startswith(f"{base}/video"):
             break
     run(p, 1.0)
     user32.SetCursorPos(*park)
     run(p, 0.3)
     grab("browser_play.png")
 
+    # 4. Native content: the bar's play button hands the submitted media URL to the decoder and
+    #    the page KEEPS it as its Native content. The address bar is floating chrome there:
+    #    revealed with the cursor in the top strip, hidden otherwise (viewport never changes).
+    navigate(p, f"{base}/noext")
+    intents, opened = play_native(p, flow)
+    check("native: the play button opens the media URL", opened,
+          f"opened={opened} path={intents.get('open_path')!r}")
+    check("native: page shows the session video", p.browser_state()["native"],
+          f"{p.browser_state()}")
+    p.play()
+    run(p, 1.0)
+    p.pause()
+    # The native open re-fits the window to the video, so re-read the rect before steering.
+    user32.GetWindowRect(hwnd, ctypes.byref(rc))
+    top = (rc.left + int((rc.right - rc.left) * 0.5), rc.top + 8)
+    bottom = (rc.left + int((rc.right - rc.left) * 0.5), rc.bottom - 14)
+    user32.SetCursorPos(*top)
+    run(p, 0.8)
+    st = p.browser_state()
+    check("native: address bar revealed in the top strip", st["addr_visible"], f"{st}")
+    grab("browser_native.png")
+    user32.SetCursorPos(*bottom)
+    run(p, 0.8)
+    st_low = p.browser_state()
+    check("native: address bar hidden away from the top", not st_low["addr_visible"], f"{st_low}")
+    check("native: the bar does not move the video viewport",
+          st["viewport"] == st_low["viewport"], f"{st['viewport']} {st_low['viewport']}")
+    grab("browser_native_bottom.png")
+    print("native state:", st_low, file=sys.stderr)
+
+    # 5. settings over a captured snapshot of the live page (the page itself must stay alive).
+    navigate(p, f"{base}/page")
+    ok = False
+    for _ in range(150):
+        run(p, 0.1)
+        if p.browser_state()["web_visible"]:
+            ok = True
+            break
+    check("settings base: live page up", ok, f"{p.browser_state()}")
+    before = p.browser_state()
+    user32.GetWindowRect(hwnd, ctypes.byref(rc))
+    user32.SetCursorPos(rc.left + int(18 * SCALE), rc.top + int(18 * SCALE))
+    time.sleep(0.1)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)
+    time.sleep(0.05)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+    for _ in range(120):
+        run(p, 0.05)
+        if p.browser_state()["settings_backdrop"]:
+            break
+    st = p.browser_state()
+    check("settings drawn over the captured page",
+          st["settings_open"] and st["settings_backdrop"], f"{st}")
+    check("settings keeps the page and its URL",
+          url_is(st["url"], f"{base}/page") and st["url"] == before["url"], f"{st}")
+    user32.SetCursorPos(rc.left + int((rc.right - rc.left) * 0.5), rc.top + 8)
+    run(p, 0.4)
+    grab("browser_settings.png")
+    # close settings: back onto the gear, then click
+    user32.SetCursorPos(rc.left + int(18 * SCALE), rc.top + int(18 * SCALE))
+    time.sleep(0.1)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)
+    time.sleep(0.05)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+    run(p, 1.2)
+    st = p.browser_state()
+    check("closing settings restores the live page",
+          not st["settings_open"] and st["web_visible"], f"{st}")
+
     p.close()
     server.shutdown()
     server.server_close()
+    if _failures:
+        print(f"{_failures} layout check(s) FAILED", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

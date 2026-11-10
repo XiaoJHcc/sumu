@@ -64,11 +64,19 @@ p.pump_messages() / p.should_quit()   # Win32 消息泵，需在主线程周期�
 # ---- 浏览器页（URL 页 + WebView2 内嵌页）----
 p.request_open_url_popup()  # 进入浏览器页（首屏/顶栏入口；不再弹 modal），记录 browser_enter
 p.exit_browser_page()       # 退出浏览器页（隐藏子窗口），记录 browser_exit
-p.browser_navigate(url)     # 地址栏「访问」：媒体直链走原生 open，其余交给 WebView2 导航
-p.browser_play_native()     # 地址栏「原生播放」：取页面捕获的媒体地址 + Referer/UA + cookies
-                            # 后写 open_path/open_headers/open_cookies
-p.browser_state()           # 页视图状态 dict（page/web/available/failed/url/candidate/
-                            # referer/loading/muted/cookie_pending）
+p.browser_navigate(url)     # 地址栏「访问」：纯导航，交给 WebView2（绝不启动原生 open）
+p.browser_go_back()         # 地址栏后退 / 前进 / 刷新（Native 下 back/forward 会退回 Web
+p.browser_go_forward()      # 并暂停原生播放；reload 在 Native 下是 no-op）
+p.browser_reload()
+p.browser_play_native()     # 地址栏「播放」：把地址栏当前 URL 直接交给原生 open（附页面
+                            # Referer + CookieManager 取的 cookie），写
+                            # open_path/open_headers/open_cookies
+p.browser_state()           # 页视图状态 dict：page/native/web/content(home|web|loading|
+                            # native|unavailable)/available/failed/url/
+                            # loading/muted/cookie_pending/address/web_visible/settings_open/
+                            # stream_open/export/can_back/can_forward/can_reload/bounds/
+                            # page_rect/home_rect/addr_visible/viewport/settings_backdrop/
+                            # backdrop_state/backdrop_url/fullscreen/top_bar_visible
 p.set_park_on_close(on)      # 关窗驻留开关：on 时 X/ESC 不再直接退出，而是经
                              # take_ui_intents() 的 close_request 交给 Python 决定驻留/退出
 p.hide_window() / p.show_window()   # 驻留：隐藏窗口 / 恢复并前台化（present 保持运行，
@@ -126,32 +134,118 @@ BrowserView 自己的槽里，由 Player 每帧 `take_cookies()` 取。回调因
   加载态/播放按钮永久卡住。
 - **代际令牌**：每次 `request_cookies()`/`cancel_cookies()` 都 `++cookie_gen_`，回调捕获发起时
   的代际，不匹配就静默丢弃。重复请求同一 URL、先取消再请求，都不会被旧答案顶替。
-- **后发动作胜出**：换候选（`record_candidate`）、清候选（`clear_candidate`）、退出网页、
-  `BrowserView::shutdown()`、以及 Player 的 `begin_native_open()`（即任何新的原生 open，
-  含地址栏直链）都会 `cancel_cookies()`——同时作废在飞查询与尚未被取走的答案。Player 侧
-  `browser_cookie_pending_` 每帧还会用 `browser_cookie_url_` 与当前候选比对，不一致或
-  BrowserView 已不再等待时立即停止等待，不会残留 true。
+- **后发动作胜出**：退出网页、地址栏再次导航（`browser_submit`）、新的一次「播放」点击
+  （`begin_native_open`）、`BrowserView::shutdown()` 都会 `cancel_cookies()`——同时作废在飞
+  查询与尚未被取走的答案。Player 侧 `browser_cookie_pending_` 每帧还会用
+  `browser_cookie_url_` 比对，不一致或 BrowserView 已不再等待时立即停止等待，不会残留 true。
 
 **页面视图的静音联动**：`set_visible()`/`apply_bounds()` 在切换可见性时同时调用
-`ICoreWebView2_8::put_IsMuted(!visible)`——加载卡片/关闭网页/窗口驻留时网页自身的声音必须停，
+`ICoreWebView2_8::put_IsMuted(!visible)`——加载卡片/离开网页/窗口驻留时网页自身的声音必须停，
 否则会和恢复的旧视频或新起的原生播放叠在一起；重新显示即取消静音（取不到该接口的老
 Runtime 安全跳过，`browser_state()['muted']` 反映最后一次成功应用的状态）。
 
-**媒体候选**：`WebResourceRequested` 里按 `browser::looks_like_media_url()` 过滤（http(s)
-且**路径**扩展名属 mp4/m3u8/mpd/webm/mov/mkv；查询串/域名不参与判定；m4s/ts 等分片不算），
-记录最新一条的 URL + `Referer` + `User-Agent`（缺 Referer 时用当前页地址）。用户点「原生
-播放」时才取 Cookie，然后写 `UiIntents.open_path/open_headers/open_cookies`；地址栏里直接
-输入的媒体直链走同一 open 通道但不带这些头。
+**网页内媒体不接管**：浏览器页**不观测、不改写页面流量**（没有 `WebResourceRequested` /
+`WebResourceResponseReceived` 订阅，也没有媒体候选/HLS 分片钉住）。网页里的 `<video>`、
+fetch 出来的媒体响应都留在 WebView2 自己播，页面不会因为「发现了媒体」而切进 Native——切
+Native 只有一个入口：地址栏右侧的播放按钮（见下）。
 
-**打开/失败语义**：原生 open 期间页面显示原 loading（spinner + Cancel，`cancel_open_url()`
-仍中断阻塞中的 `avformat_open_input`）；`notify_open_url_finished(True)` 退出浏览器页（视频
-接管客户区），失败则留在页面上显示 `open_url_load_failed`（网页可见时是地址栏下方一条
-独立错误行，网页整体下移它的高度——因为子窗口盖不住 ImGui）。进入浏览器页记
-`browser_enter`，Python 据此暂停并记住"进入前是否在播"；退出记 `browser_exit`，仅当仍是
-同一会话且仍未播放时恢复。
+**内容状态机**：页面内容由 `Player::browser_content_kind()` 唯一裁决，优先级
+Loading > Native > Web > Unavailable > Home（`browser_state()['content']` 与布局同源）：
+
+- **Native**：播放中的会话就是页面内容。`notify_open_url_finished(True)` 只把页面切进
+  Native，**绝不关闭页面**，并用 `video_path_` 统一回填地址栏与「已提交」状态——不论是播放
+  按钮、打开文件按钮还是拖入文件，地址栏显示的都是真正在播的那一个。
+  视频的 letterbox 与普通播放完全一致（只扣标题栏，`fit_viewport()` 不再为地址栏预留任何
+  高度），底栏照常可用，WebView2 子窗口隐藏并静音。
+
+  **地址栏在这一态是悬浮 chrome**：`browser_addr_visible_` = 光标位于顶部 reveal 区
+  （`Player::mouse_in_top_reveal_zone()`，顶部 10%，与全屏标题栏共用同一判定）**或**地址
+  输入正在使用（active / 聚焦中 / 右键菜单开着）。隐藏时不占布局（页面内容从标题栏下沿开
+  始），显示/隐藏都不会移动视频 viewport、也不触发窗口 resize；Web/Home/Loading 等状态地址
+  栏仍常驻。全屏时标题栏与地址栏一起按同一条 reveal 规则出现/消失（标题栏隐藏时
+  `build_top_bar()` 把占位高度返回 0）。
+  **悬浮 chrome 的输入纪律**：这类「随光标出现/消失」的窗口一律带
+  `ImGuiWindowFlags_NoFocusOnAppearing`。否则窗口重新出现的那一帧会 `FocusWindow()`，把同一
+  帧里刚按下的标题栏按钮的 `ActiveId` 清掉，松开时点击落空（实测：光标进入顶部 reveal 区、
+  地址栏恰好出现的那一帧按下的全屏按钮被吞掉，表现为「偶尔要点两次」）。地址栏输入框的键盘
+  焦点本来就由 `url_field()` 显式 `SetKeyboardFocusHere()` 取得，不依赖 appear 聚焦。
+- **Web**：WebView2 子窗口。地址栏后退/前进/刷新都走引擎真实历史。从 Native 交回页面只有
+  两条路，都要先 `browser_enter_web()`（发 `browser_enter`，让 Python 暂停会话）：
+  ① 地址栏提交新的地址；② 点后退/前进/刷新——公共动作先查 `can_go_back()/can_go_forward()`，
+  没有历史就不动，避免白白切走原生内容。刷新在 Native 下刻意 no-op（重载会丢掉会话认证的
+  地址），在 Home（没有已加载页面）时同样禁用：`can_reload` 还要求 `page_url()` 非空。
+
+**地址栏提交 = 导航（没有原生探测）**：`browser_submit()` 只做三件事——校验 http(s)、把文本
+写回地址栏与「已提交」状态、`browser_enter_web()` 后交给 WebView2 导航（controller 未就绪时
+排队到 `browser_pending_nav_`）。普通网页从确认那一刻起就由 WebView2 渲染，**不启动任何原生
+open**，页面显示不依赖 FFmpeg 成功、失败或超时。提交的地址会一直留在地址栏，直到引擎报告它
+落在了别的 URL（重定向/另一页）——`browser_page_url_seen_` 只记「地址栏已镜像的引擎 URL」，
+提交本身不动它，否则引擎无法渲染的地址（视频容器被当作下载）会在一帧后被旧页 URL 覆盖，
+播放按钮就会拿到错地址。
+
+**播放按钮 = 手动原生入口**：`browser_play_native()` 取**地址栏当前文本**
+（`browser_addr_text()` 去空白/去粘贴引号），而不是任何「捕获到的媒体地址」；用 CookieManager
+取该 URL 的 cookie jar 后调 `begin_native_open(url, headers, cookies)` →
+`open_path/open_headers/open_cookies`。不设容器扩展名门槛：带 query token、percent 转义、
+`.flv`、完全无后缀一律原样交给 FFmpeg。`headers` 只在地址栏 URL 与当前页面 URL 不同时带
+`Referer: <页面 URL>`（多数防盗链站点要它），`User-Agent` 不再覆写。失败走既有错误路径
+（`notify_open_url_finished(False)` → `open_url_load_failed`），**绝不回退**到 WebView2 导航；
+只有用户 Cancel 是静默的。新动作（再点播放、再次导航、离开页面）都会作废在飞的 cookie 查询
+（见上「后发动作胜出」）。Python 侧 `app.py::_finish_open_failed` 现在只调
+`notify_open_url_finished(False)` 并照常 `_report_open_failed`。
+
+**打开文件对话框**不再带媒体扩展名 filter（只留「所有文件」），能否播放同样交给 FFmpeg；
+导出保存对话框的 mp4 filter 保持不变。
+- **Loading / Unavailable / Home** 同前。
+
+**设置面板叠在网页上（页面快照底图）**：窗口式 WebView2 是真实子 HWND，ImGui 无法画在它
+之上。打开设置时 `BrowserView::request_snapshot()` 用 `CapturePreview` 异步抓当前网页 PNG
+（内存流，不落盘），Player 在 `d3d_mutex_` 下用系统 WIC 解码成 BGRA 并建 D3D11 纹理；抓图就绪
+后隐藏活视图，在原内容区绘制这张底图，再把设置面板画在上面。网页会话/历史/URL 都不销毁不跳
+转，关闭设置恢复同一个 live WebView2。要点：
+
+- **抓图期间活视图必须可见**：CapturePreview 要有可见帧才能完成（实测：隐藏后请求会挂起十几
+  秒才补上），所以 pending 时保持网页显示、面板晚一帧绘制，绝不闪出播放器底色。
+- 失败（抓图或解码失败）回退成旧行为（隐藏活视图、面板画在页面上），页面状态不受影响。
+- 捕获结果是**轮询**的（`take_snapshot()`），带 generation/alive 守卫：导航、关闭页面、导出、
+  shutdown 都会作废旧结果，晚到的回调不会写旧状态。
+- **设置开启时导航**：底图属于旧页面，`sync_browser_page()` 一旦发现页面 URL 与
+  `browser_backdrop_url_`（请求抓图时记下的 URL）不一致、或内容不再是 Web，就作废该底图并交
+  回同一套 `request_snapshot()` 流程重抓——面板最终显示的是新页面的图，`backdrop_url` 即它的
+  出处；每帧不会重复抓图（一次导航仍只抓一张）。
+- Web 串流模态框仍是旧的「让位」行为（隐藏+静音活视图），本次不改。
+
+**退出口**：地址栏上没有「关闭网页」按钮（已删除）；页面内唯一的退出口是首屏表单的
+Cancel（加上 Python 的 `exit_browser_page()`），它产生 `browser_exit`。设置面板、打开文件（含取消选择）、Web 串流模态框、离线导出都不再离开页面：前两者
+/模态框画在页面内且期间隐藏网页子窗口，导出是独占覆盖层（`set_export_mode(true)` 隐藏
+并静音网页），退出后由 `build_browser_page()` 恢复同一页。原生 open 失败时留在原内容上
+显示 `open_url_load_failed`（Web/Native 下是地址栏下方一条独立错误行）。
+
+**暂停/恢复语义**：进入页面、以及从 Native 退回 Web，都发 `browser_enter`；Python 记录
+「当前会话 + 是否在播」并暂停（`browser_resume`，且每次原生 open 成功都会清空它，所以下一次
+进入记录的是*新*视频）。只有显式退出页面才发 `browser_exit`，Python 仅在「仍是同一会话且
+仍未播放」时恢复。
 
 **不可用降级**：Runtime 缺失/创建失败只会让页面显示 `browser_unavailable` 一行文字；
 Player 构造、退出、本地文件与媒体直链的原生打开都不经过 WebView2。
+
+**页面视图的键盘焦点**：页面视图是子 HWND，点击它会把 Win32 焦点带走，之后
+WM_KEYDOWN/WM_CHAR 不再进本窗口（地址栏看起来"打不进字"）。`WndProc` 对送达本窗口的
+WM_LBUTTONDOWN/DBLCLK 统一 `SetFocus(hwnd)` 收回；`url_field()` 的程序化聚焦（入页/重入页
+把光标放回地址栏）同样先收回焦点。点击页面视图自身不受影响（那些消息根本不进本窗口）。
+
+**页面视图的边缘缩放（实测结论）**：WebView2 的窗口链是
+`Sumu_Player_WndClass → Chrome_WidgetWin_0`（本进程）`→ Chrome_WidgetWin_1 →
+Chrome_RenderWidgetHostHWND`（WebView2 浏览器进程）`→ Intermediate D3D Window`（GPU 进程）。
+OS 只对**最深层**窗口做命中测试，而最深层那三个都不属于本进程，`SetWindowSubclass` 对
+它们无效（`browser_view.cpp` 的子窗口子类化只覆盖到 `Chrome_WidgetWin_0`，保留作为窗口
+链变化时的第一道防线，它**不能**让跨越进程的子窗口可拖拽）。因此边缘拖拽由 `Player::poll_page_view_border()` 自绘状态机接管，分 **hover → arm →
+drag** 三段：光标在按钮**抬起**时悬停在缩放带内（且该点在页面视图矩形内）才置
+`page_resize_armed_`；左键按下时只有已经 arm 的才算拖拽起点，所以「在网页里按下选择文字、
+再拖到边缘」永远不会缩放窗口。拖拽期间按光标位移直接 `SetWindowPos`（驱动 WM_SIZE →
+swapchain 与页面视图 bounds 同步跟随），松开后 armed/active 一并清空。悬停与拖拽期间都
+按方向设置系统缩放光标（横向/纵向/两个对角），避免边缘看起来仍不可拖。不加任何 padding、
+不改页面矩形，缩放带以外的一切点击照常交给网页。
 
 ## 线程/锁模型（继承 Spike 2，新增 `decoder_mutex_`/`trace_mutex_`）
 

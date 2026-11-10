@@ -13,7 +13,6 @@
   "browser_unavailable": "Web pages unavailable (WebView2 Runtime missing)",
   "browser_go": "Go",
   "browser_play": "Play natively",
-  "browser_close": "Close page",
   "input_cut": "Cut",
   "input_copy": "Copy",
   "input_paste": "Paste",

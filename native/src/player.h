@@ -528,29 +528,48 @@ public:
     //
     // Entered by the first-screen "打开 URL" button and the top bar's link icon
     // (request_open_url_popup -- kept as the entry point's name for compatibility, it no
-    // longer opens a modal): the title bar stays, a minimal address bar appears under it and
-    // the client area below becomes a page view. The address bar closes the page, navigates,
-    // and hands the page's own media URL to the native decoder ("原生播放"). See
-    // build_browser_page() (player_ui_overlays.cpp) for the layout and
-    // docs/native_core.md for the design.
+    // longer opens a modal). The page owns the client area below the title bar: a constant
+    // address bar (back / forward / reload / URL / go / native play) plus one content state --
+    // Home (first-screen form), Web (WebView2 child window), Loading (native open in flight),
+    // Native (the session video fills the page) or Unavailable (no WebView2).
+    //
+    // A submitted address is a NAVIGATION: ordinary web pages appear immediately, with no
+    // native open, no media detection and no fallback. Only the bar's play button hands the
+    // address to the native decoder, and its failure stays a visible open error.
+    //
+    // Nothing leaves the page implicitly: a successful native open, the settings panel, the
+    // web-stream modal, the file picker and the export screen all keep it alive -- export is an
+    // exclusive overlay that hands the page back on exit. The first-screen form's Cancel is the
+    // only page-local exit, and the only thing that emits browser_exit. See
+    // build_browser_page() (player_ui_overlays.cpp) for the layout and docs/native_core.md for
+    // the design.
     void request_open_url_popup();
 
     void exit_browser_page();
 
-    // Same action as the address bar's Go: a supported media direct link goes straight to the
-    // native open, anything else navigates the page view. Exposed for scripts/verify_browser.py.
+    // Same action as the address bar's Go: navigates the page view. Exposed for scripts.
     void browser_navigate(const std::string& url);
 
-    // Same action as the address bar's native-play button: replays the captured media URL
-    // (with the page's Referer/User-Agent and its cookies) through the normal async open.
+    // Address bar back / forward / reload. From the Native state these hand the content back to
+    // the page view (browser_enter pauses the native session); reload is a no-op while Native
+    // (it would drop the URL the session is authenticated against). Exposed for scripts.
+    void browser_go_back();
+    void browser_go_forward();
+    void browser_reload();
+
+    // Same action as the address bar's native-play button: hands the bar's current URL to the
+    // normal async open (with the page's cookies as the replay jar). Any container FFmpeg can
+    // demux opens -- no filename extension is consulted. Exposed for scripts.
     void browser_play_native();
 
     // Test/debug view of the page state (no side effects).
     py::dict browser_state() const;
 
-    // Python calls this on the main thread when an async open finishes. Success closes the
-    // browser page (the video takes over); failure keeps it up with the open_url_load_failed
-    // line, unless the user cancelled -- then it silently returns to the page as it was.
+    // Python calls this on the main thread when an async open finishes. Success keeps the page
+    // up, switches it to the Native state and names the opened session in the address bar
+    // (video_path_ -- so the open-file button / a drop never leave an old page URL there).
+    // Failure keeps the previous content and shows the open_url_load_failed line, unless the
+    // user cancelled, which silently returns to it.
     void notify_open_url_finished(bool ok);
 
     // Loading-state Cancel: flag the cancellation and interrupt the blocked FFmpeg
@@ -644,9 +663,50 @@ private:
     // Browser-page internals (player_session.cpp for state, player_ui_overlays.cpp for layout).
     void ensure_browser();                                  // create BrowserView + start WebView2
     void browser_submit(const std::string& raw);            // address bar Go / page form Open
+    // Hands `url` to the normal async open as the page's Native content. Only the address bar's
+    // play button and the page's own open paths (file picker / drop) call this -- a submitted
+    // address is a NAVIGATION, never an open.
     void begin_native_open(const std::string& url, const std::string& headers,
                            const std::string& cookies);
+    // The address bar's text, trimmed; empty when there is nothing to act on.
+    std::string browser_addr_text() const;
+    // Request context (Referer) for a manual native open of `url`, derived from the page the URL
+    // was submitted on. Empty when there is nothing to replay.
+    std::string browser_native_headers(const std::string& url);
     void sync_browser_page();                               // per-frame poll of the page view
+    // Native content state (the playing session is what the page shows). The address bar becomes
+    // floating chrome in this state (it reserves no layout space; see build_browser_page()).
+    void set_browser_native(bool on);
+    // Native -> Web hand-back: the page view takes the content again and Python is asked to
+    // pause the session (browser_enter) so audio/video do not run behind the page.
+    void browser_enter_web();
+    // True while some ImGui overlay owns the page area and the WebView2 child window must step
+    // aside for it (the web-stream modal; the settings panel uses the captured-page backdrop
+    // instead, see browser_settings_backdrop_*).
+    bool browser_overlay_open() const;
+    // Shared reveal rule for the floating TOP chrome: true while the cursor is inside the top
+    // strip of the client area. The title bar uses it in fullscreen (it is always visible in
+    // windowed mode) and the address bar uses it whenever the page shows native video -- so
+    // both strips appear and disappear together instead of two drifting rules.
+    bool mouse_in_top_reveal_zone() const;
+    // Settings overlay: the WebView2 page is captured to a texture so the panel can be drawn
+    // ON the page instead of replacing it. States: 0 idle / 1 pending / 2 ready / 3 failed.
+    bool upload_page_backdrop(const std::vector<uint8_t>& png);
+    void reset_page_backdrop_state();
+    // Edge-drag rescue for the page view (player_session.cpp). The page view's real child HWNDs
+    // live in the WebView2 browser/GPU processes, so the OS gives them the mouse-down and this
+    // window never sees the WM_NCHITTEST that starts a resize. Called from pump_messages():
+    // when the cursor sits in one of this window's resize bands while a button-down happens
+    // over the page view, it hands DefWindowProc the non-client message it would have gotten.
+    void poll_page_view_border();
+    // Resize band under the cursor (only where the page view covers the client), and the
+    // direction-matching system resize cursor for it.
+    LRESULT page_view_border_at_cursor() const;
+    void set_resize_cursor(LRESULT hit);
+    // Page content state, in priority order: 0 Home / 1 Web / 2 Loading / 3 Native /
+    // 4 Unavailable. Shared by build_browser_page() and browser_state() so the scripted view
+    // and the rendered page can never disagree about what the page is showing.
+    int browser_content_kind() const;
     static std::string browser_media_headers(const std::string& referer,
                                              const std::string& user_agent);
 
@@ -658,6 +718,7 @@ private:
         bool submit = false;          // Enter pressed
         bool submit_paste = false;    // context menu "Paste & Open" (already pasted)
         bool active = false;          // the field owned keyboard focus this frame
+        bool ctx_open = false;        // its right-click menu is open (keep the bar on screen)
     };
 
     UrlFieldResult url_field(const char* id, char* buf, size_t cap, float width,
@@ -874,7 +935,6 @@ private:
         std::string browser_unavailable;
         std::string browser_go;
         std::string browser_play;
-        std::string browser_close;
         // URL field right-click context menu (Cut/Copy/Paste/Select All).
         std::string input_cut;
         std::string input_copy;
@@ -969,9 +1029,17 @@ private:
     // ---- embedded browser page (URL bar + WebView2 child window). Main-thread only, same
     // discipline as ui_settings_open_. The page view itself is optional: when WebView2 is
     // missing the page shows browser_unavailable and nothing else in the player is affected.
+    //
+    // Content state, in priority order (see browser_content_state()'s use in
+    // build_browser_page): Loading > Native > Web > Unavailable > Home.
+    //   browser_native_ -- the playing session IS the page's content (video below the address
+    //                      bar + the normal bottom bar); browser_web_ may stay true meanwhile so
+    //                      back/forward can return to the page view.
+    //   browser_web_    -- the WebView2 controller has a page loaded (shown unless Native).
     std::unique_ptr<BrowserView> browser_;
     bool browser_page_ = false;   // the browser page owns the area below the title bar
     bool browser_web_ = false;    // a page is loaded/navigating (its child window is shown)
+    bool browser_native_ = false; // the session video is the page content
     bool browser_failed_ = false; // WebView2 unavailable -> page shows browser_unavailable
     char browser_addr_buf_[2048] = {};  // address bar field (always present on this page)
     char browser_home_buf_[2048] = {};  // first-screen in-page form field
@@ -980,16 +1048,38 @@ private:
     bool browser_addr_active_ = false;   // previous frame: the address field had keyboard focus
     bool browser_addr_select_all_ = false;
     bool browser_home_select_all_ = false;
-    std::string browser_page_url_seen_;  // last page URL already reflected in the address bar
+    std::string browser_page_url_seen_;  // engine URL already mirrored into the address bar
     std::string browser_addr_submitted_; // text this page submitted (the bar owns it until edited)
+    // Last laid-out rects (client coords) of the page surface and of the Home form block, exposed
+    // through browser_state() so scripts can assert the page really spans the client and the form
+    // is centered in it (a collapsed page surface clips the whole form away).
+    float browser_page_rect_[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float browser_home_rect_[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     std::string browser_pending_nav_;    // navigation requested before the controller was ready
-    bool browser_close_pending_ = false; // open succeeded -> leave the page on the next build
-    // CookieManager lookup in flight for the native-play handover, and the URL it was made
-    // for. Cleared as soon as the answer is consumed, the lookup is cancelled (any newer
-    // action: direct media link, page leave, candidate switch) -- sync_browser_page() also
-    // clears it when the candidate no longer matches, so it can never stay true forever.
+    // CookieManager lookup in flight for the manual native-play handover, and the URL it was
+    // made for. Cleared as soon as the answer is consumed or a newer action (another play
+    // click, leaving the page) retires it, so it can never stay true forever.
     bool browser_cookie_pending_ = false;
     std::string browser_cookie_url_;
+    // Address bar drawn this frame (Native content hides it as floating chrome unless revealed).
+    bool browser_addr_visible_ = false;
+    // The address field owned the keyboard / its right-click menu was open last frame: keep the
+    // floating bar on screen while the user is interacting with it.
+    bool browser_addr_ctx_open_ = false;
+    // Whether build_top_bar() actually drew the bar this frame (in fullscreen it auto-hides), so
+    // scripts can assert the floating chrome's reveal together with the address bar.
+    bool top_bar_visible_ = false;
+    // Settings overlay backdrop (see upload_page_backdrop()).
+    int browser_backdrop_state_ = 0;   // 0 idle / 1 pending / 2 ready / 3 failed
+    bool browser_backdrop_requested_ = false; // one snapshot request per settings session
+    // The page URL the current snapshot belongs to. Any navigation (or a content switch away
+    // from Web) retires it -- a settings panel left open across a navigation must not keep
+    // showing the previous page's picture.
+    std::string browser_backdrop_url_;
+    uint32_t browser_backdrop_w_ = 0;
+    uint32_t browser_backdrop_h_ = 0;
+    ComPtr<ID3D11Texture2D> browser_backdrop_tex_;
+    ComPtr<ID3D11ShaderResourceView> browser_backdrop_srv_;
     // Open-URL loading state (spinner + Cancel) shared by the page form, the address bar and
     // the native open it starts; cleared by notify_open_url_finished().
     bool open_url_show_error_ = false;      // client-side scheme validation
@@ -1005,6 +1095,22 @@ private:
     char stream_root_buf_[2048] = {};
     bool stream_no_token_edit_ = false;      // "无 token" checkbox (hide the token input while set)
     char stream_token_buf_[256] = {};        // explicit token; empty = server generates a random one
+    // True while the web-stream modal is actually up. Tracked here because ImGui's
+    // IsPopupOpen(str_id) needs a live CurrentWindow (it crashes outside a frame), and the
+    // page's layout/state must know whether an overlay owns the content area.
+    bool stream_popup_open_ = false;
+    // Page-view edge drag, driven as a small state machine from pump_messages() (see
+    // poll_page_view_border()): no modal loop, so the UI (and Python) keep ticking while the
+    // user drags, exactly like a native sizing loop with a live client area.
+    bool page_resize_active_ = false;
+    // Armed = "the cursor is currently hovering a resize band over the page view". Only a
+    // button-down that starts while armed may begin a drag, so pressing inside the page (text
+    // selection, dragging a slider) and then moving to the edge can never resize the window.
+    bool page_resize_armed_ = false;
+    LRESULT page_resize_hit_ = 0;
+    POINT page_resize_start_cursor_{};
+    RECT page_resize_start_rect_{};
+    RECT page_resize_applied_{};
     bool stream_running_ = false;           // Python flips this (start/stop) for the 停止/启动 toggle
     std::string stream_url_;                // access URL while running (shown as a clickable link)
     // Offline-export full-screen mode (Phase 2 extension). export_mode_ is driven by Python

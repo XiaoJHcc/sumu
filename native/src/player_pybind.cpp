@@ -26,8 +26,9 @@ PYBIND11_MODULE(sumu_core, m)
         // gil_scoped_release: network open/reopen can block tens of seconds; Python's main loop
         // (and async open worker) must keep pumping UI. CUDA context is rebound inside open_session.
         // headers/cookies: optional HTTP request context for a network source -- the browser
-        // page's captured Referer/User-Agent and cookies (see UiIntents::open_headers). Keyword
-        // args with empty defaults keep every existing open(path)/reopen(path) call working.
+        // page's replay jar for a manually started native open (see UiIntents::open_headers).
+        // Keyword args with empty defaults keep every existing open(path)/reopen(path) call
+        // working.
         .def("open", &Player::open, py::arg("path"), py::arg("headers") = std::string(""),
             py::arg("cookies") = std::string(""),
             py::call_guard<py::gil_scoped_release>())
@@ -44,6 +45,9 @@ PYBIND11_MODULE(sumu_core, m)
         .def("request_open_url_popup", &Player::request_open_url_popup)
         .def("exit_browser_page", &Player::exit_browser_page)
         .def("browser_navigate", &Player::browser_navigate, py::arg("url"))
+        .def("browser_go_back", &Player::browser_go_back)     // address bar history buttons
+        .def("browser_go_forward", &Player::browser_go_forward)
+        .def("browser_reload", &Player::browser_reload)
         .def("browser_play_native", &Player::browser_play_native)
         .def("browser_state", &Player::browser_state)
         .def("play", &Player::play)

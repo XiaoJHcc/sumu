@@ -1383,6 +1383,10 @@ D3D11_VIEWPORT Player::fit_viewport() const{
     // reduced region; region_y offsets the result downward past the bar. In fullscreen the
     // bar auto-hides (build_top_bar()) and only overlays on hover, exactly like the bottom
     // bar -- so no strip is reserved there and the video fills the whole screen.
+    //
+    // The URL page's address bar is floating chrome: it reserves NO strip (revealing or hiding
+    // it never moves the video), so a Native page uses exactly the same viewport as ordinary
+    // playback.
     float bar = fullscreen_.load(std::memory_order_relaxed) ? 0.0f : top_bar_h();
     float region_y = bar;
     float wh = static_cast<float>(win_height_) - bar;
