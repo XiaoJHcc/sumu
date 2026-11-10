@@ -105,6 +105,9 @@ inline ImU32 media_track_u32() { return to_u32(kMediaTrack); }
 
 // ---- metrics (96-DPI bases) ---------------------------------------------------------------
 
+// Fraction of client height: below the title bar for top chrome, above the bottom edge for controls.
+inline constexpr float kChromeRevealFraction = 0.15f;
+
 inline constexpr float kRadiusControl = 6.0f; // buttons, inputs, combos, popups, children
 inline constexpr float kRadiusWindow = 8.0f;  // windows / modals / cards
 inline constexpr float kRadiusCheckbox = 4.0f;

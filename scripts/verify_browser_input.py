@@ -289,8 +289,7 @@ def click_until(player, hwnd, pos, predicate, tries=3, settle=4.0):
 
 
 def submit_url(player, url, settle=3.0):
-    """Submit `url` from the address bar: a NAVIGATION, with no native open involved. Returns the
-    UiIntents drained while it settles (they must not carry an open_path)."""
+    """Navigate and collect intents emitted while the page settles."""
     player.browser_navigate(url)
     t0 = time.monotonic()
     intents = {}
@@ -351,6 +350,31 @@ def move_client(hwnd, x, y):
     ox, oy, _, _ = client_rect(hwnd)
     user32.SetCursorPos(int(ox + x), int(oy + y))
     time.sleep(0.05)
+
+
+def check_reveal_boundary(player, hwnd, label):
+    _, _, width, height = client_rect(hwnd)
+    viewport = player.browser_state()["viewport"]
+    # The band starts at the title bar's bottom edge (fixed DPI height 36*scale, independent of
+    # whether the bar is currently shown) and spans 15% of the client height below it.
+    title_h = 36.0 * user32.GetDpiForWindow(hwnd) / 96.0
+    for fraction, visible in ((0.14, True), (0.16, False)):
+        move_client(hwnd, width * 0.5, title_h + height * fraction)
+        ok = pump(player, 2.0,
+                  lambda: bool(player.browser_state()["addr_visible"]) == visible)
+        state = player.browser_state()
+        check(f"{label}: address reveal at title+{fraction:.0%} is {visible}", ok, f"{state}")
+        check(f"{label}: reveal boundary keeps the viewport", state["viewport"] == viewport)
+        if state["fullscreen"]:
+            check(f"{label}: title and address bar share the reveal boundary",
+                  state["top_bar_visible"] == visible, f"{state}")
+
+    # 16% of the WINDOW height is still inside the band, because the band starts below the title
+    # bar: a boundary measured from y=0 would already have ended here.
+    move_client(hwnd, width * 0.5, height * 0.16)
+    check(f"{label}: reveal still on at 16% of the window height",
+          pump(player, 2.0, lambda: bool(player.browser_state()["addr_visible"])),
+          f"{player.browser_state()}")
 
 
 def top_bar_right_button_center(hwnd, index_from_right):
@@ -505,20 +529,13 @@ def main():
           f"{user32.GetFocus()}")
 
     # ---- 1c. Native content: the address bar is floating chrome ------------------------
-    # A media URL submitted into the bar is still just a page view; the bar's PLAY button is the
-    # manual native entry, and clicking it for real is what turns the page's content into the
-    # session video. There the bar only shows while the cursor is in the top strip (or the field
-    # is in use), and showing it never moves the video viewport.
-    submit_url(player, f"{base}/noext")
-    state = player.browser_state()
-    check("a submitted media URL stays a page view",
-          not state["native"] and state["content"] == "web", f"{state}")
-    intents, opened = play_button_click(player, hwnd, flow)
-    state = player.browser_state()
-    check("real play button hands the address bar URL to the native open",
+    intents = submit_url(player, f"{base}/noext")
+    check("video navigation automatically hands its URL to the native open",
           intents.get("open_path") == f"{base}/noext", repr(intents.get("open_path")))
-    check("real play button really opens the media URL", opened, f"{state}")
-    check("the manual open becomes the page's native content", state["native"], f"{state}")
+    opened = bool(intents.get("open_path")) and complete_native_open(player, flow, intents)
+    state = player.browser_state()
+    check("automatic navigation really opens the media URL", opened, f"{state}")
+    check("the automatic open becomes the page's native content", state["native"], f"{state}")
     _, _, cwN, chN = client_rect(hwnd)
     move_client(hwnd, cwN * 0.5, chN * 0.6)
     pump(player, 0.8)
@@ -535,6 +552,7 @@ def main():
     check("native: showing the bar does not move the video viewport",
           away["viewport"] == top["viewport"] == back["viewport"],
           f"{away['viewport']} {top['viewport']} {back['viewport']}")
+    check_reveal_boundary(player, hwnd, "windowed")
     # ---- 1d. the same reveal rule in FULLSCREEN (real click on the top bar's button) -----
     # The title bar and the floating address bar share one reveal zone, so entering fullscreen
     # through the user path must hide/show both together and never move the video viewport.
@@ -567,6 +585,7 @@ def main():
         check("fullscreen: revealing the bars does not move the video viewport",
               away["viewport"] == top["viewport"] == back["viewport"],
               f"{away['viewport']} {top['viewport']} {back['viewport']}")
+        check_reveal_boundary(player, hwnd, "fullscreen")
         # Leave fullscreen through the same button: reveal the bar first (it auto-hides).
         move_client(hwnd, fw * 0.5, 8)
         pump(player, 0.8)

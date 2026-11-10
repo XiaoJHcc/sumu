@@ -255,7 +255,7 @@ void Player::build_top_bar(float& out_height){
 void Player::build_bottom_bar(){
     ImGuiIO& io = ImGui::GetIO();
     const float bar_h = top_bar_h();
-    const float show_zone_y = io.DisplaySize.y * 0.85f;
+    const float show_zone_y = io.DisplaySize.y * (1.0f - ui::theme::kChromeRevealFraction);
     bool mouse_in_zone = io.MousePos.y >= show_zone_y && io.MousePos.y <= io.DisplaySize.y &&
         io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
     if (!mouse_in_zone) return; // auto-hide

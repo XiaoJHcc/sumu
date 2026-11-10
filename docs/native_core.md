@@ -64,7 +64,7 @@ p.pump_messages() / p.should_quit()   # Win32 消息泵，需在主线程周期�
 # ---- 浏览器页（URL 页 + WebView2 内嵌页）----
 p.request_open_url_popup()  # 进入浏览器页（首屏/顶栏入口；不再弹 modal），记录 browser_enter
 p.exit_browser_page()       # 退出浏览器页（隐藏子窗口），记录 browser_exit
-p.browser_navigate(url)     # 地址栏「访问」：纯导航，交给 WebView2（绝不启动原生 open）
+p.browser_navigate(url)     # 地址栏「访问」：先由 WebView2 导航，顶层视频响应自动原生播放
 p.browser_go_back()         # 地址栏后退 / 前进 / 刷新（Native 下 back/forward 会退回 Web
 p.browser_go_forward()      # 并暂停原生播放；reload 在 Native 下是 no-op）
 p.browser_reload()
@@ -105,7 +105,8 @@ URL 页（首屏「打开 URL」/ 顶栏 link 图标）不是弹窗，而是独�
 
 - `native/src/browser_view.h/.cpp`：唯一的 WebView2 使用者。`CreateCoreWebView2Environment-
   WithOptions` → `CreateCoreWebView2Controller(parent_hwnd)`，一次只建一个 controller；
-  只做只读导航 + 只读请求观测（`WebResourceRequested`，不改响应/不改请求）。不注入 JS、
+  提供导航、顶层媒体响应观测（`WebResourceResponseReceived`）及视频下载取消。不改响应，
+  仅 popup 的一次文档请求补齐 Referer；不注入 JS、
   不注册 web message、不开 host object，`AreHostObjectsAllowed/IsWebMessageEnabled` 显式关闭。
 - Player 侧（`player_session.cpp` 状态机 + `build_browser_page()` 布局）：页面进出、
   地址栏/表单 buffer、打开交接与 loading/cancel 状态。
@@ -144,10 +145,21 @@ BrowserView 自己的槽里，由 Player 每帧 `take_cookies()` 取。回调因
 否则会和恢复的旧视频或新起的原生播放叠在一起；重新显示即取消静音（取不到该接口的老
 Runtime 安全跳过，`browser_state()['muted']` 反映最后一次成功应用的状态）。
 
-**网页内媒体不接管**：浏览器页**不观测、不改写页面流量**（没有 `WebResourceRequested` /
-`WebResourceResponseReceived` 订阅，也没有媒体候选/HLS 分片钉住）。网页里的 `<video>`、
-fetch 出来的媒体响应都留在 WebView2 自己播，页面不会因为「发现了媒体」而切进 Native——切
-Native 只有一个入口：地址栏右侧的播放按钮（见下）。
+**顶层视频导航自动接管，网页子资源不接管**：`NavigationStarting` 跟踪当前顶层导航及其
+重定向；`WebResourceResponseReceived` 只处理与该导航 URL 对应的成功 GET 响应。响应类型为
+`video/*`、HLS/DASH 等视频清单时自动交接；通用二进制或缺失类型才允许结合 URL 路径上的
+视频后缀识别。query token、percent 转义与重定向后的 URL 保留，HTML/错误响应不会只因
+`.mp4` 后缀而接管。`DownloadStarting` 取消对应视频导航的浏览器下载，避免保存框与重复下载。
+普通 HTML 页面里的 `<video>`、iframe、fetch 等子资源不会触发原生播放；不注入脚本、不改写请求。
+
+候选通过 `take_media_navigation()` 轮询交给 Player，保留请求 Referer/User-Agent，并用
+CookieManager 查询目标 URL 的 cookie，随后复用 `begin_native_open()` 与既有加载/取消/错误路径。
+每次导航最多交接一次；新导航、手动播放、离页及 shutdown 作废旧候选和在飞查询，迟到响应不得
+启动第二次播放。原生成功后仍是浏览器页内 Native 内容，地址栏播放按钮继续作为手动入口。
+`target="_blank"` / `window.open` 的 http(s) 新窗口请求转为同一内嵌视图导航，再走上述响应识别；
+仅为该次 popup URI 的 `DOCUMENT` 请求注册一次性 `WebResourceRequested` filter 来补齐来源头，
+同源带页面 URL、跨源只带 origin、HTTPS 降级 HTTP 不带 Referer；不作用于子资源或其他重定向
+地址，cookie 仍由浏览器会话提供，不打开外部窗口。
 
 **内容状态机**：页面内容由 `Player::browser_content_kind()` 唯一裁决，优先级
 Loading > Native > Web > Unavailable > Home（`browser_state()['content']` 与布局同源）：
@@ -159,7 +171,7 @@ Loading > Native > Web > Unavailable > Home（`browser_state()['content']` 与�
   高度），底栏照常可用，WebView2 子窗口隐藏并静音。
 
   **地址栏在这一态是悬浮 chrome**：`browser_addr_visible_` = 光标位于顶部 reveal 区
-  （`Player::mouse_in_top_reveal_zone()`，顶部 10%，与全屏标题栏共用同一判定）**或**地址
+  （`Player::mouse_in_top_reveal_zone()`，从标题栏下缘再向下延伸窗口高度的 15%，包含标题栏自身；全屏下仍按固定标题栏高度计算，且与全屏标题栏共用同一判定）**或**地址
   输入正在使用（active / 聚焦中 / 右键菜单开着）。隐藏时不占布局（页面内容从标题栏下沿开
   始），显示/隐藏都不会移动视频 viewport、也不触发窗口 resize；Web/Home/Loading 等状态地址
   栏仍常驻。全屏时标题栏与地址栏一起按同一条 reveal 规则出现/消失（标题栏隐藏时
@@ -175,7 +187,7 @@ Loading > Native > Web > Unavailable > Home（`browser_state()['content']` 与�
   没有历史就不动，避免白白切走原生内容。刷新在 Native 下刻意 no-op（重载会丢掉会话认证的
   地址），在 Home（没有已加载页面）时同样禁用：`can_reload` 还要求 `page_url()` 非空。
 
-**地址栏提交 = 导航（没有原生探测）**：`browser_submit()` 只做三件事——校验 http(s)、把文本
+**地址栏提交先导航（不预先阻塞探测）**：`browser_submit()` 只做三件事——校验 http(s)、把文本
 写回地址栏与「已提交」状态、`browser_enter_web()` 后交给 WebView2 导航（controller 未就绪时
 排队到 `browser_pending_nav_`）。普通网页从确认那一刻起就由 WebView2 渲染，**不启动任何原生
 open**，页面显示不依赖 FFmpeg 成功、失败或超时。提交的地址会一直留在地址栏，直到引擎报告它

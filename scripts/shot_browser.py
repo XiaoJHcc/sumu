@@ -159,15 +159,13 @@ class _Server(http.server.ThreadingHTTPServer):
 
 
 def navigate(p, url, seconds=3.0):
-    """Submit `url` like the app does: a NAVIGATION only (no native open involved)."""
+    """Navigate using the app's browser entry point."""
     p.browser_navigate(url)
     run(p, seconds)
 
 
 def play_native(p, flow, seconds=25.0):
-    """Click the address bar's play button and complete the handover like the app: drain the
-    open_path intent, open/reopen with its replay context, report the result."""
-    p.browser_play_native()
+    """Complete automatic media handover using the app's native open path."""
     intents = {}
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < 6.0:
@@ -303,12 +301,10 @@ def main():
     run(p, 0.3)
     grab("browser_play.png")
 
-    # 4. Native content: the bar's play button hands the submitted media URL to the decoder and
-    #    the page KEEPS it as its Native content. The address bar is floating chrome there:
-    #    revealed with the cursor in the top strip, hidden otherwise (viewport never changes).
+    # Top-level media opens automatically; the Native address bar keeps its reveal behavior.
     navigate(p, f"{base}/noext")
     intents, opened = play_native(p, flow)
-    check("native: the play button opens the media URL", opened,
+    check("native: video navigation automatically opens the media URL", opened,
           f"opened={opened} path={intents.get('open_path')!r}")
     check("native: page shows the session video", p.browser_state()["native"],
           f"{p.browser_state()}")

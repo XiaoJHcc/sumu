@@ -442,12 +442,14 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
 //   Home         first-screen form (nothing loaded yet)
 //
 // Address bar: [back] [forward] [reload] [URL field] [go] [play]. A submitted http(s) URL is a
-// NAVIGATION -- the page view shows an ordinary web page immediately, with no native open, no
-// media detection and no fallback. The play button is the explicit manual native entry: it hands
-// the bar's URL to the decoder (any container FFmpeg can demux, no extension gate), and a
-// failure there is reported as an open error instead of being re-routed to the page. Nothing
-// here leaves the page implicitly: settings, the web-stream modal, the file picker, the export
-// overlay and a successful native open all keep it alive.
+// NAVIGATION -- the page view shows an ordinary web page immediately, with no probing and no
+// fallback. The play button is the explicit manual native entry: it hands the bar's URL to the
+// decoder (any container FFmpeg can demux, no extension gate), and a failure there is reported as
+// an open error instead of being re-routed to the page. The other way into Native is the page
+// view's own handover: when the navigation's document IS a video, the page switches to Native by
+// itself (BrowserView::MediaNavigation). Nothing here leaves the page implicitly: settings, the
+// web-stream modal, the file picker, the export overlay and a successful native open all keep it
+// alive.
 void Player::build_browser_page(){
     ImGuiIO& io = ImGui::GetIO();
     sync_browser_page();
@@ -574,8 +576,6 @@ void Player::build_browser_page(){
             IconButtonResult r = icon_button("##browser_go", ImVec2(ctrl_w, ctrl_h),
                 ui::AppIcon::OpenUrl, busy);
             if (r.clicked) field.submit = true;
-            if (ImGui::IsItemHovered() && !ui_str_.browser_go.empty())
-                ImGui::SetTooltip("%s", ui_str_.browser_go.c_str());
         }
         ImGui::SameLine();
         { // native play: hands the URL in the bar to the decoder (no extension/container gate)
@@ -583,8 +583,6 @@ void Player::build_browser_page(){
             IconButtonResult r = icon_button("##browser_play", ImVec2(ctrl_w, ctrl_h),
                 ui::AppIcon::Play, disabled);
             if (r.clicked) browser_play_native();
-            if (ImGui::IsItemHovered() && !ui_str_.browser_play.empty())
-                ImGui::SetTooltip("%s", ui_str_.browser_play.c_str());
         }
         ImGui::End();
         ImGui::PopStyleVar(2);

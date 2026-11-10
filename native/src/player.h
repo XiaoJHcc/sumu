@@ -534,8 +534,11 @@ public:
     // Native (the session video fills the page) or Unavailable (no WebView2).
     //
     // A submitted address is a NAVIGATION: ordinary web pages appear immediately, with no
-    // native open, no media detection and no fallback. Only the bar's play button hands the
-    // address to the native decoder, and its failure stays a visible open error.
+    // native open and no fallback. The one exception is the page view noticing that the document
+    // the navigation fetched IS a video (a direct stream link, a redirect onto an .mp4, a
+    // navigation the browser would download): that navigation is handed to the decoder, which is
+    // the only case where the page switches to Native without the play button.
+    // See BrowserView::MediaNavigation (browser_view.h).
     //
     // Nothing leaves the page implicitly: a successful native open, the settings panel, the
     // web-stream modal, the file picker and the export screen all keep it alive -- export is an
@@ -663,11 +666,14 @@ private:
     // Browser-page internals (player_session.cpp for state, player_ui_overlays.cpp for layout).
     void ensure_browser();                                  // create BrowserView + start WebView2
     void browser_submit(const std::string& raw);            // address bar Go / page form Open
-    // Hands `url` to the normal async open as the page's Native content. Only the address bar's
-    // play button and the page's own open paths (file picker / drop) call this -- a submitted
-    // address is a NAVIGATION, never an open.
+    // Hands `url` to the normal async open as the page's Native content. Reached from the
+    // address bar's play button, the page's own open paths (file picker / drop), and the page
+    // view's media handover -- a submitted address is a NAVIGATION, never an open.
     void begin_native_open(const std::string& url, const std::string& headers,
                            const std::string& cookies);
+    // Polls the page view's media handover and starts the native open for it (a page navigation
+    // whose document turned out to be a video). Called from sync_browser_page().
+    void poll_media_navigation();
     // The address bar's text, trimmed; empty when there is nothing to act on.
     std::string browser_addr_text() const;
     // Request context (Referer) for a manual native open of `url`, derived from the page the URL
@@ -1061,6 +1067,11 @@ private:
     // click, leaving the page) retires it, so it can never stay true forever.
     bool browser_cookie_pending_ = false;
     std::string browser_cookie_url_;
+    // Request context captured for a MEDIA HANDOVER (a page navigated straight to a video) -- empty
+    // for a manual play click, which derives its Referer from the page itself. `browser_auto_nav_serial_`
+    // is the page view's navigation it belongs to (0 = none).
+    std::string browser_auto_headers_;
+    uint64_t browser_auto_nav_serial_ = 0;
     // Address bar drawn this frame (Native content hides it as floating chrome unless revealed).
     bool browser_addr_visible_ = false;
     // The address field owned the keyboard / its right-click menu was open last frame: keep the

@@ -14,6 +14,7 @@
 
 #include "WebView2.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
@@ -134,14 +135,22 @@ struct BrowserView::Impl {
     ComPtr<ICoreWebView2Environment> env;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> webview;
-    // ICoreWebView2_2 carries the CookieManager (the manual native-play button's replay jar).
+    // ICoreWebView2_2 carries the CookieManager (the manual native-play button's replay jar) and
+    // WebResourceResponseReceived (the media handover's one look at page traffic).
     ComPtr<ICoreWebView2_2> webview2;
+    // ICoreWebView2_4 (DownloadStarting) catches a navigation the browser downloads instead of
+    // displaying it; null on an older Evergreen runtime means such a navigation just downloads.
+    ComPtr<ICoreWebView2_4> webview4;
     // ICoreWebView2_8 (IsMuted) is queried once; older Evergreen runtimes leave it null and the
     // page simply cannot be muted (everything else keeps working).
     ComPtr<ICoreWebView2_8> webview8;
     EventRegistrationToken tok_source{};
     EventRegistrationToken tok_nav_starting{};
     EventRegistrationToken tok_nav_completed{};
+    EventRegistrationToken tok_response{};
+    EventRegistrationToken tok_download{};
+    EventRegistrationToken tok_new_window{};
+    EventRegistrationToken tok_web_request{};
 };
 
 BrowserView::BrowserView()
@@ -223,12 +232,171 @@ void BrowserView::ensure_started(HWND parent){
     if (FAILED(hr)) fail("CreateCoreWebView2EnvironmentWithOptions failed");
 }
 
+// ---- media handover: is this navigation's document the video itself? -----------------------
+//
+// The page view is the transport, so a navigation can land on media instead of a page. These
+// helpers answer that from the response alone -- a plain page whose URL happens to end in .mp4
+// must never be taken over -- and read the replay context out of the document request.
+namespace {
+
+std::string ascii_lower(std::string s){
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// A navigation a web page is allowed to cause in this view (its new-window requests included).
+bool is_http_url(const std::string& url){
+    const std::string head = ascii_lower(url.substr(0, 8));
+    return head.compare(0, 7, "http://") == 0 || head.compare(0, 8, "https://") == 0;
+}
+
+// "scheme://authority", lowercased; empty when `url` has none.
+std::string url_origin(const std::string& url){
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) return std::string();
+    const size_t end = url.find_first_of("/?#", scheme + 3);
+    return ascii_lower(url.substr(0, end == std::string::npos ? url.size() : end));
+}
+
+// The Referer a clicked link to `target` would carry from `opener`: the opener's own URL when both
+// share an origin, its bare origin otherwise (the browser's default policy) -- another site never
+// learns the opener's path or query.
+std::string referrer_from(const std::string& opener, const std::string& target){
+    if (!is_http_url(opener) || !is_http_url(target)) return std::string();
+    const std::string origin = url_origin(opener);
+    if (origin.empty()) return std::string();
+    const std::string target_origin = url_origin(target);
+    if (origin == target_origin) return opener.substr(0, opener.find('#'));
+    // Cross-site: the bare origin only, and nothing at all on an https -> http downgrade
+    // (strict-origin-when-cross-origin, the browser's default).
+    if (origin.compare(0, 6, "https:") == 0 && target_origin.compare(0, 6, "https:") != 0)
+        return std::string();
+    return origin;
+}
+
+// `url` made absolute against the page it came from (a window request may carry a path only).
+std::string absolute_url(const std::string& base, const std::string& url){
+    if (url.empty() || is_http_url(url)) return url;
+    // Another scheme (about:, blob:, mailto:): not ours to resolve -- the caller rejects it.
+    const size_t colon = url.find(':');
+    if (colon != std::string::npos && url.find('/') > colon) return url;
+    const std::string origin = url_origin(base);
+    if (origin.empty()) return std::string();
+    if (url.compare(0, 2, "//") == 0) return origin.substr(0, origin.find("://") + 1) + url;
+    if (url[0] == '/') return origin + url;
+    const size_t end = base.find_first_of("?#");
+    const std::string path = base.substr(0, end == std::string::npos ? base.size() : end);
+    return path.substr(0, path.rfind('/') + 1) + url;
+}
+
+// A COM out-string (LPWSTR + CoTaskMemFree) as UTF-8; empty on failure.
+template <typename Getter>
+std::string take_com_string(Getter get){
+    LPWSTR raw = nullptr;
+    if (FAILED(get(&raw)) || !raw) return std::string();
+    std::string out = browser::to_utf8(std::wstring(raw));
+    CoTaskMemFree(raw);
+    return out;
+}
+
+std::string request_header(ICoreWebView2HttpRequestHeaders* headers, const wchar_t* name){
+    if (!headers) return std::string();
+    return take_com_string([&](LPWSTR* out) { return headers->GetHeader(name, out); });
+}
+
+std::string response_header(ICoreWebView2HttpResponseHeaders* headers, const wchar_t* name){
+    if (!headers) return std::string();
+    return take_com_string([&](LPWSTR* out) { return headers->GetHeader(name, out); });
+}
+
+// Content-Type without its parameters, lowercased ("video/mp4; codecs=..." -> "video/mp4").
+std::string mime_type(const std::string& raw){
+    const std::string value = raw.substr(0, raw.find(';'));
+    const size_t first = value.find_first_not_of(" \t");
+    if (first == std::string::npos) return std::string();
+    return ascii_lower(value.substr(first, value.find_last_not_of(" \t") - first + 1));
+}
+
+// Media by its own type: anything video/* plus the playlist/manifest types FFmpeg demuxes
+// (HLS, DASH, MSS). A page type (text/html, application/json, ...) never qualifies.
+bool is_media_mime(const std::string& mime){
+    if (mime.size() >= 6 && mime.compare(0, 6, "video/") == 0) return true;
+    static const char* const kPlaylists[] = {
+        "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/mpegurl",
+        "audio/mpegurl", "application/dash+xml", "application/vnd.ms-sstr+xml",
+    };
+    for (const char* playlist : kPlaylists)
+        if (mime == playlist) return true;
+    return false;
+}
+
+// Types a server hands out when it does not know (or does not care about) the file: these -- and
+// only these -- may fall back to the URL's own extension.
+bool is_generic_mime(const std::string& mime){
+    return mime.empty() || mime == "application/octet-stream" ||
+        mime == "binary/octet-stream" || mime == "application/binary" ||
+        mime == "application/unknown" || mime == "unknown/unknown" ||
+        mime == "application/x-unknown";
+}
+
+// URL reduced to what both sides of a navigation agree on: the fragment is dropped (it never
+// reaches the server, but a link may well carry one -- ".../clip.mp4#t=30") and percent-escape
+// hex digits are upper-cased, so two spellings of the same address compare equal.
+std::string url_identity(const std::string& url){
+    std::string s = url.substr(0, url.find('#'));
+    for (size_t i = 0; i + 2 < s.size(); ++i) {
+        if (s[i] != '%') continue;
+        s[i + 1] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[i + 1])));
+        s[i + 2] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[i + 2])));
+        i += 2;
+    }
+    return s;
+}
+
+// True when `a` and `b` name the same resource (see url_identity).
+bool same_url(const std::string& a, const std::string& b){
+    return !a.empty() && !b.empty() && url_identity(a) == url_identity(b);
+}
+
+// Path of `url` (no scheme/authority, no query, no fragment), lowercased.
+std::string url_path_lower(const std::string& url){
+    size_t start = 0;
+    const size_t scheme = url.find("://");
+    if (scheme != std::string::npos) {
+        const size_t authority_end = url.find('/', scheme + 3);
+        start = authority_end == std::string::npos ? url.size() : authority_end;
+    }
+    size_t end = url.find_first_of("?#", start);
+    if (end == std::string::npos) end = url.size();
+    return ascii_lower(url.substr(start, end - start));
+}
+
+// Unambiguous video/stream extension in the URL's path (query string and fragment ignored).
+bool has_video_extension(const std::string& url){
+    const std::string path = url_path_lower(url);
+    const size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return false;
+    const size_t slash = path.rfind('/');
+    if (slash != std::string::npos && dot < slash) return false;
+    const std::string ext = path.substr(dot);
+    static const char* const kExts[] = {
+        ".mp4", ".m4v", ".mkv", ".webm", ".mov", ".flv", ".avi", ".ts", ".m2ts", ".mts",
+        ".mpg", ".mpeg", ".wmv", ".3gp", ".ogv", ".f4v", ".m3u8", ".mpd",
+    };
+    for (const char* candidate : kExts)
+        if (ext == candidate) return true;
+    return false;
+}
+
+} // namespace
+
 // Page-view settings: no context menus / devtools / status bar / web-message bridge. The
 // page keeps its own error page for failed navigations (WebView2 default) -- the owner adds
 // no chrome of its own beyond the address bar.
 void BrowserView::configure_webview(){
     if (FAILED(impl_->webview.As(&impl_->webview8))) impl_->webview8.Reset();
     if (FAILED(impl_->webview.As(&impl_->webview2))) impl_->webview2.Reset();
+    if (FAILED(impl_->webview.As(&impl_->webview4))) impl_->webview4.Reset();
     ComPtr<ICoreWebView2Settings> settings;
     if (SUCCEEDED(impl_->webview->get_Settings(&settings)) && settings) {
         settings->put_AreDefaultContextMenusEnabled(FALSE);
@@ -242,8 +410,15 @@ void BrowserView::configure_webview(){
     const std::shared_ptr<std::atomic<bool>> alive = alive_;
     impl_->webview->add_NavigationStarting(
         MakeHandler<ICoreWebView2NavigationStartingEventHandler>(
-            [this, alive](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs*) -> HRESULT {
-                if (alive->load()) on_navigation_started();
+            [this, alive](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                if (!alive->load() || !args) return S_OK;
+                const std::string url =
+                    take_com_string([&](LPWSTR* out) { return args->get_Uri(out); });
+                UINT64 nav_id = 0;
+                args->get_NavigationId(&nav_id);
+                BOOL redirected = FALSE;
+                args->get_IsRedirected(&redirected);
+                on_navigation_started(url, nav_id, redirected != FALSE);
                 return S_OK;
             }).Get(), &impl_->tok_nav_starting);
     impl_->webview->add_SourceChanged(
@@ -258,15 +433,247 @@ void BrowserView::configure_webview(){
                 if (alive->load()) on_source_maybe_changed();
                 return S_OK;
             }).Get(), &impl_->tok_nav_completed);
+
+    // Media handover (see browser_view.h). Both handlers only RECORD a candidate: the owner decides
+    // and stops/opens from its own poll, so nothing here re-enters WebView2 or blocks it.
+    if (impl_->webview2) {
+        impl_->webview2->add_WebResourceResponseReceived(
+            MakeHandler<ICoreWebView2WebResourceResponseReceivedEventHandler>(
+                [this, alive](ICoreWebView2*,
+                              ICoreWebView2WebResourceResponseReceivedEventArgs* args) -> HRESULT {
+                    if (!alive->load() || !args) return S_OK;
+                    // Cheap gate first: no navigation is asking for a handover (or one was already
+                    // made), so nothing here is worth a single string allocation.
+                    if (!media_handover_possible()) return S_OK;
+                    ComPtr<ICoreWebView2WebResourceRequest> request;
+                    ComPtr<ICoreWebView2WebResourceResponseView> response;
+                    if (FAILED(args->get_Request(&request)) || !request) return S_OK;
+                    const std::string uri =
+                        take_com_string([&](LPWSTR* out) { return request->get_Uri(out); });
+                    // Any other URI is a subresource of the page (<video>, fetch, iframe, an ad).
+                    if (!same_url(uri, nav_url_)) return S_OK;
+                    if (FAILED(args->get_Response(&response)) || !response) return S_OK;
+                    int status = 0;
+                    if (FAILED(response->get_StatusCode(&status))) return S_OK;
+                    const std::string method =
+                        take_com_string([&](LPWSTR* out) { return request->get_Method(out); });
+                    std::string content_type;
+                    ComPtr<ICoreWebView2HttpResponseHeaders> resp_headers;
+                    if (SUCCEEDED(response->get_Headers(&resp_headers)) && resp_headers)
+                        content_type = response_header(resp_headers.Get(), L"Content-Type");
+                    std::string referer, user_agent;
+                    ComPtr<ICoreWebView2HttpRequestHeaders> req_headers;
+                    if (SUCCEEDED(request->get_Headers(&req_headers)) && req_headers) {
+                        referer = request_header(req_headers.Get(), L"Referer");
+                        user_agent = request_header(req_headers.Get(), L"User-Agent");
+                    }
+                    on_document_response(uri, method, status, content_type, referer, user_agent);
+                    return S_OK;
+                }).Get(), &impl_->tok_response);
+    }
+    if (impl_->webview4) {
+        impl_->webview4->add_DownloadStarting(
+            MakeHandler<ICoreWebView2DownloadStartingEventHandler>(
+                [this, alive](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) -> HRESULT {
+                    if (!alive->load() || !args) return S_OK;
+                    ComPtr<ICoreWebView2DownloadOperation> operation;
+                    if (FAILED(args->get_DownloadOperation(&operation)) || !operation) return S_OK;
+                    const std::string uri =
+                        take_com_string([&](LPWSTR* out) { return operation->get_Uri(out); });
+                    const std::string content_type =
+                        take_com_string([&](LPWSTR* out) { return operation->get_MimeType(out); });
+                    if (!on_download_started(uri, content_type)) return S_OK;
+                    // Cancelled while the download is still only announced: no file is written and no
+                    // save prompt appears. Both properties must be set before this returns.
+                    args->put_Cancel(TRUE);
+                    args->put_Handled(TRUE);
+                    return S_OK;
+                }).Get(), &impl_->tok_download);
+    }
+
+    // New-window requests (target=_blank / window.open) become navigations of THIS view: the
+    // runtime must never open a window of its own, and the navigation itself is left to the owner's
+    // poll. Plus the one-shot filter that puts a click's Referer back on such a navigation.
+    impl_->webview->add_NewWindowRequested(
+        MakeHandler<ICoreWebView2NewWindowRequestedEventHandler>(
+            [this, alive](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+                if (!alive->load() || !args) return S_OK;
+                args->put_Handled(TRUE);
+                const std::string url = absolute_url(page_url_,
+                    take_com_string([&](LPWSTR* out) { return args->get_Uri(out); }));
+                if (!is_http_url(url)) return S_OK;
+                popup_pending_ = true;
+                popup_url_ = url;
+                return S_OK;
+            }).Get(), &impl_->tok_new_window);
+    impl_->webview->add_WebResourceRequested(
+        MakeHandler<ICoreWebView2WebResourceRequestedEventHandler>(
+            [this, alive](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+                if (!alive->load() || !args || !web_filter_active_) return S_OK;
+                ComPtr<ICoreWebView2WebResourceRequest> request;
+                if (FAILED(args->get_Request(&request)) || !request) return S_OK;
+                const std::string uri =
+                    take_com_string([&](LPWSTR* out) { return request->get_Uri(out); });
+                if (!same_url(uri, web_filter_uri_)) return S_OK;
+                ComPtr<ICoreWebView2HttpRequestHeaders> headers;
+                if (SUCCEEDED(request->get_Headers(&headers)) && headers)
+                    headers->SetHeader(L"Referer", browser::to_wide(web_filter_referer_).c_str());
+                // One shot. The filter itself stays registered (removing it here would call back
+                // into the control from inside a callback); the next popup or shutdown drops it.
+                web_filter_active_ = false;
+                return S_OK;
+            }).Get(), &impl_->tok_web_request);
 }
 
-void BrowserView::on_navigation_started(){
+void BrowserView::on_navigation_started(const std::string& url, uint64_t nav_id, bool redirected){
     // A new document: a snapshot taken for the old page must not back the settings overlay any
     // more.
     ++snapshot_gen_;
     snapshot_pending_ = false;
     snapshot_state_ = Snapshot::None;
     snapshot_png_.clear();
+
+    // Top-level navigation bookkeeping for the media handover: a redirect fires again with the
+    // same id (it only moves `nav_url_` forward), so anything else is a different navigation --
+    // the candidate nobody took belongs to the one the user left.
+    const bool same_navigation = nav_id_valid_ && (redirected || nav_id == nav_id_);
+    if (!same_navigation) {
+        nav_id_ = nav_id;
+        nav_id_valid_ = true;
+        ++nav_serial_;
+        cancel_media_navigation();
+        nav_handed_id_ = 0;
+        nav_handed_valid_ = false;
+        nav_doc_seen_ = false;
+        // A window request made by the page being left must not jump the view later.
+        popup_pending_ = false;
+        popup_url_.clear();
+        nav_page_url_before_ = page_url_;
+    } else {
+        nav_id_ = nav_id;
+        // A redirect hop: the document to judge is the one its target returns.
+        nav_doc_seen_ = false;
+    }
+    nav_url_ = url;
+}
+
+bool BrowserView::media_handover_possible() const {
+    // One handover per navigation, and never while one waits for the owner: the media element
+    // re-requests the same URL for every range it plays.
+    if (!nav_id_valid_ || nav_url_.empty()) return false;
+    if (nav_handed_valid_ && nav_handed_id_ == nav_id_) return false;
+    return !media_done_;
+}
+
+void BrowserView::on_document_response(const std::string& uri, const std::string& method,
+                                       int status, const std::string& content_type,
+                                       const std::string& referer,
+                                       const std::string& user_agent){
+    // Only this navigation's own document (`nav_url_`, redirects included): subresources are a
+    // different URI and never looked at.
+    if (!same_url(uri, nav_url_)) return;
+    // Judged once: a download of the same navigation must not re-litigate a rejected response.
+    if (nav_doc_seen_) return;
+    nav_doc_seen_ = true;
+    if (!media_handover_possible()) return;
+    // Only a GET can be replayed honestly (a POST body is not available), and a redirect hop or an
+    // error page is not the media itself.
+    if (ascii_lower(method) != "get") return;
+    if (status != 200 && status != 206) return;
+    // The type decides: media types by themselves, a generic/absent type only with a video path.
+    const std::string mime = mime_type(content_type);
+    if (!is_media_mime(mime) && !(is_generic_mime(mime) && has_video_extension(nav_url_))) return;
+    MediaNavigation nav;
+    // The navigation's own URL, not the request's: query and percent-escapes as asked for.
+    nav.url = nav_url_;
+    nav.referer = !referer.empty() ? referer
+        : (same_url(nav_page_url_before_, nav_url_) ? std::string() : nav_page_url_before_);
+    nav.user_agent = user_agent;
+    nav.nav_serial = nav_serial_;
+    publish_media_navigation(std::move(nav));
+}
+
+bool BrowserView::on_download_started(const std::string& uri, const std::string& content_type){
+    // Only the navigation this page view just started keeps the browser's download behaviour: a
+    // right-click "save as" or a link to an archive must not be taken over.
+    if (!nav_id_valid_ || !same_url(uri, nav_url_)) return false;
+    // Its document response was already judged (accepted -> handed over below, or rejected:
+    // 4xx / a page type) -- a rejected navigation keeps its ordinary download.
+    if (!media_handover_possible()) {
+        if (media_done_) media_result_.download = true; // no load left to stop
+        return true;
+    }
+    if (nav_doc_seen_) return false;
+    // No response was reported for this navigation: the download's own type is the only signal.
+    const std::string mime = mime_type(content_type);
+    if (!is_media_mime(mime) && !(is_generic_mime(mime) && has_video_extension(nav_url_))) return false;
+    MediaNavigation nav;
+    nav.url = nav_url_;
+    nav.referer = same_url(nav_page_url_before_, nav_url_) ? std::string() : nav_page_url_before_;
+    nav.nav_serial = nav_serial_;
+    nav.download = true;
+    publish_media_navigation(std::move(nav));
+    return true;
+}
+
+void BrowserView::publish_media_navigation(MediaNavigation nav){
+    nav_handed_id_ = nav_id_;
+    nav_handed_valid_ = true;
+    media_done_ = true;
+    media_result_ = std::move(nav);
+}
+
+bool BrowserView::take_media_navigation(MediaNavigation& out){
+    if (!media_done_) return false;
+    media_done_ = false;
+    out = std::move(media_result_);
+    media_result_ = MediaNavigation{};
+    return true;
+}
+
+void BrowserView::cancel_media_navigation(){
+    media_done_ = false;
+    media_result_ = MediaNavigation{};
+}
+
+void BrowserView::stop_media_navigation(){
+    // Stop() re-enters WebView2, so the owner calls this from its poll, never from a callback.
+    if (!controller_ready_ || !impl_->webview) return;
+    impl_->webview->Stop();
+}
+
+bool BrowserView::take_popup_navigation(std::string& url){
+    if (!popup_pending_) return false;
+    popup_pending_ = false;
+    url = std::move(popup_url_);
+    popup_url_.clear();
+    return true;
+}
+
+void BrowserView::navigate_popup(const std::string& url){
+    if (!controller_ready_ || !impl_->webview || url.empty()) return;
+    // A host Navigate() carries no Referer at all, so the click's is written onto this one
+    // document request by a narrow URI + DOCUMENT filter (see configure_webview()).
+    clear_web_filter();
+    const std::string referer = referrer_from(page_url_, url);
+    if (!referer.empty()) {
+        web_filter_uri_ = url;
+        web_filter_referer_ = referer;
+        if (SUCCEEDED(impl_->webview->AddWebResourceRequestedFilter(
+                browser::to_wide(url).c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT)))
+            web_filter_active_ = true;
+    }
+    impl_->webview->Navigate(browser::to_wide(url).c_str());
+}
+
+void BrowserView::clear_web_filter(){
+    if (!web_filter_active_ && web_filter_uri_.empty()) return;
+    web_filter_active_ = false;
+    if (impl_->webview && !web_filter_uri_.empty())
+        impl_->webview->RemoveWebResourceRequestedFilter(browser::to_wide(web_filter_uri_).c_str(),
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
+    web_filter_uri_.clear();
+    web_filter_referer_.clear();
 }
 
 void BrowserView::on_source_maybe_changed(){
@@ -588,6 +995,9 @@ void BrowserView::shutdown(){
     if (!alive_) return;
     alive_->store(false);
     cancel_cookies(); // no late answer may be published after teardown
+    cancel_media_navigation(); // nor a media handover nobody took
+    popup_pending_ = false;
+    popup_url_.clear();
     ++snapshot_gen_;
     snapshot_pending_ = false;
     snapshot_state_ = Snapshot::None;
@@ -598,8 +1008,16 @@ void BrowserView::shutdown(){
             impl_->webview->remove_SourceChanged(impl_->tok_source);
             impl_->webview->remove_NavigationStarting(impl_->tok_nav_starting);
             impl_->webview->remove_NavigationCompleted(impl_->tok_nav_completed);
+            impl_->webview->remove_NewWindowRequested(impl_->tok_new_window);
+            impl_->webview->remove_WebResourceRequested(impl_->tok_web_request);
+            clear_web_filter();
+            if (impl_->webview2) impl_->webview2->remove_WebResourceResponseReceived(impl_->tok_response);
+            if (impl_->webview4) impl_->webview4->remove_DownloadStarting(impl_->tok_download);
             impl_->webview.Reset();
         }
+        impl_->webview8.Reset();
+        impl_->webview4.Reset();
+        impl_->webview2.Reset();
         // Close() (not just Release) tears down the child window/process synchronously --
         // required before the parent HWND goes away.
         if (impl_->controller) {

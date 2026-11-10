@@ -15,11 +15,11 @@
 #   3. request_open_url_popup() enters the page (browser_enter intent).
 #   4. An address submission is a NAVIGATION: a plain web page appears in WebView2 with no
 #      native open, no container probe and no fallback (asserted by draining UiIntents).
-#   4b. A page whose media is an extension-less URL (and one fetched by script, not by a media
-#      element) keeps playing INSIDE the page: nothing auto-switches the page to Native.
-#   5. The address bar's play button is the manual native entry: it hands the URL in the bar
-#      (query token + percent-escaped UTF-8, no filename extension) to the async open together
-#      with the engine's cookie jar. The open really plays, and a successful open KEEPS the page
+#   4b. Embedded video and script fetches stay inside their HTML document.
+#   5. Top-level video responses automatically enter native playback, preserving query tokens,
+#      percent escapes, cookies and Referer. Redirects and media downloads are covered too;
+#      HTML disguised as .mp4 and unsuccessful responses must stay in the browser.
+#      The open really plays, and a successful open KEEPS the page
 #      up as its Native content (no browser_exit); the address bar names the media URL. The .flv
 #      case (URL typed into the bar, play clicked) lives in verify_browser_input.py.
 #   6. History: back / forward / reload, with the buttons' availability state. Back from Native
@@ -105,8 +105,14 @@ PAGES = {
     "/page2": PAGE_HTML.replace("__TAG__", "e2e2").replace("__MEDIA__",
                                                            "/media/movie.mp4?t=e2e2"),
     "/plain": PLAIN_HTML,
+    "/fake.mp4": PLAIN_HTML,
     "/ctpage": CT_HTML,
+    "/pagelink": """<!doctype html><body style="margin:0;background:#101012">
+        <a href="/media/movie.mp4?token=click%20video" style="position:fixed;
+        left:20px;top:20px;width:600px;height:80px;background:#ddd">Play video</a>
+        </body>""",
 }
+PAGES["/pageblank"] = PAGES["/pagelink"].replace("<a href=", '<a target="_blank" href=')
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -126,10 +132,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _plain(self, code, body=b"", extra=()):
         self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        ctype = next((v for k, v in extra if k.lower() == "content-type"),
+                     "text/plain; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         for k, v in extra:
-            self.send_header(k, v)
+            if k.lower() != "content-type":
+                self.send_header(k, v)
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -142,9 +151,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._plain(200, body, (("Content-Type", "text/html; charset=utf-8"),
                                     ("Set-Cookie", "sumu_e2e=1; Path=/")))
             return
-        if path == "/noext":
-            # The same MP4 bytes under a name with no extension whatsoever.
-            self._serve_file(TEST_VIDEO, "video/mp4")
+        if path in ("/noext", "/HEVC%20-%200.8M.mp4", "/attachment.mp4"):
+            self._serve_file(TEST_VIDEO, "application/octet-stream"
+                             if path == "/attachment.mp4" else "video/mp4")
+            return
+        if path == "/redirect":
+            self._plain(302, extra=(("Location", "/noext?token=redirect%20video"),))
+            return
+        if path == "/denied.mp4":
+            self._plain(403, b"access denied", (("Content-Type", "video/mp4"),))
+            return
+        if path == "/slow.mp4":
+            time.sleep(1.5)
+            self._serve_file(TEST_VIDEO)
             return
         if path == "/media/movie.mp4":
             referer = self.headers.get("Referer") or ""
@@ -176,6 +195,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         length = end - start + 1
         self.send_response(206 if partial else 200)
         self.send_header("Content-Type", ctype)
+        if ctype == "application/octet-stream":
+            self.send_header("Content-Disposition", 'attachment; filename="movie.mp4"')
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if partial:
@@ -375,19 +396,16 @@ FLOW = {"opened": False}
 
 
 def navigate(player, url, settle=3.0):
-    """Submit `url` from the address bar the way the app does: it is a NAVIGATION and nothing
-    else. Returns every UiIntent drained while the navigation settles (it must not contain an
-    open_path -- that is what these checks assert)."""
+    """Navigate and collect every intent emitted while the page settles."""
     player.browser_navigate(url)
     records = collect_intents(player, settle)
     return records
 
 
-def play_native(player, flow, seconds=10.0):
-    """Click the address bar's play button and complete the handover the way app.py does:
-    drain the open_path intent, run open/reopen with its headers/cookies, notify the result.
-    Returns (intents, opened)."""
-    player.browser_play_native()
+def play_native(player, flow, seconds=10.0, manual=True):
+    """Complete a manual or automatic handover using the app's real open/reopen path."""
+    if manual:
+        player.browser_play_native()
     intents, got = drain_until(player, lambda i: i.get("open_path"), seconds)
     if not got:
         return {}, False
@@ -516,30 +534,62 @@ def main():
           not state["native"] and not any(r.get("open_path") for r in records),
           f"{state} {[r.get('open_path') for r in records]}")
 
-    # ---- 5. the play button: the bar's URL goes straight to the decoder -----------------
-    # /page sets sumu_e2e=1 (Path=/) -- that is the jar the play button has to replay. The media
-    # URL carries a query token and percent-escaped UTF-8 (a real CDN-style address) and has no
-    # filename extension at all, so nothing here can be resolving a container by name.
+    # ---- 5. top-level media automatically hands over, without a play click -------------
+    for suffix in ("/fake.mp4", "/denied.mp4"):
+        records = navigate(player, base + suffix)
+        check(f"non-video response {suffix} never opens natively",
+              not any(r.get("open_path") for r in records)
+              and not player.browser_state()["native"])
+
+    player.browser_navigate(base + "/slow.mp4")
+    pump(player, 0.3)
+    records = navigate(player, plain_url, settle=3.0)
+    check("superseded slow video response never opens natively",
+          not any(r.get("open_path") for r in records)
+          and not player.browser_state()["loading"])
+
+    for source, expected in (
+        ("/HEVC%20-%200.8M.mp4?token=test%20token", "/HEVC%20-%200.8M.mp4?token=test%20token"),
+        ("/attachment.mp4?token=download", "/attachment.mp4?token=download"),
+        ("/redirect", "/noext?token=redirect%20video"),
+    ):
+        navigate(player, plain_url)
+        player.browser_navigate(base + source)
+        auto, auto_opened = play_native(player, flow, manual=False)
+        check(f"automatic video handover: {source}",
+              auto_opened and auto.get("open_path") == base + expected, repr(auto))
+        check("automatic video handover happens only once",
+              not any(r.get("open_path") for r in collect_intents(player, 0.8)))
+
+    for link_page in ("/pagelink", "/pageblank"):
+        navigate(player, base + link_page)
+        hwnd = find_window()
+        check("own window found for real media-link click", bool(hwnd))
+        if hwnd:
+            ensure_foreground(hwnd, player)
+            bounds = player.browser_state()["bounds"]
+            scale = ctypes.windll.user32.GetDpiForWindow(hwnd) / 96.0
+            click_client(hwnd, bounds[0] + 150 * scale, bounds[1] + 50 * scale)
+            linked, linked_opened = play_native(player, flow, manual=False)
+            check(f"clicking a media link automatically opens native playback ({link_page})",
+                  linked_opened, repr(linked))
+            check("link handover preserves Referer and cookies",
+                  link_page in (linked.get("open_headers") or "")
+                  and "sumu_e2e=1" in (linked.get("open_cookies") or ""), repr(linked))
+
     navigate(player, page_url)
-    pump(player, 20.0, lambda: url_is(player.browser_state()["url"], page_url))
-    media_token_url = f"{base}/noext?token=%E4%B8%AD%E6%96%87&t=manual"
-    navigate(player, media_token_url)
-    pump(player, 20.0, lambda: url_is(player.browser_state()["url"], media_token_url))
-    state = player.browser_state()
-    check("the submitted media URL is what the address bar holds",
-          state["address"] == media_token_url, state["address"])
-    check("submitting a media URL stays a page view navigation",
-          state["content"] == "web" and not state["native"], f"{state}")
-    intents, opened = play_native(player, flow)
-    check("the play button hands the address bar URL to the native open",
+    media_token_url = f"{base}/noext?token=%E4%B8%AD%E6%96%87&t=automatic"
+    player.browser_navigate(media_token_url)
+    intents, opened = play_native(player, flow, manual=False)
+    check("a video response hands its URL over without clicking play",
           intents.get("open_path") == media_token_url, repr(intents.get("open_path")))
-    check("the manual open really opens (query token + percent-escapes + no extension)", opened,
+    check("automatic open plays query token + percent-escapes + no extension", opened,
           f"opened={opened} path={intents.get('open_path')!r}")
-    check("the manual open replays the engine's cookie jar",
+    check("the automatic open replays the engine's cookie jar",
           "sumu_e2e=1" in (intents.get("open_cookies") or ""),
           repr(intents.get("open_cookies")))
     state = player.browser_state()
-    check("a successful manual open becomes the page's native content",
+    check("a successful automatic open becomes the page's native content",
           state["native"] and state["content"] == "native", f"{state}")
     check("no cookie wait left after the handover",
           not state["cookie_pending"], f"{state}")
@@ -550,11 +600,11 @@ def main():
     check("reload is disabled on the native content", not state["can_reload"], f"{state}")
     if opened:
         check("session is network", player.is_network())
-        check("has frames from the manual source", player.frame_count() > 0,
+        check("has frames from the automatic source", player.frame_count() > 0,
               f"frames={player.frame_count()}")
         player.play()
         pump(player, 1.0)
-        check("manual playback advances", player.current_frame() > 0,
+        check("automatic playback advances", player.current_frame() > 0,
               f"frame={player.current_frame()}")
         player.pause()
 

@@ -1200,6 +1200,13 @@ void Player::request_open_url_popup(){
     browser_addr_select_all_ = false;
     browser_home_select_all_ = false;
     browser_cookie_pending_ = false;
+    browser_auto_headers_.clear();
+    browser_auto_nav_serial_ = 0;
+    if (browser_) {
+        // Nothing the page view recorded while the page was closed may be taken over on entry.
+        browser_->cancel_cookies();
+        browser_->cancel_media_navigation();
+    }
     reset_page_backdrop_state();
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
@@ -1227,6 +1234,8 @@ void Player::exit_browser_page(){
     browser_addr_submitted_.clear();
     browser_cookie_pending_ = false;
     browser_cookie_url_.clear();
+    browser_auto_headers_.clear();
+    browser_auto_nav_serial_ = 0;
     reset_page_backdrop_state();
     browser_addr_focus_ = false;
     browser_home_focus_ = false;
@@ -1235,6 +1244,9 @@ void Player::exit_browser_page(){
     if (browser_) {
         browser_->set_visible(false);
         browser_->cancel_cookies(); // a lookup for a page that is gone must not start an open
+        browser_->cancel_media_navigation(); // nor may the page hand a video over after leaving it
+        std::string ignored;
+        browser_->take_popup_navigation(ignored); // nor navigate to a window request of the old page
     }
     ui_intents_.browser_exit = true; // Python restores playback if it had paused it
 }
@@ -1268,11 +1280,13 @@ bool Player::browser_overlay_open() const {
 }
 
 // One reveal rule for the floating top chrome (title bar in fullscreen, address bar whenever the
-// page shows the native video): the cursor inside the top 10% of the client area. Two copies of
-// this test used to drift apart; keep it here.
+// page shows the native video): the cursor in the top strip -- the title bar itself plus a band of
+// kChromeRevealFraction client heights starting at the bar's bottom edge. The bar height is the
+// fixed DPI height, never the current visibility, so revealing/hiding cannot shift the boundary.
+// Two copies of this test used to drift apart; keep it here.
 bool Player::mouse_in_top_reveal_zone() const {
     const ImGuiIO& io = ImGui::GetIO();
-    const float zone_y = io.DisplaySize.y * 0.10f;
+    const float zone_y = top_bar_h() + io.DisplaySize.y * ui::theme::kChromeRevealFraction;
     return io.MousePos.y >= 0.0f && io.MousePos.y <= zone_y &&
         io.MousePos.x >= 0.0f && io.MousePos.x <= io.DisplaySize.x;
 }
@@ -1373,8 +1387,9 @@ void Player::ensure_browser(){
 }
 
 // Per-frame poll of the page view (main thread, inside ui_tick()): creation result, the page
-// URL the address bar mirrors, a navigation queued while the controller was still starting,
-// and the answer to a native-play cookie lookup. Nothing here blocks.
+// URL the address bar mirrors, a navigation queued while the controller was still starting, the
+// answer to a native-play cookie lookup, and a navigation that turned out to be media (see
+// poll_media_navigation()). Nothing here blocks.
 void Player::sync_browser_page(){
     if (!browser_) return;
     if (browser_->failed()) browser_failed_ = true;
@@ -1394,6 +1409,18 @@ void Player::sync_browser_page(){
         browser_->navigate(browser_pending_nav_);
         browser_pending_nav_.clear();
         browser_web_ = true;
+    }
+
+    // A page asking for a new window (target=_blank / window.open) keeps this view: the page view
+    // never opens one itself, and the navigation runs here, outside its callbacks. A request from a
+    // page that only runs behind the native video is dropped.
+    std::string popup_url;
+    if (browser_->take_popup_navigation(popup_url)) {
+        if (browser_page_ && !browser_native_ && !open_url_loading_ && !browser_cookie_pending_ &&
+            browser_->ready() && !browser_failed_) {
+            browser_->navigate_popup(popup_url); // replays the click's referrer (a bare Navigate drops it)
+            browser_web_ = true;
+        }
     }
 
     // Address bar mirrors the page the engine is actually on (SourceChanged /
@@ -1416,17 +1443,33 @@ void Player::sync_browser_page(){
         }
     }
 
-    // CookieManager answer for the play button: consumed only while the page is still up and the
-    // answer names the URL the click asked about. BrowserView retires staler answers itself
-    // (generation token), so anything that no longer names `browser_cookie_url_` is dropped here
-    // too -- a navigation or a page leave must never leave this waiting forever.
+    // CookieManager answer for the play button / media handover: consumed only while the page is
+    // still up and the answer names the URL the click asked about. BrowserView retires staler
+    // answers itself (generation token), so anything that no longer names `browser_cookie_url_` is
+    // dropped here too -- a navigation or a page leave must never leave this waiting forever.
+    //
+    // A handover belongs to one navigation: once the page moved on, its late answer is dropped.
+    if (browser_cookie_pending_ && browser_auto_nav_serial_ != 0 &&
+        browser_->nav_serial() != browser_auto_nav_serial_) {
+        browser_cookie_pending_ = false;
+        browser_cookie_url_.clear();
+        browser_auto_headers_.clear();
+        browser_auto_nav_serial_ = 0;
+        browser_->cancel_cookies();
+    }
     if (browser_cookie_pending_) {
         std::string url, cookies;
         if (browser_->take_cookies(url, cookies)) {
             browser_cookie_pending_ = false;
             if (browser_page_ && url == browser_cookie_url_) {
                 browser_cookie_url_.clear();
-                begin_native_open(url, browser_native_headers(url), cookies);
+                // The handover's captured request context wins; a manual play click has none and
+                // derives its Referer from the page it was clicked on.
+                std::string headers = browser_auto_headers_;
+                browser_auto_headers_.clear();
+                browser_auto_nav_serial_ = 0;
+                if (headers.empty()) headers = browser_native_headers(url);
+                begin_native_open(url, headers, cookies);
             } else {
                 browser_cookie_url_.clear();
             }
@@ -1436,6 +1479,27 @@ void Player::sync_browser_page(){
             browser_cookie_url_.clear();
         }
     }
+
+    poll_media_navigation();
+}
+
+// Takes over a page navigation whose document turned out to be the video itself: stop the page
+// view's own load of it, then reuse the play button's path (CookieManager jar -> native open).
+void Player::poll_media_navigation(){
+    if (!browser_) return;
+    BrowserView::MediaNavigation nav;
+    if (!browser_->take_media_navigation(nav)) return;
+    // One-shot either way: dropped while an open is in flight, while another handover collects
+    // its cookies, or when the page is gone.
+    if (!browser_page_ || browser_failed_ || open_url_loading_ || browser_cookie_pending_) return;
+    if (nav.url.empty() || !browser_->ready()) return;
+    // A cancelled download has nothing left to stop; never Stop() from a WebView2 callback.
+    if (!nav.download) browser_->stop_media_navigation();
+    browser_auto_headers_ = browser_media_headers(nav.referer, nav.user_agent);
+    browser_auto_nav_serial_ = nav.nav_serial;
+    browser_cookie_pending_ = true;
+    browser_cookie_url_ = nav.url;
+    browser_->request_cookies(nav.url);
 }
 
 // Replay context for a manually started native open: the page the URL came from as Referer
@@ -1458,17 +1522,23 @@ std::string Player::browser_media_headers(const std::string& referer,
 
 // Hands `url` to the normal async open path (Python's do_open/do_reopen) with the request
 // context it needs, and puts the page into its loading state until Python calls
-// notify_open_url_finished(). Reached from the address bar's play button, the file picker and
-// a dropped file -- never from a submitted address (that is a navigation, see browser_submit).
+// notify_open_url_finished(). Reached from the address bar's play button, the file picker, a
+// dropped file, and the page view's media handover -- never from a submitted address (that is a
+// navigation, see browser_submit).
 void Player::begin_native_open(const std::string& url, const std::string& headers,
                               const std::string& cookies){
     if (url.empty()) return;
     // Any cookie lookup still in flight belongs to the action this one supersedes (an older play
-    // click): retire it so its late answer can never start a second open and overwrite the
-    // URL/headers that are handed over right here.
+    // click, an older handover): retire it so its late answer can never start a second open and
+    // overwrite the URL/headers that are handed over right here.
     browser_cookie_pending_ = false;
     browser_cookie_url_.clear();
-    if (browser_) browser_->cancel_cookies();
+    browser_auto_headers_.clear();
+    browser_auto_nav_serial_ = 0;
+    if (browser_) {
+        browser_->cancel_cookies();
+        browser_->cancel_media_navigation();
+    }
     const size_t n = std::min(url.size(), sizeof(browser_addr_buf_) - 1);
     std::memcpy(browser_addr_buf_, url.c_str(), n);
     browser_addr_buf_[n] = '\0';
@@ -1525,8 +1595,11 @@ std::string Player::browser_addr_text() const {
 }
 
 // Address bar Go / first-screen form Open: a valid http(s) address goes STRAIGHT to the page
-// view. No native open, no container probing, no fallback -- an ordinary web page appears from
-// the moment it is confirmed, and nothing about it depends on the media decoder.
+// view. No probing, no fallback -- an ordinary web page appears from the moment it is confirmed,
+// and nothing about it depends on the media decoder. The one exception is the page view's own
+// observation of where the navigation lands: when the document it fetches IS a video (a direct
+// stream link, a redirect onto an .mp4), that navigation is handed to the native decoder instead
+// of being displayed (see poll_media_navigation()).
 void Player::browser_submit(const std::string& raw){
     const std::string url = normalize_url_text(raw);
     if (!starts_with_http(url)) {
@@ -1537,11 +1610,16 @@ void Player::browser_submit(const std::string& raw){
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
 
-    // A navigation is the newest action: retire a play click still waiting for its cookie
-    // answer, so its late handover can never compete with what the user just asked for.
+    // A navigation is the newest action: retire a play click / handover still waiting for its
+    // cookie answer, so its late answer can never compete with what the user just asked for.
     browser_cookie_pending_ = false;
     browser_cookie_url_.clear();
-    if (browser_) browser_->cancel_cookies();
+    browser_auto_headers_.clear();
+    browser_auto_nav_serial_ = 0;
+    if (browser_) {
+        browser_->cancel_cookies();
+        browser_->cancel_media_navigation();
+    }
 
     const size_t n = std::min(url.size(), sizeof(browser_addr_buf_) - 1);
     std::memcpy(browser_addr_buf_, url.c_str(), n);
@@ -1587,6 +1665,11 @@ void Player::browser_play_native(){
     }
     browser_cookie_pending_ = true;
     browser_cookie_url_ = url;
+    // A manual play is not a media handover: the Referer comes from the page (see
+    // browser_native_headers), and any handover of an older navigation is retired.
+    browser_auto_headers_.clear();
+    browser_auto_nav_serial_ = 0;
+    browser_->cancel_media_navigation();
     browser_->request_cookies(url);
 }
 

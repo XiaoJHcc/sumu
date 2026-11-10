@@ -299,8 +299,10 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
    与它拼成一条连续的 chrome。
 2. **地址栏**（`##sumu_browser_bar`，高度 `kAddrBarHBase = 36`，与标题栏同高同底色
    `kPanelBg` + 下边缘 `kBorder` 发丝线）。**Native 内容下它是悬浮 chrome**：只在光标进入
-   顶部 reveal 区（与全屏标题栏同一条规则）或地址输入正在使用时出现，隐藏时不占布局、不移动
-   视频 viewport；Web/Home/Loading 等状态它仍常驻。控件行 32px 高、按 `kSpaceXS` 内缩，从左到右：
+   标题栏下缘向下延伸窗口高度 15% 的 reveal 区（标题栏自身也在命中范围内；比例与底部时间条
+   共用 `kChromeRevealFraction`；全屏时仍按固定标题栏高度计算，显隐不改变边界）或地址输入正在使用时出现，隐藏时不占布局、不移动视频 viewport；
+   Web/Home/Loading 等状态它仍常驻。地址栏按钮不显示 tooltip，避免被 WebView2 子窗口遮挡。
+   控件行 32px 高、按 `kSpaceXS` 内缩，从左到右：
    **后退**（arrow-left）· **前进**（arrow-right）· **刷新**（rotate-cw）· URL 输入框
    （占满剩余宽）· 访问（OpenUrl）· 播放（Play）。**没有「关闭网页」X**（已删除：页面内唯一的
    退出口是首屏表单的 Cancel），也没有标签页、书签、历史面板；历史按钮按引擎真实可用状态

@@ -6,9 +6,12 @@
 // Scope: this class is deliberately NOT a browser. It creates one windowed WebView2 child
 // controller on the Player window, navigates where the address bar points, and reports back the
 // page URL the engine is on plus a PNG of the page (settings overlay backdrop) and the Cookie
-// jar for a URL (so a manually started native open can replay the page's credentials). It never
-// observes or rewrites page traffic, never injects script, and never exposes a host object, file
-// or command bridge -- only navigation, one-shot capture and one-shot cookie lookup.
+// jar for a URL (so a native open can replay the page's credentials). It injects no script,
+// rewrites no response, and exposes no host object, file or command bridge. Only popup document
+// requests receive a one-shot Referer override; media detection is read-only:
+// the top-level document response of a navigation, purely to notice when that navigation IS a
+// video (see MediaNavigation below). Page subresources (<video>, fetch, iframe, ads) are never
+// looked at.
 //
 // WebView2 headers stay in browser_view.cpp: Player holds this by forward-declared
 // unique_ptr (player.h), so the SDK's ~60k-line COM header never leaks into the present
@@ -17,9 +20,10 @@
 // Threading: every method, every COM callback and the whole controller lifetime belong to
 // the UI thread that owns the Player window and its message pump (Player::pump_messages()).
 // WebView2 marshals its async callbacks to that thread, so no lock is needed -- and the
-// cookie result is POLLED by the owner (take_cookies()) rather than pushed through a
-// callback, which keeps the "晚到回调访问已销毁 Player" hazard out of the picture entirely.
-// The polled slot always ends up filled: every request_cookies() failure outlet publishes an
+// cookie result and the media handover are POLLED by the owner (take_cookies(),
+// take_media_navigation()) rather than pushed through a callback, which keeps the "晚到回调访问已
+// 销毁 Player" hazard out of the picture entirely. Nothing here ever calls back into the owner.
+// The cookie slot always ends up filled: every request_cookies() failure outlet publishes an
 // empty result, and a generation token retires answers whose URL is no longer the one asked for.
 //
 // Runtime dependency: the system Evergreen WebView2 Runtime (no fixed runtime is shipped).
@@ -105,6 +109,44 @@ public:
     // it. `cookies` is the "name=value; name2=value2" request-header form.
     bool take_cookies(std::string& url, std::string& cookies);
 
+    // ---- a page navigation that IS the video ------------------------------------------------
+    // The page view is the transport, so a navigation may land on media instead of a page. Only
+    // the TOP-LEVEL document is judged: a 200/206 GET response whose Content-Type is video/* or a
+    // playlist type (HLS/DASH) qualifies by itself, a generic/absent type only with a video
+    // extension in the URL's path -- a page type never qualifies, .mp4 suffix or not. A navigation
+    // the browser turns into a download (FLV & co.) qualifies the same way and is cancelled in the
+    // browser (no file, no save prompt) before it is reported. Subresources (<video>, fetch,
+    // iframe, ads) are never looked at, and there is at most one handover per navigation.
+    //
+    // Polled like the cookie slot: no WebView2 callback calls back into the owner, the request
+    // context travels with the URL (the document's own Referer/User-Agent; cookies are the owner's
+    // separate CookieManager lookup), and a newer navigation / cancel / shutdown() retires a
+    // candidate nobody took.
+    struct MediaNavigation {
+        std::string url;         // navigated URL, query and percent-escapes untouched
+        std::string referer;     // Referer of the document request (fallback: the page it left)
+        std::string user_agent;  // User-Agent of the document request
+        uint64_t nav_serial = 0; // see nav_serial(): identifies the navigation it came from
+        bool download = false;   // the browser treated it as a file download (already cancelled)
+    };
+    bool take_media_navigation(MediaNavigation& out);
+    // Bumped whenever a NEW top-level navigation starts (not on its redirects), so the owner can
+    // drop an answer whose navigation has since been replaced.
+    uint64_t nav_serial() const { return nav_serial_; }
+    // Retires a candidate nobody took (leaving the page, a manual play, a new navigation).
+    void cancel_media_navigation();
+    // Aborts the page view's own load of a navigation being handed to the decoder. The owner calls
+    // it from its poll: Stop() re-enters WebView2, so never call it from inside a callback.
+    void stop_media_navigation();
+
+    // A page asking for a new window (target=_blank / window.open) never gets one: the runtime's
+    // new-window request is cancelled and its http(s) URL is queued for THIS view. Polled (the
+    // owner navigates, not the callback); a newer navigation or request replaces an untaken one.
+    bool take_popup_navigation(std::string& url);
+    // Runs a queued new-window navigation here, replaying the referrer a clicked link would carry
+    // (see referrer_from()); cookies stay the browser's own jar.
+    void navigate_popup(const std::string& url);
+
     // True while the page view was asked to mute itself (it is muted whenever it is hidden, so
     // a closed/loading/parked page never keeps its own audio playing over the video).
     bool muted() const { return muted_; }
@@ -128,8 +170,18 @@ private:
     void fail(const char* what);
     void configure_webview();
     void apply_bounds();
-    void on_navigation_started();
+    void on_navigation_started(const std::string& url, uint64_t nav_id, bool redirected);
     void on_source_maybe_changed();
+    // Media handover (see MediaNavigation): both only record a candidate, never call into WebView2.
+    void on_document_response(const std::string& uri, const std::string& method, int status,
+                              const std::string& content_type, const std::string& referer,
+                              const std::string& user_agent);
+    // True when this download is the navigation being taken over (the caller then cancels it).
+    bool on_download_started(const std::string& uri, const std::string& content_type);
+    void publish_media_navigation(MediaNavigation nav);
+    bool media_handover_possible() const;
+    // Drops the one-shot popup Referer filter (never called from a WebView2 callback).
+    void clear_web_filter();
     // Publishes a cookie lookup result (possibly empty) into the take_cookies() slot and
     // clears the in-flight state. Every request_cookies() exit path funnels through here.
     void publish_cookies(const std::string& url, std::string jar);
@@ -165,6 +217,28 @@ private:
     bool visible_ = false;
 
     std::string page_url_;
+
+    // Media handover (see MediaNavigation): the top-level navigation in flight (`nav_url_` follows
+    // its redirects, `nav_serial_` changes only for a new one), the one already handed over, and
+    // whether its document response has been judged.
+    uint64_t nav_serial_ = 0;
+    uint64_t nav_id_ = 0;
+    bool nav_id_valid_ = false;
+    std::string nav_url_;
+    std::string nav_page_url_before_; // page URL when the navigation started (Referer fallback)
+    uint64_t nav_handed_id_ = 0;
+    bool nav_handed_valid_ = false;
+    bool nav_doc_seen_ = false;
+    bool media_done_ = false; // a candidate is waiting for the owner to take it
+    MediaNavigation media_result_;
+    // New-window request waiting for the owner's poll (see take_popup_navigation()).
+    bool popup_pending_ = false;
+    std::string popup_url_;
+    // One-shot WebResourceRequested filter that writes the click's Referer onto the popup
+    // navigation's own document request (narrow URI + DOCUMENT context, removed lazily).
+    bool web_filter_active_ = false;
+    std::string web_filter_uri_;
+    std::string web_filter_referer_;
 
     // Page snapshot handoff (see request_snapshot()): generation-guarded, polled.
     uint64_t snapshot_gen_ = 0;
