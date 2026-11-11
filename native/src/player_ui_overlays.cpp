@@ -383,10 +383,12 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
                 ui::theme::text_u32(), items[i].label);
             ImGui::PopID();
         }
-        // Hairline outline, same language as the combo popup / modal border.
+        // Hairline outline, same language as the combo popup / modal border. In the POPUP's own
+        // draw list, so a popup lifted into its own layer over the URL page carries the outline
+        // with it (the shared foreground list would stay behind the page view).
         const ImVec2 pmin = ImGui::GetWindowPos();
         const ImVec2 pmax(pmin.x + ImGui::GetWindowSize().x, pmin.y + ImGui::GetWindowSize().y);
-        ImGui::GetForegroundDrawList()->AddRect(
+        ImGui::GetWindowDrawList()->AddRect(
             ImVec2(pmin.x + 0.5f, pmin.y + 0.5f), ImVec2(pmax.x - 0.5f, pmax.y - 0.5f),
             ui::theme::border_u32(), ui_s(ui::theme::kRadiusWindow), 0, 1.0f);
         ImGui::EndPopup();
@@ -436,8 +438,8 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
 //                nothing) and the normal bottom bar stays available. The address bar is shown
 //                only while the cursor is in the top reveal strip or the field is in use.
 //   Web          the WebView2 child window (a REAL HWND: nothing ImGui draws can appear on top
-//                of it, so the chrome strips are laid out above its rect and it steps aside
-//                while an overlay, the settings snapshot or the loading card is up)
+//                of it, so the chrome strips are laid out above its rect and it steps aside for
+//                an overlay or the loading card)
 //   Unavailable  WebView2 missing/failed -> one centered line
 //   Home         first-screen form (nothing loaded yet)
 //
@@ -448,11 +450,11 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
 // an open error instead of being re-routed to the page. The other way into Native is the page
 // view's own handover: when the navigation's document IS a video, the page switches to Native by
 // itself (BrowserView::MediaNavigation). The star favorites the COMMITTED page URL; the dropdown
-// under the field lists the favorites (see build_favorites_dropdown). Tooltips and that dropdown
-// reach into the page area, where the WebView2 child window would cover them -- they are lifted
-// into the popup layers (popup_layer.h) while the live page view is up. Nothing here leaves the
-// page implicitly: settings, the web-stream modal, the file picker, the export overlay and a
-// successful native open all keep it alive.
+// under the field lists the favorites (see build_favorites_dropdown). Tooltips, that dropdown, the
+// settings panel and the popup it opens reach into the page area, where the WebView2 child window
+// would cover them -- they are lifted into the popup layers (popup_layer.h) while the live page
+// view is up. Nothing here leaves the page implicitly: settings, the web-stream modal, the file
+// picker, the export overlay and a successful native open all keep it alive.
 void Player::build_browser_page(){
     ImGuiIO& io = ImGui::GetIO();
     sync_browser_page();
@@ -482,31 +484,13 @@ void Player::build_browser_page(){
     const float content_h = std::max(0.0f, io.DisplaySize.y - content_y);
 
     // ---- settings overlay ------------------------------------------------------------------
-    // The panel is drawn ON the page, not instead of it: the page view is captured to a texture
-    // (BrowserView::request_snapshot), which backs the panel while the live view steps aside.
-    // The page session, URL and history are untouched; closing the panel restores the same
-    // controller. While the capture is in flight the live view stays up and the panel waits a
-    // frame; if it fails the panel falls back to the plain player background.
+    // The panel is drawn ON the page, not instead of it: it is routed into its own owned top-level
+    // window (popup_layer.h, settings_popup_) while the live page view stays up underneath, so the
+    // page keeps running, clicking and sounding. The page session, URL and history are untouched.
+    // If that layer could not get its window, the page view steps aside instead (the panel then
+    // draws in the main swapchain) -- a usable panel beats an invisible one.
     const bool settings_wanted = ui_settings_open_ && is_web;
-    if (!ui_settings_open_ && browser_backdrop_requested_) reset_page_backdrop_state();
-    if (settings_wanted && !browser_backdrop_requested_) {
-        browser_backdrop_requested_ = true;
-        browser_backdrop_state_ = 1; // pending
-        browser_backdrop_url_ = browser_ ? browser_->page_url() : std::string();
-        if (browser_) browser_->request_snapshot();
-    }
-    if (browser_backdrop_state_ == 1 && browser_) {
-        std::vector<uint8_t> png;
-        const BrowserView::Snapshot snap = browser_->take_snapshot(png);
-        if (snap == BrowserView::Snapshot::Ready)
-            browser_backdrop_state_ = upload_page_backdrop(png) ? 2 : 3;
-        else if (snap == BrowserView::Snapshot::Failed)
-            browser_backdrop_state_ = 3;
-    }
-    const bool backdrop_ready = settings_wanted && browser_backdrop_state_ == 2 &&
-        browser_backdrop_srv_ != nullptr;
-    const bool backdrop_failed = settings_wanted && browser_backdrop_state_ == 3;
-    const bool settings_pending = settings_wanted && browser_backdrop_state_ == 1;
+    const bool settings_layer_ok = settings_popup_available();
 
     // ---- address bar -------------------------------------------------------------------
     if (addr_visible) {
@@ -655,23 +639,6 @@ void Player::build_browser_page(){
     // ---- page content -------------------------------------------------------------------
     const float page_y = content_y + err_h;
     const float page_h = std::max(0.0f, content_h - err_h);
-    // Settings overlay: the captured page, 1:1 over the area the live view used to cover.
-    if (backdrop_ready) {
-        ImGui::SetNextWindowPos(ImVec2(0, page_y));
-        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, page_h));
-        ImGuiWindowFlags bd_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing |
-            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground |
-            ImGuiWindowFlags_NoInputs;
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::Begin("##sumu_settings_backdrop", nullptr, bd_flags);
-        ImGui::Image((ImTextureID)(intptr_t)browser_backdrop_srv_.Get(),
-            ImVec2(io.DisplaySize.x, page_h));
-        ImGui::End();
-        ImGui::PopStyleVar();
-    }
     if (!is_web && !is_native) {
         ImGui::SetNextWindowPos(ImVec2(0, page_y));
         ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, page_h));
@@ -834,12 +801,11 @@ void Player::build_browser_page(){
     }
 
     // ---- in-page overlays ---------------------------------------------------------------
-    // Both live INSIDE the page (neither navigates back to the player): the settings panel over
-    // the captured page snapshot (skipped for the one frame that capture is still in flight --
-    // the live page is what the user sees then), and the web-stream modal over the plain page
-    // background (the live page view steps aside for it and comes back unchanged).
-    if (ui_settings_open_ && !settings_pending)
-        build_settings_panel(top_bar_h + (addr_visible ? addr_h : 0.0f));
+    // Both live INSIDE the page (neither navigates back to the player): the settings panel, which
+    // floats above the LIVE page in its own popup layer (the page keeps running underneath), and
+    // the web-stream modal over the plain page background (the live page view steps aside for it
+    // and comes back unchanged).
+    if (ui_settings_open_) build_settings_panel(top_bar_h + (addr_visible ? addr_h : 0.0f));
     build_stream_popup();
 
     // ---- favorites dropdown --------------------------------------------------------------
@@ -851,15 +817,14 @@ void Player::build_browser_page(){
     // ---- page view placement -------------------------------------------------------------
     // The child window covers exactly the page area, below the chrome strips, and only when the
     // page itself is what should be visible: not loading, not native, not covered by an overlay,
-    // not while the export screen owns the window. Bounds/visibility are pushed every frame
-    // (both are no-ops when unchanged) so resize, DPI change and every transition land on the
-    // next tick without extra plumbing.
+    // not while the export screen owns the window. The settings panel is NOT one of these -- it
+    // floats above the page -- unless its layer is unavailable, in which case the page steps
+    // aside for it. Bounds/visibility are pushed every frame (both are no-ops when unchanged) so
+    // resize, DPI change and every transition land on the next tick without extra plumbing.
     if (browser_) {
-        // The live page stays up while the settings capture is in flight (no blank flash, and
-        // the engine needs visible frames to capture); once the backdrop is ready -- or the
-        // capture failed -- it steps aside for the panel.
+        const bool settings_steps_aside = settings_wanted && !settings_layer_ok;
         const bool web_visible = is_web && !browser_overlay_open() && !export_mode_ &&
-            !backdrop_ready && !backdrop_failed;
+            !settings_steps_aside;
         browser_->set_bounds(0, static_cast<int>(page_y),
             static_cast<int>(io.DisplaySize.x), static_cast<int>(page_h));
         browser_->set_visible(web_visible);

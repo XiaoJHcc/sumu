@@ -5,8 +5,8 @@
 //
 // Scope: this class is deliberately NOT a browser. It creates one windowed WebView2 child
 // controller on the Player window, navigates where the address bar points, and reports back the
-// page URL the engine is on plus a PNG of the page (settings overlay backdrop) and the Cookie
-// jar for a URL (so a native open can replay the page's credentials). It injects no script,
+// page URL the engine is on, the document title, and the Cookie jar for a URL (so a native open
+// can replay the page's credentials). It injects no script,
 // rewrites no response, and exposes no host object, file or command bridge. Only popup document
 // requests receive a one-shot Referer override; media detection is read-only:
 // the top-level document response of a navigation, purely to notice when that navigation IS a
@@ -88,15 +88,6 @@ public:
     // Latest document title the page reported (DocumentTitleChanged), UTF-8; empty until the
     // page sets one. The address bar's favorites list stores it as the display label.
     const std::string& page_title() const { return page_title_; }
-
-    // Page snapshot for the settings overlay (see docs/native_core.md): an async
-    // CapturePreview() into memory, POLLED like the cookie result so no callback ever touches
-    // the owner. Ready gives PNG bytes; Failed means the caller should fall back to the plain
-    // "hide the page view" overlay. A newer request, a navigation or shutdown() retires an
-    // older one.
-    enum class Snapshot { None, Ready, Failed };
-    void request_snapshot();
-    Snapshot take_snapshot(std::vector<uint8_t>& png);
 
     // Asks the CookieManager for the cookies that apply to `url` (async) -- the manual
     // native-play button's replay context. The result is handed back by take_cookies(); a
@@ -189,7 +180,6 @@ private:
     // Publishes a cookie lookup result (possibly empty) into the take_cookies() slot and
     // clears the in-flight state. Every request_cookies() exit path funnels through here.
     void publish_cookies(const std::string& url, std::string jar);
-    void publish_snapshot(std::vector<uint8_t> png);
 
     // ---- non-client resize forwarding (best effort, our own process only) -------------
     // Measured window chain (see docs/native_core.md):
@@ -244,12 +234,6 @@ private:
     bool web_filter_active_ = false;
     std::string web_filter_uri_;
     std::string web_filter_referer_;
-
-    // Page snapshot handoff (see request_snapshot()): generation-guarded, polled.
-    uint64_t snapshot_gen_ = 0;
-    bool snapshot_pending_ = false;
-    Snapshot snapshot_state_ = Snapshot::None;
-    std::vector<uint8_t> snapshot_png_;
 
     // Cookie handoff (polled by take_cookies(), push-free): `cookie_pending_` is the in-flight
     // lookup for `cookie_url_`, the `cookie_done_` slot holds its answer. `cookie_gen_` is

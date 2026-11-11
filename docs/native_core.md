@@ -80,11 +80,13 @@ p.browser_state()           # 页视图状态 dict：page/native/web/content(hom
                             # native|unavailable)/available/failed/url/
                             # loading/muted/cookie_pending/address/web_visible/settings_open/
                             # stream_open/export/can_back/can_forward/can_reload/bounds/
-                            # page_rect/home_rect/addr_visible/viewport/settings_backdrop/
-                            # backdrop_state/backdrop_url/fullscreen/top_bar_visible/
+                            # page_rect/home_rect/addr_visible/viewport/settings_popup/
+                            # fullscreen/top_bar_visible/
                             # favorites/favorited/favorites_open/addr_field_rect/popups
-                            # popups = {favorites, tooltip}，每项 {hwnd, visible, routed,
-                            # client_rect, screen_rect, frames}（弹出层取证用）
+                            # popups = {favorites, tooltip, settings, menu}，每项 {hwnd,
+                            # visible, routed, available, client_rect, screen_rect, frames}
+                            # （弹出层取证用；available=false 表示该层拿不到窗口，设置面板
+                            # 退回主 swapchain、活页视图让位）
                             # take_ui_intents() 另带 favorite_add_url / favorite_add_title /
                             # favorite_remove_url（空串 = 无）
 p.set_park_on_close(on)      # 关窗驻留开关：on 时 X/ESC 不再直接退出，而是经
@@ -220,22 +222,19 @@ open**，页面显示不依赖 FFmpeg 成功、失败或超时。提交的地址
 导出保存对话框的 mp4 filter 保持不变。
 - **Loading / Unavailable / Home** 同前。
 
-**设置面板叠在网页上（页面快照底图）**：窗口式 WebView2 是真实子 HWND，ImGui 无法画在它
-之上。打开设置时 `BrowserView::request_snapshot()` 用 `CapturePreview` 异步抓当前网页 PNG
-（内存流，不落盘），Player 在 `d3d_mutex_` 下用系统 WIC 解码成 BGRA 并建 D3D11 纹理；抓图就绪
-后隐藏活视图，在原内容区绘制这张底图，再把设置面板画在上面。网页会话/历史/URL 都不销毁不跳
-转，关闭设置恢复同一个 live WebView2。要点：
+**设置面板浮在网页之上**：窗口式 WebView2 是真实子 HWND，ImGui 无法在它之上作画。设置面板
+因此走**弹出层**（`settings_popup_`，见下节）：面板被路由进自己 owned 顶层窗口，画在活页视图
+之上，网页照常渲染、可点、有声。页面会话/历史/URL 都不销毁不跳转，关闭设置只是收起面板。
+要点：
 
-- **抓图期间活视图必须可见**：CapturePreview 要有可见帧才能完成（实测：隐藏后请求会挂起十几
-  秒才补上），所以 pending 时保持网页显示、面板晚一帧绘制，绝不闪出播放器底色。
-- 失败（抓图或解码失败）回退成旧行为（隐藏活视图、面板画在页面上），页面状态不受影响。
-- 捕获结果是**轮询**的（`take_snapshot()`），带 generation/alive 守卫：导航、关闭页面、导出、
-  shutdown 都会作废旧结果，晚到的回调不会写旧状态。
-- **设置开启时导航**：底图属于旧页面，`sync_browser_page()` 一旦发现页面 URL 与
-  `browser_backdrop_url_`（请求抓图时记下的 URL）不一致、或内容不再是 Web，就作废该底图并交
-  回同一套 `request_snapshot()` 流程重抓——面板最终显示的是新页面的图，`backdrop_url` 即它的
-  出处；每帧不会重复抓图（一次导航仍只抓一张）。
-- Web 串流模态框仍是旧的「让位」行为（隐藏+静音活视图），本次不改。
+- **活页视图始终不变**：没有抓图、没有让位、没有「等一帧」，打开/关闭面板不改变页面视图的
+  可见性与 bounds，因此音频、滚动位置、正在播放的网页视频都不受影响；面板开着时导航照常发生
+  在面板之下（面板本身与页面 URL 无关）。
+- 面板行内的键盘输入依赖**焦点交还**：面板窗口永不激活，点进面板任何控件时该层把 Win32 键盘
+  焦点交回 Player 主窗口（与主 WndProc 对 chrome 点击的处理一致），数字框才收得到键入。
+- **兜底**：若该层拿不到窗口/swapchain（`available=false`），面板退回主 swapchain 绘制，
+  此时活页视图让位（隐藏+静音）——即快照方案之前的旧行为，面板永远可用。
+- Web 串流模态框仍是「让位」行为（隐藏+静音活视图）。
 
 **退出口**：地址栏上没有「关闭网页」按钮（已删除）；页面内唯一的退出口是首屏表单的
 Cancel（加上 Python 的 `exit_browser_page()`），它产生 `browser_exit`。设置面板、打开文件（含取消选择）、Web 串流模态框、离线导出都不再离开页面：前两者
@@ -272,8 +271,9 @@ swapchain 与页面视图 bounds 同步跟随），松开后 armed/active 一并
 ## 弹出层（`native/src/popup_layer.h/.cpp`）
 
 窗口式 WebView2 是**真实子 HWND**：子窗口永远压在父窗口客户区之上，ImGui 画在主 swapchain
-里的任何东西都会被网页盖住。地址栏收藏下拉、地址栏按钮 tooltip 都要伸到页面区上方，因此走
-**弹出层**——单窗口版的 ImGui multi-viewport，与 Chrome 的 omnibox 弹窗同一个思路：
+里的任何东西都会被网页盖住。地址栏收藏下拉、tooltip、设置面板以及面板/地址栏打开的 ImGui
+弹出窗口都要伸到页面区上方，因此走**弹出层**——单窗口版的 ImGui multi-viewport，与 Chrome 的
+omnibox 弹窗同一个思路：
 
 - 一个 `PopupLayer` 持有一个 **owned 顶层窗口**（`WS_POPUP`，owner = Player 的 `hwnd_`）：
   被拥有的窗口恒在 owner 及其子窗口之上，所以必然压住网页；`WS_EX_NOACTIVATE |
@@ -296,20 +296,31 @@ swapchain 与页面视图 bounds 同步跟随），松开后 armed/active 一并
 - **不闪黑**：主线程只在 present 线程已经按当前尺寸渲染过一帧（`rendered_frames()` 变化 +
   尺寸匹配）之后才 `ShowWindow(SW_SHOWNOACTIVATE)`，并每帧按 `ClientToScreen` 跟随被路由窗口
   的位置；没有路由时（或窗口最小化/隐藏、`WM_ACTIVATEAPP` 失活、退出）立即隐藏。
+- **层间叠放按出现顺序**：某层从隐藏转可见时把窗口提到 owner 的 owned 栈顶，所以后打开的
+  combo 列表/提示必然画在先前就在屏上的设置面板之上（与 Chrome 的 popup 叠放语义一致）。
 - **输入**：鼠标消息直接进弹出窗口自己，转成主客户区坐标后喂给共享 ImGui IO
   （`AddMousePosEvent`/`AddMouseButtonEvent`/`AddMouseWheelEvent`），按下时 `SetCapture(弹出窗)`、
   抬起释放。**故意不**经 `ImGui_ImplWin32_WndProcHandler`：那会给主窗口
   `TrackMouseEvent` 并投递假的 `WM_MOUSELEAVE`。光标离开主窗口时后端把鼠标位置置为无效，但它
   在 `NewFrame()` 里的回退分支（应用仍聚焦时用 `GetCursorPos` 换算主客户区）会把位置补回来，
   所以主窗口/弹出窗口之间来回移动不会让 hover 抖动。`WM_SETCURSOR` 固定箭头。
+- **键盘焦点交还**：层永不激活，所以焦点可能停在网页子窗口里（用户点过页面）。层内任何左键
+  按下都把 Win32 焦点交回 Player 主窗口（`SetFocus(hwnd_)`，与主 WndProc 对 chrome 点击的处理
+  完全一致），被路由的 InputText/数字框因此收得到键入；弹出窗口本身仍然从不激活。
 - **只在「活的网页视图真的可见」时启用路由**：`ui_tick()` 用
   `browser_ && browser_->visible() && !export_mode_ && app_activated_ && !IsIconic(hwnd_)` 判定。
-  其余状态（首页表单、Native 内容、设置/串流的让位、导出页、窗口最小化或应用在后台）不路由，
+  其余状态（首页表单、Native 内容、串流的让位、导出页、窗口最小化或应用在后台）不路由，
   同一个 ImGui 窗口照旧画在主 swapchain 里——网页视图以外零行为变化。
-- Player 用两个实例：`fav_popup_`（地址栏收藏下拉 `##sumu_favorites`）与 `tooltip_popup_`
-  （当帧绘制过的 ImGui tooltip 窗口 `##Tooltip_%02d`，按名字前缀查找）。`close()` 在 present
-  线程 join 之后、`ui_shutdown()` 之前 `release()`（快照用 ImGui 分配器释放，swapchain/HWND
-  一并销毁）。
+- Player 用四个实例：`fav_popup_`（地址栏收藏下拉 `##sumu_favorites`）、`tooltip_popup_`
+  （当帧绘制过的 ImGui tooltip 窗口 `##Tooltip_%02d`，按名字前缀查找）、`settings_popup_`
+  （设置面板 `##sumu_settings`）、`menu_popup_`（**当帧最顶层且真的绘制过的 ImGui 弹出窗口**，
+  由 `PopupLayer::active_popup_name()` 从 context 的 `OpenPopupStack` 顶项取名——combo 下拉、
+  地址栏右键菜单等所有 `BeginPopup*` 都算；弹出窗口是独立 root window，所以必须单独一层）。
+  `close()` 在 present 线程 join 之后、`ui_shutdown()` 之前 `release()`（快照用 ImGui 分配器
+  释放，swapchain/HWND 一并销毁）。
+- **拿不到窗口就退回主 swapchain**：窗口或 swapchain 创建失败时该层 `unavailable()` 置位
+  （sticky），`browser_state()["popups"][<层>]["available"]` 可查；设置面板据此决定「活页视图
+  让位」，面板本身永远可用。
 
 **地址栏收藏（favorites）**：星标作用于**已提交**的页面 URL——Web 内容取
 `BrowserView::page_url()`，Native 内容取该会话被打开时的 URL（地址栏显示的那个），首页/加载中
@@ -324,8 +335,9 @@ swapchain 与页面视图 bounds 同步跟随），松开后 armed/active 一并
 
 验证入口：`scripts/verify_browser_input.py`（真实鼠标：星标 intent、下拉是真实顶层窗口且
 **停在网页之上**（行内屏幕像素不等于网页底色）、点行导航、点 X 删除、Esc 关闭、hover 出
-tooltip）、`scripts/verify_browser.py`（页面链路回归）、`scripts/shot_browser.py`
-（`native/trace/browser_favorites.png` 目检）。
+tooltip；设置面板与它的 combo 列表、地址栏右键菜单同样按像素取证，且面板数字框要收得下真实
+键入的数值）、`scripts/verify_browser.py`（页面链路回归 + 设置面板浮在活页之上的状态断言）、
+`scripts/shot_browser.py`（`native/trace/browser_favorites.png` / `browser_settings*.png` 目检）。
 
 ## 线程/锁模型（继承 Spike 2，新增 `decoder_mutex_`/`trace_mutex_`）
 

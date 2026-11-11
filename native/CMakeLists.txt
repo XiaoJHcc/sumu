@@ -191,8 +191,6 @@ target_link_libraries(sumu_core PRIVATE
     shlwapi
     version
     comctl32
-    # WIC: decode the WebView2 page snapshot that backs the settings overlay.
-    windowscodecs
     avcodec
     avformat
     avutil

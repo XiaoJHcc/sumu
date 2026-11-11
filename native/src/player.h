@@ -657,8 +657,8 @@ private:
     void ui_render_drawdata();
 
     // Present thread, inside d3d_mutex_ right after ui_render_drawdata(): renders whichever
-    // popup layers (address-bar dropdown / tooltip over the page view) have a routed frame,
-    // each into its own swapchain. See popup_layer.h for why they exist.
+    // popup layers (address-bar dropdown / tooltip / settings panel / open popup, see
+    // popup_layer.h) have a routed frame, each into its own swapchain.
     void ui_render_popups();
 
     void build_ui();
@@ -693,18 +693,19 @@ private:
     // pause the session (browser_enter) so audio/video do not run behind the page.
     void browser_enter_web();
     // True while some ImGui overlay owns the page area and the WebView2 child window must step
-    // aside for it (the web-stream modal; the settings panel uses the captured-page backdrop
-    // instead, see browser_settings_backdrop_*).
+    // aside for it (the web-stream modal). The settings panel is NOT one of these: it is routed
+    // into its own popup layer and floats above the live page view (see popup_layer.h).
     bool browser_overlay_open() const;
     // Shared reveal rule for the floating TOP chrome: true while the cursor is inside the top
     // strip of the client area. The title bar uses it in fullscreen (it is always visible in
     // windowed mode) and the address bar uses it whenever the page shows native video -- so
     // both strips appear and disappear together instead of two drifting rules.
     bool mouse_in_top_reveal_zone() const;
-    // Settings overlay: the WebView2 page is captured to a texture so the panel can be drawn
-    // ON the page instead of replacing it. States: 0 idle / 1 pending / 2 ready / 3 failed.
-    bool upload_page_backdrop(const std::vector<uint8_t>& png);
-    void reset_page_backdrop_state();
+    // Settings overlay on the URL page: the panel floats above the live WebView2 page view, so
+    // it is routed into its own popup layer (settings_popup_, see popup_layer.h). False when that
+    // layer could not get its window/swapchain -- then the page view has to step aside while the
+    // panel is open, otherwise the panel would be drawn underneath it.
+    bool settings_popup_available() const;
     // Edge-drag rescue for the page view (player_session.cpp). The page view's real child HWNDs
     // live in the WebView2 browser/GPU processes, so the OS gives them the mouse-down and this
     // window never sees the WM_NCHITTEST that starts a resize. Called from pump_messages():
@@ -1073,11 +1074,15 @@ private:
     // Address field rect of the frame that drew the bar (client coords) -- the dropdown is
     // pinned to its left edge and width.
     float browser_addr_field_rect_[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    // Popup layers (popup_layer.h): the favorites dropdown and ImGui tooltips must be able to
-    // appear ABOVE the page view, which is a real child HWND covering the main swapchain.
+    // Popup layers (popup_layer.h): everything that must appear ABOVE the page view, which is a
+    // real child HWND covering the main swapchain -- the address-bar favorites dropdown, ImGui
+    // tooltips, the settings panel, and the topmost OPEN ImGui popup (combo lists, context menus).
+    // The last two are separate root windows, hence separate layers.
     std::unique_ptr<PopupLayer> fav_popup_;
     std::unique_ptr<PopupLayer> tooltip_popup_;
-    // WM_ACTIVATEAPP: a deactivated app hides both popups (they must never float over another
+    std::unique_ptr<PopupLayer> settings_popup_;
+    std::unique_ptr<PopupLayer> menu_popup_;
+    // WM_ACTIVATEAPP: a deactivated app hides every popup (they must never float over another
     // app's window while the Player is in the background).
     bool app_activated_ = true;
 
@@ -1125,17 +1130,6 @@ private:
     // Whether build_top_bar() actually drew the bar this frame (in fullscreen it auto-hides), so
     // scripts can assert the floating chrome's reveal together with the address bar.
     bool top_bar_visible_ = false;
-    // Settings overlay backdrop (see upload_page_backdrop()).
-    int browser_backdrop_state_ = 0;   // 0 idle / 1 pending / 2 ready / 3 failed
-    bool browser_backdrop_requested_ = false; // one snapshot request per settings session
-    // The page URL the current snapshot belongs to. Any navigation (or a content switch away
-    // from Web) retires it -- a settings panel left open across a navigation must not keep
-    // showing the previous page's picture.
-    std::string browser_backdrop_url_;
-    uint32_t browser_backdrop_w_ = 0;
-    uint32_t browser_backdrop_h_ = 0;
-    ComPtr<ID3D11Texture2D> browser_backdrop_tex_;
-    ComPtr<ID3D11ShaderResourceView> browser_backdrop_srv_;
     // Open-URL loading state (spinner + Cancel) shared by the page form, the address bar and
     // the native open it starts; cleared by notify_open_url_finished().
     bool open_url_show_error_ = false;      // client-side scheme validation

@@ -389,7 +389,7 @@ void Player::ui_render_drawdata(){
     dd.CmdLists.swap(ui_active_->cmd_lists); // give ownership back to the snapshot
 }
 
-// ---- present thread: popup layers (address-bar dropdown / tooltip over the page view) ------
+// ---- present thread: popup layers (favorites / tooltips / settings / open popup) -----------
 //
 // Called from draw_and_present()/draw_splash() right after ui_render_drawdata() and before the
 // main Present(1,0), while already holding d3d_mutex_. Each layer renders only its own routed
@@ -399,6 +399,8 @@ void Player::ui_render_popups(){
     if (!ui_ready_) return;
     if (fav_popup_) fav_popup_->render(device_.Get(), context_.Get());
     if (tooltip_popup_) tooltip_popup_->render(device_.Get(), context_.Get());
+    if (settings_popup_) settings_popup_->render(device_.Get(), context_.Get());
+    if (menu_popup_) menu_popup_->render(device_.Get(), context_.Get());
 }
 
 // Win11 DWM window chrome for the borderless (hollow-NC) client: system rounded corners

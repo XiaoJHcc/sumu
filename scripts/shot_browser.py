@@ -17,7 +17,12 @@
 #                      the same Native content with the cursor at the bottom: the address bar is
 #                      hidden (floating chrome) and the normal bottom bar is shown
 #   browser_settings.png
-#                      the settings panel drawn OVER a captured snapshot of the live page
+#                      the settings panel floating ABOVE the live page: it is routed into its own
+#                      owned top-level window (native/src/popup_layer.cpp) while the page keeps
+#                      running, clicking and sounding underneath
+#   browser_settings_combo.png
+#                      the same panel with its target-fps combo list open over the page -- an
+#                      ImGui popup is a separate root window, so it gets its own popup layer
 # Layout is eyeballed -- no assertions here; scripts/verify_browser.py owns the functional
 # checks.
 #
@@ -365,7 +370,10 @@ def main():
     grab("browser_native_bottom.png")
     print("native state:", st_low, file=sys.stderr)
 
-    # 5. settings over a captured snapshot of the live page (the page itself must stay alive).
+    # 5. the settings panel floating above the LIVE page. It is routed into its own owned
+    #    top-level window (native/src/popup_layer.cpp), so the page keeps rendering, clicking and
+    #    sounding behind it. Eyeball: solid panel card at the top-left over the page, rows as
+    #    [label][number box][slider track], page content visible around it.
     navigate(p, f"{base}/page")
     ok = False
     for _ in range(150):
@@ -376,30 +384,61 @@ def main():
     check("settings base: live page up", ok, f"{p.browser_state()}")
     before = p.browser_state()
     user32.GetWindowRect(hwnd, ctypes.byref(rc))
-    user32.SetCursorPos(rc.left + int(18 * SCALE), rc.top + int(18 * SCALE))
-    time.sleep(0.1)
+    scale = user32.GetDpiForWindow(hwnd) / 96.0
+    gear = (rc.left + int(18 * scale), rc.top + int(18 * scale))
+
+    def click_gear():
+        user32.SetCursorPos(*gear)
+        time.sleep(0.1)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        time.sleep(0.05)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        run(p, 1.0)
+
+    for _ in range(4):  # the first click after a state change can be eaten
+        if p.browser_state()["settings_open"]:
+            break
+        click_gear()
+    st = p.browser_state()
+    check("settings: the panel floats above the live page",
+          st["settings_open"] and st["popups"]["settings"]["visible"],
+          f"{st['popups']['settings']}")
+    check("settings: the page and its URL stay untouched",
+          url_is(st["url"], f"{base}/page") and st["url"] == before["url"] and st["web_visible"],
+          f"{st}")
+    # Park the cursor right of the panel (page area) so no settings row shows its hover wash.
+    user32.SetCursorPos(rc.left + int((rc.right - rc.left) * 0.6), rc.top + int(60 * scale))
+    run(p, 0.5)
+    grab("browser_settings.png")
+
+    # 5b. the target-fps list the panel opens: a BeginPopup window, i.e. a SECOND root window and
+    #     therefore its own popup layer -- it must hang below the panel, above the page.
+    st = p.browser_state()
+    panel = st["popups"]["settings"]["client_rect"]
+    # Row layout of build_settings_panel: kPaddingContainer top inset, then per row a kFontSizeSm
+    # label + kSpaceM gap over a kControlHeight row + kSpaceM gap (target-fps is row index 4).
+    combo = (rc.left + int(panel[0] + panel[2] * 0.5),
+             rc.top + int(panel[1] + (34.0 + 68.0 * 4) * scale + 16.0 * scale))
+    user32.SetCursorPos(*combo)
+    run(p, 0.2)
     user32.mouse_event(0x0002, 0, 0, 0, 0)
     time.sleep(0.05)
     user32.mouse_event(0x0004, 0, 0, 0, 0)
-    for _ in range(120):
+    for _ in range(100):
         run(p, 0.05)
-        if p.browser_state()["settings_backdrop"]:
+        if p.browser_state()["popups"]["menu"]["visible"]:
             break
     st = p.browser_state()
-    check("settings drawn over the captured page",
-          st["settings_open"] and st["settings_backdrop"], f"{st}")
-    check("settings keeps the page and its URL",
-          url_is(st["url"], f"{base}/page") and st["url"] == before["url"], f"{st}")
-    user32.SetCursorPos(rc.left + int((rc.right - rc.left) * 0.5), rc.top + 8)
-    run(p, 0.4)
-    grab("browser_settings.png")
-    # close settings: back onto the gear, then click
-    user32.SetCursorPos(rc.left + int(18 * SCALE), rc.top + int(18 * SCALE))
-    time.sleep(0.1)
-    user32.mouse_event(0x0002, 0, 0, 0, 0)
-    time.sleep(0.05)
-    user32.mouse_event(0x0004, 0, 0, 0, 0)
-    run(p, 1.2)
+    check("settings: the target-fps list is open above the page",
+          st["popups"]["menu"]["visible"], f"{st['popups']['menu']}")
+    grab("browser_settings_combo.png")
+
+    # close settings: back onto the gear. The open list swallows the click that closes it, so
+    # keep clicking until the panel is really gone.
+    for _ in range(4):
+        if not p.browser_state()["settings_open"]:
+            break
+        click_gear()
     st = p.browser_state()
     check("closing settings restores the live page",
           not st["settings_open"] and st["web_visible"], f"{st}")

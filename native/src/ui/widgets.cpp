@@ -392,10 +392,13 @@ bool Combo(const char* label, const char* const items[], int count, int* idx, fl
             pdl->PopClipRect();
             ImGui::PopID();
         }
-        // hairline outline, same language as the modal border
+        // hairline outline, same language as the modal border. Drawn into the POPUP's own draw
+        // list, not the foreground list: a popup over the URL page is lifted into its own popup
+        // layer (native/src/popup_layer.cpp) by window, so anything drawn on the shared foreground
+        // list would stay behind the page view and the outline would be missing there.
         const ImVec2 pmin = ImGui::GetWindowPos();
         const ImVec2 pmax(pmin.x + ImGui::GetWindowSize().x, pmin.y + ImGui::GetWindowSize().y);
-        ImGui::GetForegroundDrawList()->AddRect(
+        ImGui::GetWindowDrawList()->AddRect(
             ImVec2(pmin.x + 0.5f, pmin.y + 0.5f), ImVec2(pmax.x - 0.5f, pmax.y - 0.5f),
             theme::border_u32(), theme::kRadiusWindow * s, 0, 1.0f);
         ImGui::EndPopup();

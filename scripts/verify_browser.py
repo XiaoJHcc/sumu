@@ -26,8 +26,9 @@
 #      hands the content to the page view again and asks Python to pause (browser_enter).
 #   R1. A cookie lookup in flight is retired by a navigation: no second handover, no stuck state.
 #   D. settings / file-picker intent / export overlay / web-stream modal all stay inside the
-#      URL page and give the same page back when they close. Settings is drawn over a captured
-#      snapshot of the page (backdrop), the live view stepping aside and coming back untouched.
+#      URL page and give the same page back when they close. Settings floats above the LIVE page
+#      in its own owned top-level popup window (the page keeps running, clicking and sounding
+#      underneath), so the web view stays visible and keeps navigating while the panel is open.
 #   E. Native content turns the address bar into floating chrome: hidden unless the cursor is in
 #      the top strip (or the field is in use), and the video viewport never moves.
 #   R3. Page view audio follows visibility: muted=false while the page is shown, muted=true
@@ -62,6 +63,10 @@ TEST_VIDEO = os.path.join(ROOT, "test_video.mp4")
 _failures = []
 _requests = []  # (path, referer, cookie) of every /media request the server saw
 _page_hits = {}  # path -> how many times the HTML page itself was fetched (reload check)
+
+# PAGE_HTML's body background: the "known solid color" the popup-layer pixel checks compare
+# against (an overlay that is really composited above the page view cannot show it there).
+PAGE_BG = (0x10, 0x10, 0x12)
 
 
 def check(name, cond, detail=""):
@@ -309,6 +314,18 @@ def move_client(hwnd, x, y):
     ox, oy, _, _ = client_origin(hwnd)
     user32.SetCursorPos(int(ox + x), int(oy + y))
     time.sleep(0.05)
+
+def screen_pixel(x, y):
+    """Color of one desktop pixel as (r, g, b). Reads the COMPOSITED desktop, so it shows what the
+    user actually sees -- which is how a popup layer above the page view is proven."""
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    hdc = user32.GetDC(0)
+    try:
+        color = gdi32.GetPixel(hdc, int(x), int(y)) & 0xFFFFFF  # COLORREF 0x00BBGGRR
+    finally:
+        user32.ReleaseDC(0, hdc)
+    return color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF
 
 
 def ensure_foreground(hwnd, player):
@@ -780,42 +797,70 @@ def main():
             user32.SetWindowPos(hwnd, -1, 60, 40, 0, 0, 0x1)
             check("overlay base: window really is foreground", ensure_foreground(hwnd, op))
             pump(op, 0.3)
+            ox, oy, _, _ = client_origin(hwnd)
             before = op.browser_state()
-            # Settings: real click on the top bar's gear. The panel is drawn OVER a captured
-            # snapshot of the page (the live view is not replaced by the player background).
+            # Settings: real click on the top bar's gear. The panel floats above the LIVE page in
+            # its own owned top-level window (native/src/popup_layer.cpp); the page itself keeps
+            # running, clicking and sounding underneath.
             check("settings toggled open by the real gear click", toggle_settings(hwnd, True, op))
-            ok = pump(op, 6.0, lambda: op.browser_state()["settings_backdrop"])
+            ok = pump(op, 6.0, lambda: op.browser_state()["popups"]["settings"]["visible"])
             state = op.browser_state()
-            check("settings opens over a captured page backdrop",
-                  ok and state["settings_open"] and state["settings_backdrop"]
-                  and state["backdrop_state"] == 2, f"{state}")
+            panel = state["popups"]["settings"]
+            check("settings panel rises into its own top-level popup window",
+                  ok and state["settings_open"] and state["settings_popup"] and panel["hwnd"]
+                  and panel["frames"] > 0, f"{panel}")
             check("settings keeps the page and its URL",
                   state["page"] and url_is(state["url"], page_url), f"{state}")
+            check("settings keeps the live page view up and audible",
+                  state["web_visible"] and not state["muted"], f"{state}")
             check("settings does not rebuild the page view (same history)",
                   state["url"] == before["url"] and state["can_back"] == before["can_back"],
                   f"{before} -> {state}")
-            check("live page view steps aside for the backdrop",
-                  not state["web_visible"], f"{state}")
-            # Navigating while the panel is open: the snapshot on screen belongs to the page we
-            # just left, so it must be invalidated and re-captured from the new one (the panel,
-            # the page session and the address bar all keep running underneath).
+            bounds = state["bounds"]
+            web_rect = (ox + bounds[0], oy + bounds[1], bounds[2], bounds[3])
+            panel_rect = panel["screen_rect"]
+            check("the settings panel window is a top-level owner window",
+                  user32.GetWindow(panel["hwnd"], 4) == hwnd and
+                  user32.IsWindowVisible(panel["hwnd"]),  # GW_OWNER = 4
+                  f"owner={user32.GetWindow(panel['hwnd'], 4)} player={hwnd}")
+            check("the settings panel overlaps the web view rect",
+                  panel_rect[0] < web_rect[0] + web_rect[2] and
+                  panel_rect[0] + panel_rect[2] > web_rect[0] and
+                  panel_rect[1] < web_rect[1] + web_rect[3] and
+                  panel_rect[1] + panel_rect[3] > web_rect[1],
+                  f"panel={panel_rect} web={web_rect}")
+            sc = user32.GetDpiForWindow(hwnd) / 96.0
+            check("the panel window is the settings panel's own 260px width",
+                  abs(panel_rect[2] - 260 * sc) <= 2, f"panel={panel_rect} scale={sc}")
+            # A pixel inside the panel is the panel's surface, not the page's: the panel really is
+            # composited above the page view rather than buried underneath it.
+            panel_pixel = screen_pixel(panel_rect[0] + panel_rect[2] * 0.5,
+                                       panel_rect[1] + panel_rect[3] * 0.5)
+            check("a screen pixel inside the panel is not the page background",
+                  panel_pixel != PAGE_BG, f"{panel_pixel} page_bg={PAGE_BG}")
+            # Navigating while the panel is open: the page underneath really navigates, and the
+            # panel stays up over it (nothing to re-capture, nothing to invalidate).
             navigate(op, plain_url)
-            ok = pump(op, 25.0, lambda: (op.browser_state()["settings_backdrop"]
-                                         and url_is(op.browser_state()["backdrop_url"], plain_url)))
+            ok = pump(op, 25.0, lambda: url_is(op.browser_state()["url"], plain_url))
             state = op.browser_state()
             check("settings open: the page still navigates underneath",
-                  state["page"] and state["settings_open"] and url_is(state["url"], plain_url),
-                  f"{state}")
-            check("settings open: the old page's backdrop is replaced by the new capture", ok,
-                  f"state={state['backdrop_state']} backdrop_url={state['backdrop_url']!r}")
-            check("settings open: re-capturing keeps the live view aside",
-                  not state["web_visible"], f"{state}")
+                  ok and state["page"] and state["settings_open"], f"{state}")
+            check("settings open: the panel stays up and the page stays live",
+                  state["popups"]["settings"]["visible"] and state["web_visible"]
+                  and not state["muted"], f"{state}")
+            frames_before = state["popups"]["settings"]["frames"]
+            pump(op, 0.5)
+            check("settings open: the panel keeps rendering its own frame",
+                  op.browser_state()["popups"]["settings"]["frames"] >= frames_before,
+                  f"{frames_before} -> {op.browser_state()['popups']['settings']['frames']}")
             toggle_settings(hwnd, False, op)
             pump(op, 1.5)
             state = op.browser_state()
-            check("closing settings restores the same live page",
+            check("closing settings leaves the live page as it was",
                   state["page"] and not state["settings_open"] and state["web_visible"]
                   and url_is(state["url"], plain_url), f"{state}")
+            check("closing settings hides its popup window",
+                  not state["popups"]["settings"]["visible"], f"{state}")
             # Back to the page the export assertions below use (same page session, just history).
             navigate(op, page_url)
             ok = pump(op, 25.0, lambda: (op.browser_state()["web_visible"]

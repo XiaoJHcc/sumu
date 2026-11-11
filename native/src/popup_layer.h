@@ -6,8 +6,8 @@
 // Why this exists (the airspace problem): the URL page embeds WebView2 as a real windowed
 // child HWND. A child window always composites above its parent's client area, so everything
 // ImGui draws in the main swapchain (player_window.cpp CreateSwapChainForHwnd) is covered by
-// the page view. An address-bar dropdown or a button tooltip that reaches into the page area
-// is therefore invisible. Same problem Chrome solves for its omnibox popup.
+// the page view. An address-bar dropdown, a settings panel or a button tooltip that reaches
+// into the page area is therefore invisible. Same problem Chrome solves for its omnibox popup.
 //
 // The approach is the single-window case of ImGui multi-viewport, hand-rolled:
 //
@@ -25,10 +25,17 @@
 //     ui_render_drawdata() and before the main Present(1,0): bind the popup's own swapchain,
 //     clear, ImGui_ImplDX11_RenderDrawData, then Present(0,0). Never Present(1) -- a second
 //     vblank wait in the video present loop would be a pacing regression (DESIGN I10).
+//   * Layers stack among themselves by appearance order: a layer that becomes visible is brought
+//     to the top of the owner's owned-window stack, so a dropdown/tooltip opened over a routed
+//     panel really draws above it.
 //   * Input arrives at the popup window itself and is fed straight into the shared ImGui IO in
 //     main-client coordinates (io.AddMousePosEvent/AddMouseButtonEvent/AddMouseWheelEvent).
 //     ImGui_ImplWin32_WndProcHandler is deliberately NOT used here: it would TrackMouseEvent
-//     the Player window and post spurious WM_MOUSELEAVE for it.
+//     the Player window and post spurious WM_MOUSELEAVE for it. A button-down inside the layer
+//     hands the Win32 KEYBOARD focus back to the Player window -- the same hand-back the main
+//     WndProc does for clicks on the parent chrome, and what lets a routed InputText receive
+//     typed characters again after the user clicked into the page view. The popup itself never
+//     activates.
 //
 // Thread ownership: HWND/window placement, routing and snapshots are main-thread state
 // (Player::ui_tick's thread, the one that owns the ImGui context); the swapchain and the
@@ -129,6 +136,10 @@ public:
     HWND hwnd() const { return hwnd_; }
     bool visible() const { return shown_; }
     bool routed() const { return routed_; }
+    // True once this layer could NOT get its window or its swapchain (sticky). The owner uses
+    // it to fall back to drawing the routed window in the main swapchain -- with the page view
+    // stepping aside -- instead of ending up with a window nobody can see.
+    bool unavailable() const { return unavailable_.load(std::memory_order_relaxed); }
     // Last routed window rect in main-client coordinates (0,0,0,0 when nothing is routed).
     void client_rect(int out[4]) const;
     // Last applied window rect in screen coordinates (0,0,0,0 while never placed).
@@ -140,6 +151,12 @@ public:
     // rendered, or nullptr. ImGui creates tooltip windows on demand from ImGui::SetTooltip(), so
     // they can only be found by name, after the fact.
     static const char* active_tooltip_name();
+
+    // Name of the ImGui window of the topmost OPEN popup (combo list, BeginPopupContextItem menu,
+    // any BeginPopup*) that has geometry in this frame, or nullptr. Popups are their own root
+    // windows, so a layer routing a panel never picks them up -- they need a layer of their own,
+    // and this is how that layer finds out what to route.
+    static const char* active_popup_name();
 
 private:
     bool ensure_window();
@@ -161,6 +178,7 @@ private:
     // `rendered_w_` / `rendered_h_` tell the main thread when it may show the window.
     std::atomic<bool> wanted_{ false };
     std::atomic<bool> visible_{ false };
+    std::atomic<bool> unavailable_{ false };
     std::atomic<uint64_t> rendered_gen_{ 0 };
     std::atomic<int> rendered_w_{ 0 };
     std::atomic<int> rendered_h_{ 0 };

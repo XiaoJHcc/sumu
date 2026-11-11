@@ -536,13 +536,6 @@ void BrowserView::configure_webview(){
 }
 
 void BrowserView::on_navigation_started(const std::string& url, uint64_t nav_id, bool redirected){
-    // A new document: a snapshot taken for the old page must not back the settings overlay any
-    // more.
-    ++snapshot_gen_;
-    snapshot_pending_ = false;
-    snapshot_state_ = Snapshot::None;
-    snapshot_png_.clear();
-
     // Top-level navigation bookkeeping for the media handover: a redirect fires again with the
     // same id (it only moves `nav_url_` forward), so anything else is a different navigation --
     // the candidate nobody took belongs to the one the user left.
@@ -927,83 +920,6 @@ bool BrowserView::take_cookies(std::string& url, std::string& cookies){
     return true;
 }
 
-// ---- page snapshot (settings overlay backdrop) -------------------------------------------
-// WebView2's windowed controller paints into its own child HWND, so ImGui cannot draw anything
-// on top of the live page. The settings overlay therefore asks the engine for a PNG of the page,
-// draws THAT under the panel and hides the live view -- the page session, history and URL are
-// untouched, and closing the panel brings the same controller back.
-void BrowserView::request_snapshot(){
-    const uint64_t gen = ++snapshot_gen_;
-    snapshot_state_ = Snapshot::None;
-    snapshot_png_.clear();
-    if (!controller_ready_ || !impl_->webview) {
-        snapshot_pending_ = false;
-        snapshot_state_ = Snapshot::Failed;
-        return;
-    }
-    ComPtr<IStream> stream;
-    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream) {
-        snapshot_pending_ = false;
-        snapshot_state_ = Snapshot::Failed;
-        return;
-    }
-    snapshot_pending_ = true;
-    const std::shared_ptr<std::atomic<bool>> alive = alive_;
-    HRESULT hr = impl_->webview->CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
-        stream.Get(),
-        MakeHandler<ICoreWebView2CapturePreviewCompletedHandler>(
-            [this, alive, stream, gen](HRESULT result) -> HRESULT {
-                if (!alive->load()) return S_OK;
-                if (gen != snapshot_gen_) return S_OK; // retired by a newer request/navigation
-                snapshot_pending_ = false;
-                if (result != S_OK) {
-                    snapshot_state_ = Snapshot::Failed;
-                    return S_OK;
-                }
-                STATSTG stat{};
-                if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart <= 0) {
-                    snapshot_state_ = Snapshot::Failed;
-                    return S_OK;
-                }
-                LARGE_INTEGER zero{};
-                if (FAILED(stream->Seek(zero, STREAM_SEEK_SET, nullptr))) {
-                    snapshot_state_ = Snapshot::Failed;
-                    return S_OK;
-                }
-                std::vector<uint8_t> png(static_cast<size_t>(stat.cbSize.QuadPart));
-                ULONG read = 0;
-                if (FAILED(stream->Read(png.data(), static_cast<ULONG>(png.size()), &read)) ||
-                    read != png.size()) {
-                    snapshot_state_ = Snapshot::Failed;
-                    return S_OK;
-                }
-                publish_snapshot(std::move(png));
-                return S_OK;
-            }).Get());
-    if (FAILED(hr)) {
-        snapshot_pending_ = false;
-        snapshot_state_ = Snapshot::Failed;
-    }
-}
-
-void BrowserView::publish_snapshot(std::vector<uint8_t> png){
-    if (png.empty()) {
-        snapshot_state_ = Snapshot::Failed;
-        return;
-    }
-    snapshot_png_ = std::move(png);
-    snapshot_state_ = Snapshot::Ready;
-}
-
-BrowserView::Snapshot BrowserView::take_snapshot(std::vector<uint8_t>& png){
-    if (snapshot_state_ == Snapshot::None) return Snapshot::None;
-    const Snapshot state = snapshot_state_;
-    snapshot_state_ = Snapshot::None;
-    if (state == Snapshot::Ready) png = std::move(snapshot_png_);
-    snapshot_png_.clear();
-    return state;
-}
-
 void BrowserView::shutdown(){
     if (!alive_) return;
     alive_->store(false);
@@ -1011,10 +927,6 @@ void BrowserView::shutdown(){
     cancel_media_navigation(); // nor a media handover nobody took
     popup_pending_ = false;
     popup_url_.clear();
-    ++snapshot_gen_;
-    snapshot_pending_ = false;
-    snapshot_state_ = Snapshot::None;
-    snapshot_png_.clear();
     remove_child_subclasses(); // before the child windows go away with the controller
     if (impl_) {
         if (impl_->webview) {

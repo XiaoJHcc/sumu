@@ -12,6 +12,14 @@
 #   1d. The floating chrome's reveal in FULLSCREEN, entered/left through the real top-bar
 #       button: both strips hide/show together with the cursor, the video viewport never moves,
 #       and leaving restores the windowed rect.
+#   1g. The settings panel and the ImGui popup it opens over the LIVE page: both are routed into
+#      their own owned top-level windows (native/src/popup_layer.cpp), so the page keeps running
+#      underneath. Real clicks: the title-bar gear lifts the panel above the page, a click on a
+#      panel number box hands the Win32 keyboard focus back from the page view (Ctrl+A + typing +
+#      Enter must record the "lead" intent), the target-fps combo list opens as its own popup
+#      window above the page (pixel check) and its rows select (the "target_fps" intent), the
+#      address field's right-click menu is routed the same way, and hovering a panel row shows
+#      its tooltip in the tooltip layer.
 #   2. Window edge resizing. The child window covers the page area, so the parent never receives
 #      WM_NCHITTEST over it; the resize bands must still work. A real mouse drag on the right,
 #      bottom and LEFT edges must resize the window AND move/resize the page view with it -- and
@@ -218,6 +226,42 @@ def click_client(hwnd, x, y):
     time.sleep(0.05)
     user32.mouse_event(0x0004, 0, 0, 0, 0)
     time.sleep(0.05)
+
+def right_click_client(hwnd, x, y):
+    """Real right click at a client-relative point (the address field's context menu)."""
+    ox, oy, _, _ = client_rect(hwnd)
+    user32.SetCursorPos(int(ox + x), int(oy + y))
+    time.sleep(0.08)
+    user32.mouse_event(0x0008, 0, 0, 0, 0)  # RIGHTDOWN
+    time.sleep(0.05)
+    user32.mouse_event(0x0010, 0, 0, 0, 0)  # RIGHTUP
+    time.sleep(0.05)
+
+
+def ensure_foreground(hwnd, player):
+    """Make the Player window the FOREGROUND window; returns whether it really is. Windows'
+    foreground lock refuses SetForegroundWindow while another app owns the foreground, and a
+    WebView2 page view only takes the keyboard focus inside an ACTIVE window -- so every real
+    input phase needs this first. The activation click goes to the title bar (chrome, never the
+    page) so it cannot pre-focus the page view the focus checks are about."""
+    for _ in range(6):
+        fg = user32.GetForegroundWindow()
+        if fg == hwnd:
+            return True
+        tid_fg = user32.GetWindowThreadProcessId(fg, None)
+        tid_self = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = bool(user32.AttachThreadInput(tid_self, tid_fg, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetFocus(hwnd)
+        if attached:
+            user32.AttachThreadInput(tid_self, tid_fg, False)
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        _, _, cw, _ = client_rect(hwnd)
+        click_client(hwnd, cw * 0.5, user32.GetDpiForWindow(hwnd) / 96.0 * 18.0)  # title bar
+        pump(player, 0.5)
+    return user32.GetForegroundWindow() == hwnd
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -433,6 +477,13 @@ def top_bar_right_button_center(hwnd, index_from_right):
     return cw - s * (2.0 + 16.0 + index_from_right * 34.0), s * 18.0
 
 
+def top_bar_icon_center(hwnd, index):
+    """Left-side top-bar icon buttons, counted from the left edge: 0 settings / 1 open /
+    2 URL / 3 web stream / 4 export (same 32px button beat as the right side)."""
+    s = user32.GetDpiForWindow(hwnd) / 96.0
+    return s * (2.0 + 16.0 + index * 34.0), s * 18.0
+
+
 def window_rect(hwnd):
     rc = wintypes.RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(rc))
@@ -489,7 +540,7 @@ def main():
         server.server_close()
         return 1
     user32.SetWindowPos(hwnd, -1, 60, 40, 0, 0, 0x1)  # topmost, keep size
-    user32.SetForegroundWindow(hwnd)
+    check("window is foreground for the real-input phases", ensure_foreground(hwnd, player))
     pump(player, 0.4)
 
     # ---- 1. keyboard focus hand-back ----------------------------------------------------
@@ -500,8 +551,10 @@ def main():
 
     click_client(hwnd, cw * 0.5, page_y)  # click INTO the page view: it takes the Win32 focus
     # Chromium grabs the focus asynchronously after its own click handling; the very first click
-    # that activates the window can be swallowed, so give it one more.
-    if not pump(player, 2.0, lambda: user32.GetFocus() != hwnd):
+    # that activates the window can be swallowed, so keep clicking until the focus really moved.
+    for _ in range(4):
+        if user32.GetFocus() != hwnd:
+            break
         click_client(hwnd, cw * 0.5, page_y)
         pump(player, 2.0, lambda: user32.GetFocus() != hwnd)
     check("page view owns the Win32 focus after clicking it", user32.GetFocus() != hwnd,
@@ -849,6 +902,159 @@ def main():
         check("a screen pixel inside the tooltip is not the page background",
               all(px != PAGE_BG for px in tip_pixels), f"{tip_pixels} page_bg={PAGE_BG}")
 
+
+    # ---- 1g. settings panel + the ImGui popup it opens, over the LIVE page ----------------
+    # Both are separate ImGui root windows, so each has its own popup layer
+    # (native/src/popup_layer.cpp): the panel floats above the page view (which keeps running,
+    # clicking and sounding) and the combo list / context menu that the panel or the address bar
+    # opens gets its own window on top of everything. Typing into a routed number box needs the
+    # Win32 keyboard focus back from the page view -- the layer hands it over on the click itself.
+    state = player.browser_state()
+    check("settings: the page view is up before the panel test", state["web_visible"], f"{state}")
+
+    def settings_row_y(panel, row):
+        """Client y of settings row `row`'s control row. The panel insets its content by
+        kPaddingContainer (10px top), every row block is a kFontSizeSm label + kSpaceM gap over a
+        kControlHeight row + kSpaceM gap (see build_settings_panel / ui::SliderInt)."""
+        return panel[1] + (34.0 + 68.0 * row) * scale
+
+    # Click INTO the page first: WebView2's child window takes the Win32 focus.
+    click_client(hwnd, cw * 0.6, ch * 0.62)
+    pump(player, 0.6)
+    if user32.GetFocus() == hwnd:  # the first click can be eaten by the activation itself
+        click_client(hwnd, cw * 0.6, ch * 0.62)
+        pump(player, 0.6)
+    check("settings: the page view owns the keyboard before the panel is used",
+          user32.GetFocus() != hwnd, f"{user32.GetFocus()}")
+
+    ok = click_until(player, hwnd, lambda: top_bar_icon_center(hwnd, 0),
+                     lambda: player.browser_state()["popups"]["settings"]["visible"],
+                     tries=4, settle=3.0)
+    state = player.browser_state()
+    panel = state["popups"]["settings"]
+    check("settings: a real gear click lifts the panel into its own window above the page",
+          ok and state["settings_open"] and panel["hwnd"] and panel["frames"] > 0, f"{panel}")
+    check("settings: the live page view stays up behind the panel",
+          state["web_visible"] and not state["muted"], f"{state}")
+    bounds = state["bounds"]
+    web_rect = (ox + bounds[0], oy + bounds[1], bounds[2], bounds[3])
+    panel_rect = panel["screen_rect"]
+    check("settings: the panel window overlaps the web view rect",
+          panel_rect[0] < web_rect[0] + web_rect[2] and
+          panel_rect[0] + panel_rect[2] > web_rect[0] and
+          panel_rect[1] < web_rect[1] + web_rect[3] and
+          panel_rect[1] + panel_rect[3] > web_rect[1],
+          f"panel={panel_rect} web={web_rect}")
+    panel_pixels = [screen_pixel(panel_rect[0] + panel_rect[2] * fx,
+                                 panel_rect[1] + panel_rect[3] * fy)
+                    for fx, fy in ((0.5, 0.15), (0.92, 0.5), (0.5, 0.92))]
+    check("settings: screen pixels inside the panel are not the page background",
+          all(px != PAGE_BG for px in panel_pixels), f"{panel_pixels} page_bg={PAGE_BG}")
+
+    # A real click on the "lead" number box: the panel is a non-activating window, so the layer
+    # must hand the keyboard focus back to the Player window for the typed digits to arrive.
+    panel_c = panel["client_rect"]
+    lead_box = (panel_c[0] + 48.0 * scale, settings_row_y(panel_c, 0) + 16.0 * scale)
+    got_focus = False
+    for _ in range(3):
+        click_client(hwnd, *lead_box)
+        if pump(player, 1.5, lambda: user32.GetFocus() == hwnd):
+            got_focus = True
+            break
+    check("settings: clicking a panel number box takes the keyboard back from the page",
+          got_focus, f"focus={user32.GetFocus()}")
+    key(0x11)  # Ctrl down
+    key(0x41)  # A -- select the whole value
+    key(0x41, up=True)
+    key(0x11, up=True)
+    pump(player, 0.2)
+    type_text(player, "42")
+    pump(player, 0.3)
+    key(0x0D)  # Enter commits the edit
+    key(0x0D, up=True)
+    intents = pump_intents(player, 2.0, lambda i: i.get("lead"))
+    check("settings: a typed number records the lead intent", intents.get("lead") == 42,
+          repr(intents.get("lead")))
+
+    # The target-fps combo: its list is a BeginPopup window -- a separate ImGui root window, hence
+    # a separate layer -- and must show above the page just like the panel.
+    panel_c = player.browser_state()["popups"]["settings"]["client_rect"]
+    combo = (panel_c[0] + panel_c[2] * 0.5, settings_row_y(panel_c, 4) + 16.0 * scale)
+    ok = click_until(player, hwnd, lambda: combo,
+                     lambda: player.browser_state()["popups"]["menu"]["visible"],
+                     tries=3, settle=2.0)
+    state = player.browser_state()
+    menu = state["popups"]["menu"]
+    check("settings: the open combo list is its own window above the page",
+          ok and menu["hwnd"] and menu["frames"] > 0, f"{menu}")
+    menu_rect = menu["screen_rect"]
+    # The list hangs below the panel, so its lower part sits over bare page pixels: a pixel there
+    # proves the menu layer really composites above the WebView2 child window.
+    menu_pixel = screen_pixel(menu_rect[0] + menu_rect[2] * 0.5,
+                              menu_rect[1] + menu_rect[3] - 10)
+    check("settings: the combo list is composited above the page", menu_pixel != PAGE_BG,
+          f"{menu_pixel} page_bg={PAGE_BG} menu={menu_rect}")
+    menu_c = menu["client_rect"]
+    row = (menu_c[0] + menu_c[2] * 0.4, menu_c[1] + 4.0 * scale + 32.0 * scale * 1.5)
+    intents = {}
+    for _ in range(3):
+        click_client(hwnd, *row)
+        intents = pump_intents(player, 2.0, lambda i: i.get("target_fps") is not None)
+        if intents.get("target_fps") is not None:
+            break
+    check("settings: a real click on a combo row records the target_fps intent",
+          intents.get("target_fps") == 30, repr(intents.get("target_fps")))
+    check("settings: the combo list closes after the pick",
+          not player.browser_state()["popups"]["menu"]["visible"],
+          f"{player.browser_state()['popups']['menu']}")
+
+    # The address field's right-click menu is a BeginPopupContextItem popup: another root window,
+    # routed by the same menu layer.
+    right_click_client(hwnd, cw * 0.5, addr_y)
+    ok = pump(player, 3.0, lambda: player.browser_state()["popups"]["menu"]["visible"])
+    state = player.browser_state()
+    ctx = state["popups"]["menu"]
+    check("the address field's right-click menu rises above the page view",
+          ok and ctx["hwnd"] and ctx["frames"] > 0, f"{ctx}")
+    if ok:
+        ctx_rect = ctx["screen_rect"]
+        ctx_pixel = screen_pixel(ctx_rect[0] + ctx_rect[2] * 0.3,
+                                 ctx_rect[1] + ctx_rect[3] - 8)
+        check("the address field's menu is composited above the page",
+              ctx_pixel != PAGE_BG, f"{ctx_pixel} page_bg={PAGE_BG} menu={ctx_rect}")
+    # Close it by clicking the address field (a click outside closes an ImGui popup; the page area
+    # is covered by the WebView2 child window, which would swallow the click). NOT Esc
+    # unconditionally: with no dropdown open, ESC is the player's own quit/park shortcut -- so it
+    # is only pressed when the field click really opened the favorites dropdown.
+    click_client(hwnd, cw * 0.45, addr_y)
+    pump(player, 0.8)
+    check("clicking the address field closes the context menu",
+          not player.browser_state()["popups"]["menu"]["visible"],
+          f"{player.browser_state()['popups']['menu']}")
+    if player.browser_state()["favorites_open"]:
+        key(0x1B)  # ESC closes the dropdown instead of quitting/parking the player
+        key(0x1B, up=True)
+        pump(player, 0.8)
+
+    # Hovering a settings row shows its tooltip -- through the tooltip layer, over the panel that
+    # is itself floating above the page.
+    panel_c = player.browser_state()["popups"]["settings"]["client_rect"]
+    move_client(hwnd, panel_c[0] + panel_c[2] * 0.72,
+                settings_row_y(panel_c, 1) + 16.0 * scale)
+    ok = pump(player, 5.0, lambda: player.browser_state()["popups"]["tooltip"]["visible"])
+    check("hovering a routed settings row shows its tooltip",
+          ok, f"{player.browser_state()['popups']['tooltip']}")
+
+    # Toggle the panel closed with the same real button.
+    ok = click_until(player, hwnd, lambda: top_bar_icon_center(hwnd, 0),
+                     lambda: not player.browser_state()["settings_open"], tries=4, settle=2.0)
+    state = player.browser_state()
+    check("settings: the same gear click closes the panel", ok, f"{state}")
+    check("settings: closing the panel hides its popup window",
+          not state["popups"]["settings"]["visible"], f"{state}")
+    check("settings: the page is left exactly as it was",
+          state["page"] and state["web_visible"] and not state["muted"] and
+          (state["url"] or "").rstrip("/") == page2_url, f"{state}")
 
     # ---- 2a. negative: a press INSIDE the page dragged to the edge must not resize -------
     # (arming requires the button-down to start in the resize band)

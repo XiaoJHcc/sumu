@@ -110,6 +110,8 @@ bool PopupLayer::ensure_window()
     hwnd_ = CreateWindowExA(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kPopupClassName, "sumu",
         WS_POPUP, 0, 0, 1, 1, owner_, nullptr, GetModuleHandleA(nullptr), nullptr);
     if (!hwnd_) {
+        // No airspace fix possible: the owner falls back to drawing in the main swapchain.
+        unavailable_.store(true, std::memory_order_relaxed);
         fprintf(stderr, "[sumu] popup window create failed (err=%lu)\n", GetLastError());
         return false;
     }
@@ -225,6 +227,10 @@ void PopupLayer::sync()
             rendered_w_.load(std::memory_order_relaxed) == w &&
             rendered_h_.load(std::memory_order_relaxed) == h) {
             ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+            // Owned windows stack in appearance order: whatever the user just opened (a combo list
+            // over a routed settings panel, a tooltip over a dropdown) must be the one on top.
+            SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             shown_ = true;
             shown_gen_ = gen;
             visible_.store(true, std::memory_order_relaxed);
@@ -333,6 +339,9 @@ bool PopupLayer::ensure_swapchain(ID3D11Device* device, ID3D11DeviceContext* con
     HRESULT hr = factory_->CreateSwapChainForHwnd(device, hwnd_, &scd, nullptr, nullptr,
         &swapchain_);
     if (FAILED(hr)) {
+        // Sticky: without its own swapchain this layer can never show anything, so the owner
+        // falls back to the main swapchain (page view stepping aside) instead of a blank float.
+        unavailable_.store(true, std::memory_order_relaxed);
         fprintf(stderr, "[sumu] popup swapchain create failed hr=0x%08lx\n",
             static_cast<unsigned long>(hr));
         swapchain_.Reset();
@@ -341,6 +350,7 @@ bool PopupLayer::ensure_swapchain(ID3D11Device* device, ID3D11DeviceContext* con
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
     if (FAILED(swapchain_->GetBuffer(0, IID_PPV_ARGS(&backbuffer))) || !backbuffer ||
         FAILED(device->CreateRenderTargetView(backbuffer.Get(), nullptr, &rtv_))) {
+        unavailable_.store(true, std::memory_order_relaxed);
         release_swapchain();
         return false;
     }
@@ -431,6 +441,12 @@ void PopupLayer::feed_mouse(UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK:
+        // The layer never activates, so the Win32 keyboard focus is wherever the user left it --
+        // typically inside the page view (a real child HWND of another window) after a click
+        // there, which would swallow every keystroke meant for a routed InputText. Take it back
+        // to the Player window, exactly like the main WndProc does for clicks on its own chrome;
+        // the popup itself still never activates.
+        if (owner_ && GetFocus() != owner_) SetFocus(owner_);
         if (GetCapture() != hwnd_) SetCapture(hwnd_); // keep receiving while dragged outside
         io.AddMouseButtonEvent(0, true);
         break;
@@ -500,4 +516,19 @@ const char* PopupLayer::active_tooltip_name()
         return w->Name;
     }
     return nullptr;
+}
+
+const char* PopupLayer::active_popup_name()
+{
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (!ctx || ctx->OpenPopupStack.Size == 0) return nullptr;
+    // The stack is ordered outermost -> innermost, so its top entry is the popup the user is
+    // looking at. Its window is still null on the frame the popup is REQUESTED (it only gets
+    // created by the BeginPopup that follows), and a popup whose window drew nothing this frame
+    // has nothing to route. Popups are separate root windows ("##Popup_%08x" for BeginPopup,
+    // whatever name a BeginPopupContext* passes), so a layer routing the panel that opened them
+    // never sees their geometry.
+    ImGuiWindow* w = ctx->OpenPopupStack.back().Window;
+    if (!w || !w->Active || !w->DrawList || w->DrawList->CmdBuffer.Size == 0) return nullptr;
+    return w->Name;
 }

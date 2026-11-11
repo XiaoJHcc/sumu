@@ -303,8 +303,8 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
    `kPanelBg` + 下边缘 `kBorder` 发丝线）。**Native 内容下它是悬浮 chrome**：只在光标进入
    标题栏下缘向下延伸窗口高度 15% 的 reveal 区（标题栏自身也在命中范围内；比例与底部时间条
    共用 `kChromeRevealFraction`；全屏时仍按固定标题栏高度计算，显隐不改变边界）或地址输入正在使用时出现，隐藏时不占布局、不移动视频 viewport；
-   Web/Home/Loading 等状态它仍常驻。按钮 tooltip 与地址栏收藏下拉都通过**弹出层**
-   （`native/src/popup_layer.*`）绘制，因此可以出现在网页之上（见下节）。
+   Web/Home/Loading 等状态它仍常驻。按钮 tooltip、地址栏收藏下拉、设置面板与地址栏右键菜单
+   都通过**弹出层**（`native/src/popup_layer.*`）绘制，因此可以出现在网页之上（见下节）。
    控件行 32px 高、按 `kSpaceXS` 内缩，从左到右：
    **后退**（arrow-left）· **前进**（arrow-right）· **刷新**（rotate-cw）· URL 输入框
    （占满剩余宽）· 访问（OpenUrl）· 播放（Play）· **收藏星标**（star / star-filled）。
@@ -327,22 +327,25 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
    - **Home**：首屏页内表单（标题 + hint + 输入框 + 打开/取消）。
 
 **布局铁律**：网页本体是**真实子窗口**，ImGui 画在它下面的一切都看不见。因此标题栏/
-地址栏必须排在它的矩形之上；Loading / Home / Unavailable 出现时、以及设置面板与 Web
-串流模态框打开期间、导出页接管窗口期间，子窗口一律 `set_visible(false)`（同时静音），
-关闭后恢复同一页面。唯一能越过这条限制的是**弹出层**（`native/src/popup_layer.*`）：
-地址栏收藏下拉与地址栏按钮 tooltip 在活网页视图可见时被路由到它们自己的 owned 顶层窗口，
-因此可以浮到网页之上——它们仍按主客户区坐标布局，写法与其它 ImGui 窗口完全一样。
-open 失败提示是地址栏正下方一条独立的错误行窗口（Web/Native 下页面整体/网页上沿下移它的
-高度）。
+地址栏必须排在它的矩形之上；Loading / Home / Unavailable 出现时、Web 串流模态框打开期间、
+导出页接管窗口期间，子窗口一律 `set_visible(false)`（同时静音），关闭后恢复同一页面。
+唯一能越过这条限制的是**弹出层**（`native/src/popup_layer.*`）：地址栏收藏下拉、地址栏按钮
+tooltip、**设置面板**以及**面板/地址栏打开的任何 ImGui 弹出窗口**（combo 列表、右键菜单）在
+活网页视图可见时都被路由到它们自己的 owned 顶层窗口，因此可以浮到网页之上——它们仍按主客户
+区坐标布局，写法与其它 ImGui 窗口完全一样（弹出窗口是独立 root window，故单独一层；层间
+按出现顺序叠放）。弹出层窗口永不激活，但**在其内按下鼠标会把键盘焦点交回主窗口**，被路由的
+输入框才收得到键入。open 失败提示是地址栏正下方一条独立的错误行窗口（Web/Native 下页面整体/
+网页上沿下移它的高度）。
 
 **页面只由自己关闭**：首屏 Cancel 是唯一的出口（也是唯一会产生 `browser_exit` 的地方）。
 原生打开成功、设置、打开文件、Web 串流、导出都**不**离开本页；
 导出是独占覆盖层，退出后回到仍在的同一页。
 
-**不离开页面的覆盖层**：设置面板从 `top_bar + addr_bar`（地址栏隐藏时从 `top_bar`）开始画在
-页面内，且**画在网页快照底图之上**——打开设置时先 `CapturePreview` 抓一张当前网页 PNG 作
-底图，再隐藏活视图、把面板叠上去，页面本身不重建；抓图未就绪时网页保持可见、面板晚一帧，
-失败则退回「隐藏活视图」的旧表现。Web 串流模态框仍是让位（隐藏+静音）行为，关闭即恢复。
+**不离开页面的覆盖层**：设置面板从 `top_bar + addr_bar`（地址栏隐藏时从 `top_bar`）开始，
+**浮在活网页之上**（弹出层 `settings_popup_`）：网页照常渲染、可点、有声，面板开着时导航
+照常发生在它下面，关闭只是收起面板。它开的 combo 列表是第二个弹出层窗口，若与面板重叠必然
+画在面板之上（出现顺序叠放）。只有弹出层拿不到窗口时，网页子窗口才让位（隐藏+静音）给画在
+主 swapchain 里的面板。Web 串流模态框仍是让位（隐藏+静音）行为，关闭即恢复。
 
 ### 地址栏收藏下拉（弹出层）
 
@@ -371,13 +374,14 @@ open 失败提示是地址栏正下方一条独立的错误行窗口（Web/Nativ
 交接过去的媒体地址）。
 
 **输入与窗口**：页面视图是子窗口，键盘焦点会跑到它那里——点击本窗口任何 chrome 都会
-`SetFocus` 收回（见 `WndProc` 的 WM_LBUTTONDOWN）；边缘缩放由
-`Player::poll_page_view_border()` 接管（见 `docs/native_core.md`），不能靠给网页留
-padding 绕过。
+`SetFocus` 收回（见 `WndProc` 的 WM_LBUTTONDOWN），点击弹出层里的控件则由该层替你做同一件
+事（`popup_layer.cpp` 的 `feed_mouse`）；边缘缩放由 `Player::poll_page_view_border()` 接管
+（见 `docs/native_core.md`），不能靠给网页留 padding 绕过。
 
-改动本页后跑 `scripts/shot_browser.py` 目检七张图（首屏表单 / 真实网页 / 收藏下拉 / 播放按钮 /
-Native 内容（bar 露出）/ Native 内容（bar 隐藏）/ 设置叠在页面快照上），功能链路与真实输入
-分别由 `scripts/verify_browser.py`、`scripts/verify_browser_input.py` 断言。
+改动本页后跑 `scripts/shot_browser.py` 目检八张图（首屏表单 / 真实网页 / 收藏下拉 / 播放按钮 /
+Native 内容（bar 露出）/ Native 内容（bar 隐藏）/ 设置浮在活网页之上 / 该面板的 combo 列表
+开在面板之上），功能链路与真实输入分别由 `scripts/verify_browser.py`、
+`scripts/verify_browser_input.py` 断言。
 
 ### 导出页（`build_export_screen`）
 

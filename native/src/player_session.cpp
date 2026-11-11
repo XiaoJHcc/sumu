@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 #include "player.h"
-#include "browser_view.h" // BrowserView (page view state, cookie lookup, snapshots)
-
-#include <wincodec.h> // settings-overlay backdrop: decode the captured page PNG on the CPU
-#pragma comment(lib, "windowscodecs.lib")
+#include "browser_view.h" // BrowserView (page view state, cookie lookup, media handover)
 
 #include <cctype>
 #include <cstdlib>
@@ -42,12 +39,17 @@ Player::Player(int width_hint, int height_hint, bool maximized){
     create_shader_pipeline();
     ui_init(); // present thread not started yet (starts below) -- no context contention
                // for this one-time ImGui/backend warmup.
-    // Popup layers (popup_layer.h): the address bar's favorites dropdown and the tooltips that
-    // must appear ABOVE the WebView2 page view. Created before the present thread starts.
+    // Popup layers (popup_layer.h): everything that must appear ABOVE the WebView2 page view --
+    // the address bar's favorites dropdown, tooltips, the settings panel and the topmost open
+    // ImGui popup. Created before the present thread starts.
     fav_popup_ = std::make_unique<PopupLayer>();
     fav_popup_->attach(hwnd_);
     tooltip_popup_ = std::make_unique<PopupLayer>();
     tooltip_popup_->attach(hwnd_);
+    settings_popup_ = std::make_unique<PopupLayer>();
+    settings_popup_->attach(hwnd_);
+    menu_popup_ = std::make_unique<PopupLayer>();
+    menu_popup_->attach(hwnd_);
     init_cuda_driver(); // device-independent-of-video-size CUDA setup only; landing
                          // texture + registration happen in open_session() once src dims
                          // are known.
@@ -569,6 +571,14 @@ void Player::close(){
         tooltip_popup_->release();
         tooltip_popup_.reset();
     }
+    if (settings_popup_) {
+        settings_popup_->release();
+        settings_popup_.reset();
+    }
+    if (menu_popup_) {
+        menu_popup_->release();
+        menu_popup_.reset();
+    }
     // The page view is closed FIRST: its child window and WebView2 process must be gone before
     // the parent HWND is destroyed, and its async callbacks are cancelled by the same call.
     if (browser_) {
@@ -1022,17 +1032,20 @@ void Player::ui_tick(){
     ImDrawData* dd = ImGui::GetDrawData();
     // ---- popup layer routing ---------------------------------------------------------------
     // The page view (WebView2) is a real child HWND, so it composites above everything ImGui
-    // draws into the main swapchain: an address-bar dropdown or a tooltip that reaches into the
-    // page area would be invisible. While the live page view is actually up, those two windows
-    // are routed OUT of this frame into their own owned top-level windows (popup_layer.h). In
-    // every other state (Home, Native content, export, page view stepped aside, window minimized
-    // or the app in the background) routing is off and both windows draw in the main swapchain
-    // exactly as before -- zero behavior change outside the live web view.
+    // draws into the main swapchain: an address-bar dropdown, a tooltip, the settings panel or an
+    // open combo list that reaches into the page area would be invisible. While the live page view
+    // is actually up, those windows are routed OUT of this frame into their own owned top-level
+    // windows (popup_layer.h). In every other state (Home, Native content, export, page view
+    // stepped aside, window minimized or the app in the background) routing is off and they draw
+    // in the main swapchain exactly as before -- zero behavior change outside the live web view.
     const bool route_popups = ui_ready_ && browser_ && browser_->visible() && !export_mode_ &&
         app_activated_ && hwnd_ && !IsIconic(hwnd_);
     if (fav_popup_) fav_popup_->route(route_popups ? dd : nullptr, "##sumu_favorites");
     if (tooltip_popup_) tooltip_popup_->route(route_popups ? dd : nullptr,
         route_popups ? PopupLayer::active_tooltip_name() : nullptr);
+    if (settings_popup_) settings_popup_->route(route_popups ? dd : nullptr, "##sumu_settings");
+    if (menu_popup_) menu_popup_->route(route_popups ? dd : nullptr,
+        route_popups ? PopupLayer::active_popup_name() : nullptr);
     auto snap = std::make_unique<UiDrawSnapshot>();
     snap->total_vtx = dd->TotalVtxCount;
     snap->total_idx = dd->TotalIdxCount;
@@ -1052,6 +1065,8 @@ void Player::ui_tick(){
     // the present thread has drawn a frame at its current size.
     if (fav_popup_) fav_popup_->sync();
     if (tooltip_popup_) tooltip_popup_->sync();
+    if (settings_popup_) settings_popup_->sync();
+    if (menu_popup_) menu_popup_->sync();
 }
 
 // ---- UI intent recording (M3): main-thread-only. Called from WndProc (keyboard, via
@@ -1084,6 +1099,8 @@ void Player::hide_window(){
     if (browser_) browser_->set_visible(false); // no page view floating over a hidden window
     if (fav_popup_) fav_popup_->hide();         // nor a popup floating over a hidden window
     if (tooltip_popup_) tooltip_popup_->hide();
+    if (settings_popup_) settings_popup_->hide();
+    if (menu_popup_) menu_popup_->hide();
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
 }
 
@@ -1105,6 +1122,8 @@ void Player::on_app_activated(bool active){
     if (active) return;
     if (fav_popup_) fav_popup_->hide();
     if (tooltip_popup_) tooltip_popup_->hide();
+    if (settings_popup_) settings_popup_->hide();
+    if (menu_popup_) menu_popup_->hide();
 }
 
 // Web-stream popup request (main-thread-only, see UiIntents header comment). The offline
@@ -1255,7 +1274,6 @@ void Player::request_open_url_popup(){
         browser_->cancel_cookies();
         browser_->cancel_media_navigation();
     }
-    reset_page_backdrop_state();
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
     open_cancel_requested_.store(false, std::memory_order_relaxed);
@@ -1284,7 +1302,6 @@ void Player::exit_browser_page(){
     browser_cookie_url_.clear();
     browser_auto_headers_.clear();
     browser_auto_nav_serial_ = 0;
-    reset_page_backdrop_state();
     browser_addr_focus_ = false;
     browser_home_focus_ = false;
     open_url_show_error_ = false;
@@ -1324,8 +1341,16 @@ void Player::browser_enter_web(){
 
 bool Player::browser_overlay_open() const {
     // Only the web-stream modal still replaces the page view with the player background; the
-    // settings panel is drawn OVER a captured snapshot of the page (see build_browser_page()).
+    // settings panel floats above the live page in its own popup layer (see build_browser_page()).
     return stream_popup_open_;
+}
+
+// The settings panel is drawn ON the page, not instead of it: it is routed into its own owned
+// top-level window (popup_layer.h) while the live page view is up, so the page keeps running,
+// clicking and sounding underneath. A layer that could not get its window/swapchain is the one
+// exception -- then the page view has to step aside or the panel would be buried under it.
+bool Player::settings_popup_available() const {
+    return settings_popup_ && !settings_popup_->unavailable();
 }
 
 // One reveal rule for the floating top chrome (title bar in fullscreen, address bar whenever the
@@ -1351,80 +1376,6 @@ int Player::browser_content_kind() const {
     return 0;                                                           // Home
 }
 
-// ---- settings overlay: captured-page backdrop -------------------------------------------
-// The settings panel is drawn ON the page instead of replacing it. WebView2's windowed
-// controller owns a real child HWND, so the page is captured (BrowserView::request_snapshot)
-// and decoded here into a D3D11 texture that ImGui can draw; the live view is only hidden once
-// that texture is ready, and closing the panel brings the same controller back unchanged.
-void Player::reset_page_backdrop_state(){
-    browser_backdrop_state_ = 0;
-    browser_backdrop_requested_ = false;
-    browser_backdrop_url_.clear();
-    // The texture is kept: an ImGui draw snapshot from the previous frame may still reference
-    // its SRV, and it is cheap device-level memory (freed with the device).
-}
-
-bool Player::upload_page_backdrop(const std::vector<uint8_t>& png){
-    if (png.empty() || !device_) return false;
-    // WIC: PNG bytes -> 32bpp BGRA. (COM apartment: this is the UI thread, already STA because
-    // the page view initializes it.)
-    ComPtr<IWICImagingFactory> factory;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory))) || !factory)
-        return false;
-    ComPtr<IWICStream> stream;
-    if (FAILED(factory->CreateStream(&stream)) || !stream) return false;
-    if (FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(png.data()),
-            static_cast<DWORD>(png.size()))))
-        return false;
-    ComPtr<IWICBitmapDecoder> decoder;
-    if (FAILED(factory->CreateDecoderFromStream(stream.Get(), nullptr,
-            WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder)
-        return false;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) return false;
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(factory->CreateFormatConverter(&converter)) || !converter) return false;
-    if (FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
-            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
-        return false;
-    UINT w = 0, h = 0;
-    if (FAILED(converter->GetSize(&w, &h)) || w == 0 || h == 0) return false;
-
-    const size_t stride = static_cast<size_t>(w) * 4;
-    std::vector<uint8_t> pixels(stride * h);
-    if (FAILED(converter->CopyPixels(nullptr, static_cast<UINT>(stride),
-            static_cast<UINT>(pixels.size()), pixels.data())))
-        return false;
-
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = w;
-    td.Height = h;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA init{};
-    init.pSysMem = pixels.data();
-    init.SysMemPitch = static_cast<UINT>(stride);
-    ComPtr<ID3D11Texture2D> tex;
-    ComPtr<ID3D11ShaderResourceView> srv;
-    {
-        // Device-level work shared with every other thread that touches the device.
-        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-        if (FAILED(device_->CreateTexture2D(&td, &init, &tex)) || !tex) return false;
-        if (FAILED(device_->CreateShaderResourceView(tex.Get(), nullptr, &srv)) || !srv)
-            return false;
-        browser_backdrop_tex_ = tex;
-        browser_backdrop_srv_ = srv;
-        browser_backdrop_w_ = w;
-        browser_backdrop_h_ = h;
-    }
-    return true;
-}
-
 void Player::ensure_browser(){
     if (browser_ && browser_->failed()) {
         browser_failed_ = true;
@@ -1442,12 +1393,6 @@ void Player::ensure_browser(){
 void Player::sync_browser_page(){
     if (!browser_) return;
     if (browser_->failed()) browser_failed_ = true;
-    // The settings overlay's backdrop is a picture of ONE page state. A navigation (or leaving
-    // the Web content for loading/native) retires it, and the next build requests exactly one
-    // fresh capture for the new state -- no stale page behind the panel, no per-frame captures.
-    if (browser_backdrop_state_ != 0 &&
-        (browser_content_kind() != 1 || browser_->page_url() != browser_backdrop_url_))
-        reset_page_backdrop_state();
     // WebView2 creates (and may recreate) its child window tree asynchronously; the edge-resize
     // forwarding subclass has to reach every one of those windows, so it is refreshed here --
     // cheap, and idempotent per HWND.
@@ -1887,14 +1832,9 @@ py::dict Player::browser_state() const {
     d["addr_visible"] = browser_addr_visible_;
     const D3D11_VIEWPORT vp = fit_viewport();
     d["viewport"] = py::make_tuple(vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height);
-    // Settings overlay: "backdrop" is true only while the captured page is actually fronting
-    // the panel; the raw state is exposed for diagnostics/assertions
-    // (0 idle / 1 capture pending / 2 ready / 3 failed).
-    d["settings_backdrop"] = ui_settings_open_ && browser_backdrop_state_ == 2;
-    d["backdrop_state"] = browser_backdrop_state_;
-    // Which page the current backdrop was captured from (empty when none): lets a script prove a
-    // navigation re-captured instead of keeping the old picture.
-    d["backdrop_url"] = browser_backdrop_state_ == 2 ? browser_backdrop_url_ : std::string();
+    // Whether the settings panel can float above the live page view at all (see
+    // settings_popup_available()): when it cannot, the page view steps aside while it is open.
+    d["settings_popup"] = settings_popup_available();
     d["fullscreen"] = fullscreen_.load(std::memory_order_relaxed);
     d["top_bar_visible"] = top_bar_visible_;
     int b[4] = { 0, 0, 0, 0 };
@@ -1915,8 +1855,10 @@ py::dict Player::browser_state() const {
     d["favorited"] = browser_favorited(browser_committed_url());
     d["favorites_open"] = fav_dropdown_open_;
     // Each popup layer is a real top-level owned window with its own swapchain: scripts use the
-    // hwnd/visible/rect trio to prove the dropdown and tooltips really do rise above the page
-    // view, and "frames" to know the present thread has drawn into it.
+    // hwnd/visible/rect trio to prove the dropdown, the tooltips, the settings panel and the open
+    // popup really do rise above the page view, "frames" to know the present thread has drawn into
+    // it, and "available" to know the layer could get its window at all (false = the owner falls
+    // back to the main swapchain, with the page view stepping aside).
     auto popup_dict = [](const PopupLayer* layer) {
         py::dict p;
         int client[4] = { 0, 0, 0, 0 };
@@ -1930,6 +1872,7 @@ py::dict Player::browser_state() const {
         p["hwnd"] = py::int_(hwnd_value);
         p["visible"] = layer && layer->visible();
         p["routed"] = layer && layer->routed();
+        p["available"] = layer && !layer->unavailable();
         p["client_rect"] = py::make_tuple(client[0], client[1], client[2], client[3]);
         p["screen_rect"] = py::make_tuple(screen[0], screen[1], screen[2], screen[3]);
         p["frames"] = layer ? layer->rendered_frames() : 0ull;
@@ -1938,6 +1881,10 @@ py::dict Player::browser_state() const {
     py::dict popups;
     popups["favorites"] = popup_dict(fav_popup_.get());
     popups["tooltip"] = popup_dict(tooltip_popup_.get());
+    // The settings panel is its own root window, and so is the popup it opens (a combo list, a
+    // context menu) -- two layers, not one.
+    popups["settings"] = popup_dict(settings_popup_.get());
+    popups["menu"] = popup_dict(menu_popup_.get());
     d["popups"] = popups;
     // Last address-field rect the bar laid out (client coords: x, y, w, h). The dropdown is
     // pinned to its left edge and width, so a script can compare the two exactly.
