@@ -159,28 +159,9 @@ inline bool is_ai(Source s) { return s == Source::AiFresh || s == Source::AiStal
 // ---- UI draw-data snapshot (M2: main-thread NewFrame/Render -> present-thread RenderDrawData
 // handoff) --------------------------------------------------------------------------------
 //
-// ImGui::GetDrawData()'s ImDrawList*s are owned by the ImGuiContext and get overwritten by the
-// next NewFrame() -- unsafe to hand across threads by pointer. CloneOutput() (imgui_draw.cpp)
-// deep-copies each ImDrawList's CmdBuffer/IdxBuffer/VtxBuffer into a freshly IM_NEW'd
-// ImDrawList, so a snapshot built from CloneOutput() is safe for the present thread to read
-// after the main thread has moved on to its next frame. IM_NEW/IM_DELETE route through
-// ImGui::MemAlloc/MemFree (imgui.h's IM_NEW/IM_DELETE macros), so cloned lists must be freed
-// with IM_DELETE, not plain `delete` -- matches ImGuiViewportP::~ImGuiViewportP's own use of
-// IM_DELETE on BgFgDrawLists (imgui.h:1988), the only other place in this vendored tree that
-// owns/frees a raw ImDrawList*.
-struct UiDrawSnapshot {
-    ImVector<ImDrawList*> cmd_lists; // each entry is a CloneOutput() result -- owned here
-    int total_vtx = 0;
-    int total_idx = 0;
-    ImVec2 display_pos{};
-    ImVec2 display_size{};
-    ImVec2 framebuffer_scale{};
-
-    ~UiDrawSnapshot()
-    {
-        for (ImDrawList* dl : cmd_lists) IM_DELETE(dl);
-    }
-};
+// Defined in popup_layer.h together with the popup layer that reuses the same snapshot type for
+// a single routed window (see that file's header).
+#include "popup_layer.h"
 
 // ---- UI intent channel (M3) -----------------------------------------------------------
 // Main-thread-exclusive state recording what the UI wants to happen next, drained once per
@@ -268,6 +249,12 @@ struct UiIntents {
     int export_set_default = -1;      // preset idx to mark as the default
     // Files dropped on the window while in export mode (multi-file drop -> queue).
     std::vector<std::string> export_drop_paths;
+    // Address-bar favorites. The Python settings store owns the list; these are EDGES the page
+    // records when the user clicks the star / a row's X (empty string = nothing pending), and
+    // Python re-pushes the authoritative list with set_browser_favorites() right after.
+    std::string favorite_add_url;
+    std::string favorite_add_title;
+    std::string favorite_remove_url;
 };
 
 // Offline-export screen state pushed by Python via set_export_snapshot() (main-thread only, same
@@ -439,6 +426,10 @@ public:
     void hide_window();
     void show_window();
 
+    // WM_ACTIVATEAPP: a deactivated Player hides both popup layers (they are owned top-level
+    // windows and would otherwise float over whatever the user switched to).
+    void on_app_activated(bool active);
+
     void on_resize(UINT w, UINT h);
 
     void resize_window_for_video();
@@ -568,6 +559,16 @@ public:
     // Test/debug view of the page state (no side effects).
     py::dict browser_state() const;
 
+    // Address-bar favorites: `favorites` is a Python list of {"url": str, "title": str} dicts in
+    // display order. Python owns the list (settings.json) and pushes it at startup and after
+    // every change; native also applies the user's own click optimistically, so the star and the
+    // dropdown react in the same frame the click lands.
+    void set_browser_favorites(const py::list& favorites);
+
+    // WndProc's ESC path: closes the address bar's favorites dropdown and reports that the key
+    // was consumed, so ESC inside the page does not quit/park the app.
+    bool handle_escape();
+
     // Python calls this on the main thread when an async open finishes. Success keeps the page
     // up, switches it to the Native state and names the opened session in the address bar
     // (video_path_ -- so the open-file button / a drop never leave an old page URL there).
@@ -655,6 +656,11 @@ private:
 
     void ui_render_drawdata();
 
+    // Present thread, inside d3d_mutex_ right after ui_render_drawdata(): renders whichever
+    // popup layers (address-bar dropdown / tooltip over the page view) have a routed frame,
+    // each into its own swapchain. See popup_layer.h for why they exist.
+    void ui_render_popups();
+
     void build_ui();
 
     void build_splash_overlay();
@@ -729,6 +735,21 @@ private:
 
     UrlFieldResult url_field(const char* id, char* buf, size_t cap, float width,
                              bool* focus_pending, bool* select_all_pending);
+
+    // ---- address-bar favorites (the dropdown lives in a PopupLayer, see popup_layer.h) ------
+    // The committed page URL the star acts on: the Web page view's own URL, or the URL the
+    // native session in the page was opened from. Empty on Home/Loading/Unavailable. Never the
+    // address field's typed-but-unsubmitted text.
+    std::string browser_committed_url() const;
+    // The committed page's title for a new favorite: the document title when the page reports
+    // one, else the URL itself.
+    std::string browser_committed_title() const;
+    bool browser_favorited(const std::string& url) const;
+    // Star click: add the committed URL (with its title) or remove it. Records the intent.
+    void browser_toggle_favorite();
+    void browser_remove_favorite(const std::string& url);
+    // Rows of the dropdown under the address field: [title (fallback url)] ... [x].
+    void build_favorites_dropdown();
 
     void build_stream_popup();
 
@@ -1036,6 +1057,30 @@ private:
     // discipline as ui_settings_open_. The page view itself is optional: when WebView2 is
     // missing the page shows browser_unavailable and nothing else in the player is affected.
     //
+    // Address-bar favorites: the list itself is Python's (set_browser_favorites), mirrored here
+    // for the star's state and the dropdown's rows. `fav_dropdown_open_` is a STICKY flag, not a
+    // derivation of the field's active state: pressing a row/X button makes that button the
+    // ActiveId and deactivates the InputText on PRESS while the click fires on RELEASE, so the
+    // dropdown must survive those frames (it stays open while the field is active or the
+    // dropdown itself is hovered).
+    struct BrowserFavorite {
+        std::string url;
+        std::string title;
+    };
+    std::vector<BrowserFavorite> browser_favorites_;
+    bool fav_dropdown_open_ = false;
+    bool fav_field_was_active_ = false; // previous frame: the address field held the caret
+    // Address field rect of the frame that drew the bar (client coords) -- the dropdown is
+    // pinned to its left edge and width.
+    float browser_addr_field_rect_[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    // Popup layers (popup_layer.h): the favorites dropdown and ImGui tooltips must be able to
+    // appear ABOVE the page view, which is a real child HWND covering the main swapchain.
+    std::unique_ptr<PopupLayer> fav_popup_;
+    std::unique_ptr<PopupLayer> tooltip_popup_;
+    // WM_ACTIVATEAPP: a deactivated app hides both popups (they must never float over another
+    // app's window while the Player is in the background).
+    bool app_activated_ = true;
+
     // Content state, in priority order (see browser_content_state()'s use in
     // build_browser_page): Loading > Native > Web > Unavailable > Home.
     //   browser_native_ -- the playing session IS the page's content (video below the address

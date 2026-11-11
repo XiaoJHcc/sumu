@@ -50,6 +50,10 @@ PYBIND11_MODULE(sumu_core, m)
         .def("browser_reload", &Player::browser_reload)
         .def("browser_play_native", &Player::browser_play_native)
         .def("browser_state", &Player::browser_state)
+        // Address-bar favorites: Python's settings store owns the list and pushes it here (at
+        // startup and after every change); the star / row X record intents for the changes the
+        // user makes (see UiIntents::favorite_*).
+        .def("set_browser_favorites", &Player::set_browser_favorites, py::arg("favorites"))
         .def("play", &Player::play)
         .def("pause", &Player::pause)
         .def("is_playing", &Player::is_playing)

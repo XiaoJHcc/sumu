@@ -32,10 +32,12 @@ def main():
         settings_path = os.path.join(tmpdir, "settings.json")
 
         # 1. Round-trip
+        favs = [{"url": "https://a.example/x?q=1", "title": "A"},
+                {"url": "https://b.example/", "title": ""}]
         s = settings_mod.Settings(
             volume=0.5, muted=True, recent=["a", "b", "c"], positions={"x": 1234},
             cold_start_s=1.5, target_fps=30, clip_length=45, max_regions=3, lead=120,
-            language="en",
+            language="en", favorites=[dict(f) for f in favs],
         )
         settings_mod.save(s, settings_path)
         loaded = settings_mod.load(settings_path)
@@ -49,6 +51,7 @@ def main():
         check("round-trip max_regions", loaded.max_regions == 3)
         check("round-trip lead", loaded.lead == 120)
         check("round-trip language", loaded.language == "en")
+        check("round-trip favorites order + titles", loaded.favorites == favs)
 
         # 2. Corrupt/missing
         with open(settings_path, "wb") as f:
@@ -64,6 +67,7 @@ def main():
         check("corrupt file -> defaults (max_regions)", corrupt_loaded.max_regions == 1)
         check("corrupt file -> defaults (lead)", corrupt_loaded.lead == 180)
         check("corrupt file -> defaults (language)", corrupt_loaded.language == "auto")
+        check("corrupt file -> defaults (favorites)", corrupt_loaded.favorites == [])
 
         os.remove(settings_path)
         missing_loaded = settings_mod.load(settings_path)
@@ -110,6 +114,38 @@ def main():
             json.dump({"fps_div": 1}, f)
         check("legacy fps_div=1 -> target_fps 0", settings_mod.load(settings_path).target_fps == 0)
 
+        # 2c2. favorites (address-bar star): garbage rows dropped, dedupe by exact url keeping
+        # the first occurrence, title defaults to "", cap enforced, absent key -> empty list.
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"favorites": [
+                "junk", 42, None, ["https://x/"], {"title": "no url"}, {"url": ""},
+                {"url": 7}, {"url": "https://a/", "title": "A"},
+                {"url": "https://a/", "title": "A dup"}, {"url": "https://b/", "title": 5},
+            ]}, f)
+        fav_loaded = settings_mod.load(settings_path).favorites
+        check("favorites: garbage rows dropped, exact-url dedupe keeps first, junk title -> ''",
+              fav_loaded == [{"url": "https://a/", "title": "A"},
+                             {"url": "https://b/", "title": ""}])
+
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"favorites": {"https://a/": "A"}}, f)
+        check("favorites: non-list -> empty", settings_mod.load(settings_path).favorites == [])
+
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({"volume": 0.25}, f)
+        no_fav = settings_mod.load(settings_path)
+        check("favorites: file without the key -> empty", no_fav.favorites == [])
+        check("favorites: missing key keeps other fields", no_fav.volume == 0.25)
+
+        over_cap = [{"url": f"https://e/{i}", "title": f"t{i}"}
+                    for i in range(settings_mod.FAVORITES_CAP + 5)]
+        settings_mod.save(settings_mod.Settings(favorites=over_cap), settings_path)
+        capped = settings_mod.load(settings_path).favorites
+        check("favorites: capped at FAVORITES_CAP", len(capped) == settings_mod.FAVORITES_CAP)
+        check("favorites: cap keeps the newest-first head",
+              capped[0]["url"] == "https://e/0"
+              and capped[-1]["url"] == f"https://e/{settings_mod.FAVORITES_CAP - 1}")
+
         # 2d. fps_div_for_target (nearest 1/N, never upsample)
         check("div: original -> 1", settings_mod.fps_div_for_target(60.0, 0) == 1)
         check("div: 60->30 uses 2", settings_mod.fps_div_for_target(60.0, 30) == 2)
@@ -153,7 +189,7 @@ def main():
               settings_mod.is_resumable_frame(None, fps, frame_count) is False)
 
         # 5. Atomic write: no leftover temp file, target parses as valid JSON.
-        s4 = settings_mod.Settings(volume=0.7)
+        s4 = settings_mod.Settings(volume=0.7, favorites=[{"url": "https://z/", "title": "Z"}])
         settings_mod.save(s4, settings_path)
         leftover_tmp = [f for f in os.listdir(tmpdir) if f != "settings.json"]
         check("atomic write: no leftover temp files", leftover_tmp == [])
@@ -161,6 +197,7 @@ def main():
             data = json.load(f)
         check("atomic write: target parses as valid JSON", isinstance(data, dict))
         check("save writes target_fps not fps_div", "target_fps" in data and "fps_div" not in data)
+        check("save writes favorites", data.get("favorites") == [{"url": "https://z/", "title": "Z"}])
         check("save writes clip_length/max_regions/lead",
               data.get("clip_length") == 30 and data.get("max_regions") == 1 and data.get("lead") == 180)
 

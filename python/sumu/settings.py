@@ -3,8 +3,9 @@
 #
 # Phase 6 M-E: persisted user state for the daily entrypoint (scripts/play.py) -- last volume,
 # mute state, recent-files list, per-file last playback position (resume), AI/scheduler knobs
-# (clip_length / max_regions / cold_start_s / lead / target_fps), and UI language preference
-# ("auto" | "zh-CN" | "en"). Deliberately stdlib-only (json/os/pathlib/tempfile +
+# (clip_length / max_regions / cold_start_s / lead / target_fps), UI language preference
+# ("auto" | "zh-CN" | "en"), web-stream/offline-export state, and the browser page's address-bar
+# favorites (ordered url+title list). Deliberately stdlib-only (json/os/pathlib/tempfile +
 # dataclasses/typing), no dependency on sumu_core/torch, so this module is importable and
 # testable in complete isolation (see scripts/verify_settings.py).
 #
@@ -24,6 +25,11 @@ from pathlib import Path
 from typing import Optional
 
 RECENT_CAP = 10
+
+# Address-bar favorites of the embedded browser page: an ordered list of {"url", "title"}.
+# Order IS the display order (newest added first), so it is preserved verbatim across load/save;
+# the cap only bounds a runaway list (favorites are user-curated, so it is generous).
+FAVORITES_CAP = 200
 
 # positions（续播进度）LRU 上限：此前每播放过一个文件永久新增一条、settings.json
 # 无限变大（L3）。dict 保序 = 插入序，set_position 把命中键移到末尾（MRU），
@@ -159,6 +165,10 @@ class Settings:
     export_presets: list[dict] = field(default_factory=lambda: [dict(p) for p in EXPORT_PRESET_DEFAULTS])
     export_default_preset_idx: int = EXPORT_DEFAULT_PRESET_INDEX
     export_queue: list[dict] = field(default_factory=list)
+    # Address-bar favorites of the embedded browser page (ordered {"url", "title"} dicts, newest
+    # first). Python is the source of truth: the native star button / dropdown only reports
+    # add/remove intents, and this list is pushed back every time it changes.
+    favorites: list[dict] = field(default_factory=list)
 
     def push_recent(self, path: str) -> None:
         """Move-to-front, dedup by norm key, cap at RECENT_CAP entries (oldest dropped).
@@ -393,6 +403,28 @@ def _coerce_positions(value) -> dict[str, int]:
     return out
 
 
+def _coerce_favorites(value) -> list[dict]:
+    """Coerce the persisted favorites list: keep only {"url": non-empty str, "title": str} rows,
+    dedupe by exact url keeping the FIRST occurrence (so display order stays stable), fill a
+    missing/junk title with "", cap at FAVORITES_CAP. Anything not a list -> []."""
+    if not isinstance(value, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str) or not url or url in seen:
+            continue
+        seen.add(url)
+        title = item.get("title")
+        out.append({"url": url, "title": title if isinstance(title, str) else ""})
+        if len(out) >= FAVORITES_CAP:
+            break
+    return out
+
+
 def _migrate_target_fps(data: dict) -> int:
     """Prefer target_fps; else map legacy fps_div (>1 → 30, else original)."""
     if "target_fps" in data:
@@ -443,6 +475,7 @@ def load(path: Optional[str | Path] = None) -> Settings:
             export_default_preset_idx=clamp_export_default_idx(
                 data.get("export_default_preset_idx"), len(presets)),
             export_queue=clamp_export_queue(data.get("export_queue")),
+            favorites=_coerce_favorites(data.get("favorites")),
         )
     except Exception:  # noqa: BLE001 -- a corrupt/unreadable settings file must never crash the player
         return Settings()
@@ -480,6 +513,7 @@ def save(settings: Settings, path: Optional[str | Path] = None) -> None:
             "export_default_preset_idx": clamp_export_default_idx(
                 settings.export_default_preset_idx, len(settings.export_presets)),
             "export_queue": clamp_export_queue(settings.export_queue),
+            "favorites": _coerce_favorites(settings.favorites),
         }
         fd, tmp_path = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(p.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:

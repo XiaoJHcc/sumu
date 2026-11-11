@@ -1413,6 +1413,7 @@ void Player::draw_and_present(Source source, UINT slot){
     context_->ClearRenderTargetView(backbuffer_rtv_.Get(), black);
     if (slot == UINT_MAX) {
         ui_render_drawdata();
+        ui_render_popups();
         swapchain_->Present(1, 0);
         return;
     }
@@ -1449,6 +1450,7 @@ void Player::draw_and_present(Source source, UINT slot){
     // the main thread by ui_tick()) -- see ui_render_drawdata()'s header comment. Called
     // here, after the video Draw(3,0) and before Present(1,0), still inside d3d_mutex_.
     ui_render_drawdata();
+    ui_render_popups(); // popup layers (own swapchains, Present(0,0))
 
     swapchain_->Present(1, 0);
 }
@@ -1471,6 +1473,7 @@ void Player::draw_splash(){
     context_->ClearRenderTargetView(backbuffer_rtv_.Get(), clear_color);
 
     ui_render_drawdata();
+    ui_render_popups(); // popup layers keep working without a session (they belong to the UI)
 
     swapchain_->Present(1, 0);
 }

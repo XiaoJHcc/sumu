@@ -43,9 +43,13 @@ import sumu_core  # noqa: E402
 from sumu import i18n  # noqa: E402
 
 user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
 
 _failures = []
 _page_hits = {}  # path -> page fetches (reload check)
+
+# PAGE_HTML's body background: the "known solid color" the popup-layer checks compare against.
+PAGE_BG = (0x10, 0x10, 0x12)
 
 
 def check(name, cond, detail=""):
@@ -270,11 +274,55 @@ def addr_button_center(hwnd, index):
 
 
 def addr_right_button_center(hwnd, index_from_right):
-    """Center of a right-side address-bar button (0 play / 1 go): the field takes the remaining
-    width, so these are anchored to the bar's right edge (2px inset + 32px button + 32px)."""
+    """Center of a right-side address-bar button, counted from the RIGHT edge of the bar
+    (0 star / 1 play / 2 go): the field takes the remaining width, so these are anchored to the
+    bar's right edge (2px inset + 32px button + 32px per step)."""
     s = user32.GetDpiForWindow(hwnd) / 96.0
     _, _, cw, _ = client_rect(hwnd)
     return cw - s * (2.0 + 16.0 + index_from_right * 34.0), s * (36.0 + 18.0)
+
+
+STAR_FROM_RIGHT, PLAY_FROM_RIGHT, GO_FROM_RIGHT = 0, 1, 2
+
+
+def screen_pixel(x, y):
+    """Color of one desktop pixel as (r, g, b). Reads the COMPOSITED desktop, so it shows what
+    the user actually sees -- the whole point of the popup-layer checks (an ImGui window drawn
+    in the main swapchain would be hidden behind the WebView2 child window here)."""
+    hdc = user32.GetDC(0)
+    try:
+        color = gdi32.GetPixel(hdc, int(x), int(y)) & 0xFFFFFF  # COLORREF 0x00BBGGRR
+    finally:
+        user32.ReleaseDC(0, hdc)
+    return color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF
+
+
+def pump_intents(player, seconds, until=None):
+    """Pump the player and collect UI intents (drained exactly like app.py's main loop)."""
+    intents = {}
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        player.pump_messages()
+        player.ui_tick()
+        for k, v in player.take_ui_intents().items():
+            if v:
+                intents[k] = v
+        if until is not None and until(intents):
+            break
+        time.sleep(0.02)
+    return intents
+
+
+def click_right_button(player, hwnd, index_from_right, keys, tries=3):
+    """Real click on one of the address bar's right-side buttons until one of `keys` shows up in
+    the drained intents (the first click after a state change can be eaten)."""
+    intents = {}
+    for _ in range(tries):
+        click_client(hwnd, *addr_right_button_center(hwnd, index_from_right))
+        intents = pump_intents(player, 2.0, lambda i: any(i.get(k) for k in keys))
+        if any(intents.get(k) for k in keys):
+            return intents
+    return intents
 
 
 def click_until(player, hwnd, pos, predicate, tries=3, settle=4.0):
@@ -329,7 +377,7 @@ def play_button_click(player, hwnd, flow, settle=2.0, tries=3):
     Returns (intents, opened)."""
     intents = {}
     for _ in range(tries):
-        click_client(hwnd, *addr_right_button_center(hwnd, 0))
+        click_client(hwnd, *addr_right_button_center(hwnd, PLAY_FROM_RIGHT))
         t0 = time.monotonic()
         while time.monotonic() - t0 < 3.0:
             player.pump_messages()
@@ -645,6 +693,162 @@ def main():
     submit_url(player, page_url)
     ok = pump(player, 20.0, lambda: player.browser_state()["web_visible"])
     check("web page restored for the drag tests", ok, f"{player.browser_state()}")
+
+    # ---- 1f. favorites dropdown + the popup layer --------------------------------------
+    # The page view is a real child HWND: everything ImGui draws in the main swapchain is covered
+    # by it. The address bar's favorites dropdown and its button tooltips are therefore lifted
+    # into their own owned top-level windows (native/src/popup_layer.cpp) while the live page view
+    # is up. Everything here is a REAL mouse hover/click, and the "is it really above the page?"
+    # evidence is a screen pixel that is not the page's own background color.
+    page_title = "sumu input one"
+    other_title = "sumu input two"
+    state = player.browser_state()
+    check("favorites: the committed page URL is the one on screen",
+          (state["url"] or "").rstrip("/") == page_url, state["url"])
+    check("favorites: nothing is favorited to start with", not state["favorited"],
+          f"{state['favorites']}")
+
+    # The dropdown will open over the page area: prove the page view really covers that spot
+    # first (same pixel, page background), otherwise the popup check proves nothing.
+    _, _, cw, ch = client_rect(hwnd)
+    ox, oy = client_rect(hwnd)[0], client_rect(hwnd)[1]
+    probe_y = (36.0 + 36.0 + 20.0) * scale
+    coverage_before = screen_pixel(ox + cw * 0.5, oy + probe_y)
+    check("favorites: the page view covers the area the dropdown will occupy",
+          coverage_before == PAGE_BG, f"{coverage_before}")
+
+    intents = click_right_button(player, hwnd, STAR_FROM_RIGHT,
+                                 ("favorite_add_url", "favorite_remove_url"))
+    check("star click records favorite_add_url for the committed page URL",
+          intents.get("favorite_add_url") == page_url, repr(intents.get("favorite_add_url")))
+    check("star click carries the page's document title",
+          intents.get("favorite_add_title") == page_title,
+          repr(intents.get("favorite_add_title")))
+    check("the star fills in the click's own frame (optimistic local update)",
+          player.browser_state()["favorited"],
+          f"{player.browser_state()['favorites']}")
+    # The Python side owns the list (settings store) and echoes it back, exactly like app.py.
+    player.set_browser_favorites([
+        {"url": page_url, "title": page_title},
+        {"url": page2_url, "title": other_title},
+    ])
+    pump(player, 0.3)
+    state = player.browser_state()
+    check("set_browser_favorites publishes the list in display order",
+          list(state["favorites"]) == [page_url, page2_url], f"{state['favorites']}")
+
+    # Click into the URL field: the dropdown opens under it.
+    click_client(hwnd, cw * 0.45, addr_y)
+    ok = pump(player, 3.0, lambda: player.browser_state()["popups"]["favorites"]["visible"])
+    state = player.browser_state()
+    pop = state["popups"]["favorites"]
+    check("clicking the address field opens the favorites dropdown",
+          ok and state["favorites_open"], f"open={state['favorites_open']} {pop}")
+    check("the dropdown is a real top-level window with a live swapchain",
+          pop["hwnd"] and pop["visible"] and pop["frames"] > 0, f"{pop}")
+
+    field = state["addr_field_rect"]
+    pop_client = pop["client_rect"]
+    check("the dropdown is as wide as the field and starts at its left edge",
+          abs(pop_client[0] - field[0]) <= 1 and abs(pop_client[2] - field[2]) <= 1,
+          f"field={field} popup={pop_client}")
+    check("the dropdown hangs below the address field",
+          pop_client[1] >= field[1] + field[3], f"field={field} popup={pop_client}")
+    bounds = state["bounds"]
+    web_rect = (ox + bounds[0], oy + bounds[1], bounds[2], bounds[3])
+    pop_screen = pop["screen_rect"]
+    check("the dropdown overlaps the web view rect",
+          pop_screen[0] < web_rect[0] + web_rect[2] and
+          pop_screen[0] + pop_screen[2] > web_rect[0] and
+          pop_screen[1] < web_rect[1] + web_rect[3] and
+          pop_screen[1] + pop_screen[3] > web_rect[1],
+          f"popup={pop_screen} web={web_rect}")
+    # A row's own pixels are NOT the page background: the dropdown really is composited above
+    # the page view rather than hidden behind it.
+    row_h = 32.0 * scale
+    row0_y = pop_screen[1] + 4.0 * scale + row_h * 0.5
+    row_pixels = [screen_pixel(pop_screen[0] + pop_screen[2] * f, row0_y)
+                  for f in (0.03, 0.4, 0.85)]
+    check("a screen pixel inside a dropdown row is not the page background",
+          all(px != PAGE_BG for px in row_pixels), f"{row_pixels} page_bg={PAGE_BG}")
+
+    # Hovering a row only recolors it (same geometry): the popup must still re-render, otherwise
+    # the hover wash never reaches the screen.
+    hover_cx = pop_client[0] + pop_client[2] * 0.6
+    hover_sx = pop_screen[0] + pop_screen[2] * 0.6
+    move_client(hwnd, hover_cx, pop_client[1] + 4.0 * scale + row_h * 0.5)
+    pump(player, 0.6)
+    hovered_px = screen_pixel(hover_sx, row0_y)
+    move_client(hwnd, hover_cx, pop_client[1] + 4.0 * scale + row_h * 1.5)
+    pump(player, 0.6)
+    unhovered_px = screen_pixel(hover_sx, row0_y)
+    check("hovering a dropdown row shows its hover wash on screen",
+          hovered_px != unhovered_px, f"hovered={hovered_px} after_leave={unhovered_px}")
+
+    # Real click on the SECOND row -> that favorite's URL is put in the field and navigated.
+    click_client(hwnd, pop_client[0] + pop_client[2] * 0.3,
+                 pop_client[1] + 4.0 * scale + row_h * 1.5)
+    ok = pump(player, 20.0, lambda: (player.browser_state()["url"] or "").rstrip("/") == page2_url)
+    state = player.browser_state()
+    check("a real click on a dropdown row navigates to that favorite",
+          ok, f"{state['url']}")
+    check("the row's URL is what the address bar now shows", state["address"] == page2_url,
+          state["address"])
+    check("the dropdown closes after a row click", not state["favorites_open"],
+          f"{state['favorites_open']}")
+
+    # Reopen and press a row's X: that entry is removed and the list stays open.
+    _, _, cw, ch = client_rect(hwnd)
+    click_client(hwnd, cw * 0.45, addr_y)
+    pump(player, 3.0, lambda: player.browser_state()["popups"]["favorites"]["visible"])
+    state = player.browser_state()
+    pop_client = state["popups"]["favorites"]["client_rect"]
+    check("the dropdown reopens on a second field click", state["favorites_open"], f"{state}")
+    click_client(hwnd, pop_client[0] + pop_client[2] - row_h * 0.5,
+                 pop_client[1] + 4.0 * scale + row_h * 0.5)
+    intents = pump_intents(player, 2.0, lambda i: i.get("favorite_remove_url"))
+    state = player.browser_state()
+    check("a real click on a row's X records favorite_remove_url",
+          intents.get("favorite_remove_url") == page_url,
+          repr(intents.get("favorite_remove_url")))
+    check("the row's X removes that favorite locally", page_url not in list(state["favorites"]),
+          f"{state['favorites']}")
+    check("the dropdown stays open after a removal", state["favorites_open"], f"{state}")
+    player.set_browser_favorites([{"url": page2_url, "title": other_title}])  # app.py's echo
+    pump(player, 0.3)
+
+    # Esc closes the dropdown instead of quitting/parking the player.
+    check("the address field still owns the keyboard", user32.GetFocus() == hwnd,
+          f"{user32.GetFocus()}")
+    key(0x1B)  # ESC
+    key(0x1B, up=True)
+    ok = pump(player, 2.0, lambda: not player.browser_state()["favorites_open"])
+    check("Esc closes the dropdown", ok, f"{player.browser_state()['favorites_open']}")
+    check("Esc with the dropdown open does not quit the player", not player.should_quit(),
+          f"{player.should_quit()}")
+
+    # A real hover on the go button: its tooltip must also rise above the page view.
+    move_client(hwnd, *addr_right_button_center(hwnd, GO_FROM_RIGHT))
+    ok = pump(player, 4.0, lambda: player.browser_state()["popups"]["tooltip"]["visible"])
+    state = player.browser_state()
+    tip = state["popups"]["tooltip"]
+    check("hovering the go button shows its tooltip above the page view",
+          ok and tip["hwnd"], f"{tip}")
+    if ok:
+        tip_rect = tip["screen_rect"]
+        bounds = state["bounds"]
+        web_rect = (ox + bounds[0], oy + bounds[1], bounds[2], bounds[3])
+        check("the tooltip overlaps the web view rect",
+              tip_rect[0] < web_rect[0] + web_rect[2] and
+              tip_rect[0] + tip_rect[2] > web_rect[0] and
+              tip_rect[1] < web_rect[1] + web_rect[3] and
+              tip_rect[1] + tip_rect[3] > web_rect[1],
+              f"tooltip={tip_rect} web={web_rect}")
+        tip_pixels = [screen_pixel(tip_rect[0] + tip_rect[2] * f, tip_rect[1] + tip_rect[3] * 0.5)
+                      for f in (0.06, 0.5, 0.94)]
+        check("a screen pixel inside the tooltip is not the page background",
+              all(px != PAGE_BG for px in tip_pixels), f"{tip_pixels} page_bg={PAGE_BG}")
+
 
     # ---- 2a. negative: a press INSIDE the page dragged to the edge must not resize -------
     # (arming requires the button-down to start in the resize band)

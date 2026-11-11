@@ -33,6 +33,8 @@ native/
                           export=导出页）
   src/browser_view.h/.cpp 内嵌 WebView2 页视图（windowed child controller）。WebView2 SDK
                           头只出现在这里，Player 只持 forward-declared unique_ptr
+  src/popup_layer.h/.cpp 弹出层：把一个 ImGui 窗口画进自己的 owned 顶层窗口，浮在
+                          WebView2 子窗口之上（地址栏收藏下拉 / 地址栏按钮 tooltip）
   src/player_pybind.cpp   pybind11 模块定义 sumu_core。
   smoke_player.py         三项验证场景的驱动脚本（见下文"验证结果"）。
 python/sumu/
@@ -71,12 +73,20 @@ p.browser_reload()
 p.browser_play_native()     # 地址栏「播放」：把地址栏当前 URL 直接交给原生 open（附页面
                             # Referer + CookieManager 取的 cookie），写
                             # open_path/open_headers/open_cookies
+p.set_browser_favorites([{"url": u, "title": t}, ...])
+                            # 地址栏收藏列表：Python（settings）是唯一事实来源，启动时与每次
+                            # 变更后整体推给原生；原生自己也乐观更新，使星标/下拉当帧生效
 p.browser_state()           # 页视图状态 dict：page/native/web/content(home|web|loading|
                             # native|unavailable)/available/failed/url/
                             # loading/muted/cookie_pending/address/web_visible/settings_open/
                             # stream_open/export/can_back/can_forward/can_reload/bounds/
                             # page_rect/home_rect/addr_visible/viewport/settings_backdrop/
-                            # backdrop_state/backdrop_url/fullscreen/top_bar_visible
+                            # backdrop_state/backdrop_url/fullscreen/top_bar_visible/
+                            # favorites/favorited/favorites_open/addr_field_rect/popups
+                            # popups = {favorites, tooltip}，每项 {hwnd, visible, routed,
+                            # client_rect, screen_rect, frames}（弹出层取证用）
+                            # take_ui_intents() 另带 favorite_add_url / favorite_add_title /
+                            # favorite_remove_url（空串 = 无）
 p.set_park_on_close(on)      # 关窗驻留开关：on 时 X/ESC 不再直接退出，而是经
                              # take_ui_intents() 的 close_request 交给 Python 决定驻留/退出
 p.hide_window() / p.show_window()   # 驻留：隐藏窗口 / 恢复并前台化（present 保持运行，
@@ -258,6 +268,64 @@ drag** 三段：光标在按钮**抬起**时悬停在缩放带内（且该点在
 swapchain 与页面视图 bounds 同步跟随），松开后 armed/active 一并清空。悬停与拖拽期间都
 按方向设置系统缩放光标（横向/纵向/两个对角），避免边缘看起来仍不可拖。不加任何 padding、
 不改页面矩形，缩放带以外的一切点击照常交给网页。
+
+## 弹出层（`native/src/popup_layer.h/.cpp`）
+
+窗口式 WebView2 是**真实子 HWND**：子窗口永远压在父窗口客户区之上，ImGui 画在主 swapchain
+里的任何东西都会被网页盖住。地址栏收藏下拉、地址栏按钮 tooltip 都要伸到页面区上方，因此走
+**弹出层**——单窗口版的 ImGui multi-viewport，与 Chrome 的 omnibox 弹窗同一个思路：
+
+- 一个 `PopupLayer` 持有一个 **owned 顶层窗口**（`WS_POPUP`，owner = Player 的 `hwnd_`）：
+  被拥有的窗口恒在 owner 及其子窗口之上，所以必然压住网页；`WS_EX_NOACTIVATE |
+  WS_EX_TOOLWINDOW` + `WM_MOUSEACTIVATE → MA_NOACTIVATE` 让它永不取得激活、不进任务栏/Alt+Tab，
+  键盘焦点、地址栏光标与 IME 都留在原处。窗口按需惰性创建（主线程，消息泵线程），Win11 圆角
+  走 `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL)`（best-effort）。
+- **共享同一个 ImGui context**：被路由的窗口照常在主客户区坐标里构建；`ui_tick()` 在
+  `ImGui::Render()` 之后把这些窗口的 draw list（自身 + RootWindow 是它的子窗口）从当帧
+  `ImDrawData` 中**摘出**并 `CloneOutput()` 成该层自己的 `UiDrawSnapshot`，其
+  `display_pos/display_size` = 该窗口矩形（客户区坐标，取整到整像素），framebuffer scale 与主
+  快照相同。主题/字体/图标/DPI/字体纹理全部免费共用（纹理列表挂在唯一 context 的
+  `GetPlatformIO().Textures` 上）。主快照里不再有这部分几何，因此不会被画两次。
+- **渲染在 present 线程**（`d3d_mutex_` 内，紧跟主 `ui_render_drawdata()`、主 `Present(1,0)`
+  之前）：只在新快照存在且内容（矩形 + 顶点/索引/绘制命令的 FNV-1a 指纹，hover 换色这种
+  几何不变的变化也算）与屏上那帧不同、或窗口尚未显示时才渲染
+  并 Present，必要时 `ResizeBuffers`，绑自己的 RTV、清屏、
+  `ImGui_ImplDX11_RenderDrawData`，然后 `Present(0,0)`——**绝不** `Present(1)`，不给视频 present
+  循环加第二个 vblank 等待（I10）。窗口用同 device 的 `CreateSwapChainForHwnd`
+  （FLIP_DISCARD、2 buffer、R8G8B8A8_UNORM，与主 swapchain 同格式）。
+- **不闪黑**：主线程只在 present 线程已经按当前尺寸渲染过一帧（`rendered_frames()` 变化 +
+  尺寸匹配）之后才 `ShowWindow(SW_SHOWNOACTIVATE)`，并每帧按 `ClientToScreen` 跟随被路由窗口
+  的位置；没有路由时（或窗口最小化/隐藏、`WM_ACTIVATEAPP` 失活、退出）立即隐藏。
+- **输入**：鼠标消息直接进弹出窗口自己，转成主客户区坐标后喂给共享 ImGui IO
+  （`AddMousePosEvent`/`AddMouseButtonEvent`/`AddMouseWheelEvent`），按下时 `SetCapture(弹出窗)`、
+  抬起释放。**故意不**经 `ImGui_ImplWin32_WndProcHandler`：那会给主窗口
+  `TrackMouseEvent` 并投递假的 `WM_MOUSELEAVE`。光标离开主窗口时后端把鼠标位置置为无效，但它
+  在 `NewFrame()` 里的回退分支（应用仍聚焦时用 `GetCursorPos` 换算主客户区）会把位置补回来，
+  所以主窗口/弹出窗口之间来回移动不会让 hover 抖动。`WM_SETCURSOR` 固定箭头。
+- **只在「活的网页视图真的可见」时启用路由**：`ui_tick()` 用
+  `browser_ && browser_->visible() && !export_mode_ && app_activated_ && !IsIconic(hwnd_)` 判定。
+  其余状态（首页表单、Native 内容、设置/串流的让位、导出页、窗口最小化或应用在后台）不路由，
+  同一个 ImGui 窗口照旧画在主 swapchain 里——网页视图以外零行为变化。
+- Player 用两个实例：`fav_popup_`（地址栏收藏下拉 `##sumu_favorites`）与 `tooltip_popup_`
+  （当帧绘制过的 ImGui tooltip 窗口 `##Tooltip_%02d`，按名字前缀查找）。`close()` 在 present
+  线程 join 之后、`ui_shutdown()` 之前 `release()`（快照用 ImGui 分配器释放，swapchain/HWND
+  一并销毁）。
+
+**地址栏收藏（favorites）**：星标作用于**已提交**的页面 URL——Web 内容取
+`BrowserView::page_url()`，Native 内容取该会话被打开时的 URL（地址栏显示的那个），首页/加载中
+没有可收藏对象；从不使用地址栏里尚未提交的输入。点击星标即本地乐观增删并记录
+`favorite_add_url/favorite_add_title/favorite_remove_url` intent，Python 把变更写进 settings 后
+用 `set_browser_favorites()` 整体回推（Python 是唯一事实来源）；URL 相等 = 二者都过
+`normalize_url_text()` 后逐字符相等。条目标题取 `ICoreWebView2::DocumentTitleChanged`
+（`BrowserView::page_title()`，导航开始时清空），空标题回退为 URL。下拉在地址栏输入框取得
+焦点时打开（≥1 条才开），行点击 = 把 URL 填进输入框并走 `browser_submit()`，行尾 X = 删除并
+保持展开，Esc / Enter / 点击框与下拉之外 / 导航 / 离开页面都会关闭；它用的是**粘性 open 标志**
+而不是每帧从输入框激活态推导——按下行/行尾 X 会让按钮取走 ActiveId，而点击在抬起时才生效。
+
+验证入口：`scripts/verify_browser_input.py`（真实鼠标：星标 intent、下拉是真实顶层窗口且
+**停在网页之上**（行内屏幕像素不等于网页底色）、点行导航、点 X 删除、Esc 关闭、hover 出
+tooltip）、`scripts/verify_browser.py`（页面链路回归）、`scripts/shot_browser.py`
+（`native/trace/browser_favorites.png` 目检）。
 
 ## 线程/锁模型（继承 Spike 2，新增 `decoder_mutex_`/`trace_mutex_`）
 

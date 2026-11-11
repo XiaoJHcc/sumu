@@ -281,6 +281,17 @@ def main():
     # persisted settings.
     player.set_stream_defaults(settings.stream_port, settings.stream_root,
                                settings.stream_no_token, settings.stream_token)
+    # Address-bar favorites (browser page): Python owns the list + its persistence, native only
+    # reports star / dropdown-X intents and re-renders whatever we push back. Guarded like
+    # i18n.apply_to_player's set_ui_strings so a sumu_core build without the favorites API still
+    # starts.
+    _set_browser_favorites = getattr(player, "set_browser_favorites", None)
+
+    def _push_favorites() -> None:
+        if callable(_set_browser_favorites):
+            _set_browser_favorites(list(settings.favorites))
+
+    _push_favorites()
     # fps_div is derived per open from target_fps + source_fps (not a global fixed skip).
 
     # Kick off model warmup in the background immediately -- the window is already up (Player's
@@ -943,6 +954,28 @@ def main():
                         and current_path == resume[0] and not player.is_playing()
                         and open_state is None):
                     player.play()
+
+            # Address-bar favorites: the native star / dropdown X only reports add/remove; the
+            # list, its display order (newest first) and its persistence live here. Adding an
+            # already-favorited url is a no-op -- the star is a toggle, so a duplicate click must
+            # neither reorder the list nor add a second row.
+            fav_add = intents.get("favorite_add_url") or ""
+            fav_remove = intents.get("favorite_remove_url") or ""
+            favorites_changed = False
+            if fav_add and not any(f.get("url") == fav_add for f in settings.favorites):
+                fav_title = intents.get("favorite_add_title")
+                settings.favorites.insert(0, {
+                    "url": fav_add,
+                    "title": fav_title if isinstance(fav_title, str) else "",
+                })
+                del settings.favorites[settings_mod.FAVORITES_CAP:]
+                favorites_changed = True
+            if fav_remove and any(f.get("url") == fav_remove for f in settings.favorites):
+                settings.favorites = [f for f in settings.favorites if f.get("url") != fav_remove]
+                favorites_changed = True
+            if favorites_changed:
+                settings_mod.save(settings)
+                _push_favorites()
 
             # Close-parking (native park_on_close routes X/ESC here instead of quitting):
             # tear down everything the finally block would EXCEPT player.close(), hide the

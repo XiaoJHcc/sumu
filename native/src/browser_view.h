@@ -85,6 +85,10 @@ public:
     // Latest URL the page view reported (SourceChanged / NavigationCompleted), UTF-8.
     const std::string& page_url() const { return page_url_; }
 
+    // Latest document title the page reported (DocumentTitleChanged), UTF-8; empty until the
+    // page sets one. The address bar's favorites list stores it as the display label.
+    const std::string& page_title() const { return page_title_; }
+
     // Page snapshot for the settings overlay (see docs/native_core.md): an async
     // CapturePreview() into memory, POLLED like the cookie result so no callback ever touches
     // the owner. Ready gives PNG bytes; Failed means the caller should fall back to the plain
@@ -217,6 +221,7 @@ private:
     bool visible_ = false;
 
     std::string page_url_;
+    std::string page_title_;
 
     // Media handover (see MediaNavigation): the top-level navigation in flight (`nav_url_` follows
     // its redirects, `nav_serial_` changes only for a new one), the one already handed over, and

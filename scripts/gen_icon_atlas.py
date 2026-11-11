@@ -54,6 +54,8 @@ ICONS = [
     "arrow-left",      # NavBack (browser page address bar)
     "arrow-right",     # NavForward
     "rotate-cw",       # Reload
+    "star",            # Star (address bar: not favorited)
+    "star-filled",     # StarFilled (address bar: favorited)
 ]
 
 ICON_PX = 96    # raster size of one glyph (lucide grid is 24 -> 4x, stroke = whole 10px)
@@ -65,9 +67,11 @@ STROKE_WIDTH = 2.5  # lucide default is 2; 2.5 reads better at our 14-28px draw 
 def render_icon(svg_path: Path) -> bytes:
     """Rasterize one lucide SVG to ICON_PX x ICON_PX RGBA (straight alpha, white strokes)."""
     svg = svg_path.read_text(encoding="utf-8")
-    # lucide strokes use currentColor; bake white so the native side can tint via ImGui.
+    # lucide strokes (and the filled variants' fill) use currentColor; bake white so the
+    # native side can tint via ImGui.
     # Also bake the design-system stroke width (upstream files stay untouched).
     svg = svg.replace('stroke="currentColor"', 'stroke="#ffffff"')
+    svg = svg.replace('fill="currentColor"', 'fill="#ffffff"')
     svg = svg.replace('stroke-width="2"', f'stroke-width="{STROKE_WIDTH}"')
     doc = pymupdf.open(stream=svg.encode("utf-8"), filetype="svg")
     try:

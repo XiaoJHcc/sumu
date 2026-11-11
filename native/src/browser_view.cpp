@@ -147,6 +147,7 @@ struct BrowserView::Impl {
     EventRegistrationToken tok_source{};
     EventRegistrationToken tok_nav_starting{};
     EventRegistrationToken tok_nav_completed{};
+    EventRegistrationToken tok_title{};
     EventRegistrationToken tok_response{};
     EventRegistrationToken tok_download{};
     EventRegistrationToken tok_new_window{};
@@ -433,6 +434,15 @@ void BrowserView::configure_webview(){
                 if (alive->load()) on_source_maybe_changed();
                 return S_OK;
             }).Get(), &impl_->tok_nav_completed);
+    // Document title: the address bar's favorites list uses it as the entry's label (the URL
+    // is the fallback). Recorded here, never acted upon.
+    impl_->webview->add_DocumentTitleChanged(
+        MakeHandler<ICoreWebView2DocumentTitleChangedEventHandler>(
+            [this, alive](ICoreWebView2* sender, IUnknown*) -> HRESULT {
+                if (!alive->load() || !sender) return S_OK;
+                page_title_ = take_com_string([&](LPWSTR* out) { return sender->get_DocumentTitle(out); });
+                return S_OK;
+            }).Get(), &impl_->tok_title);
 
     // Media handover (see browser_view.h). Both handlers only RECORD a candidate: the owner decides
     // and stops/opens from its own poll, so nothing here re-enters WebView2 or blocks it.
@@ -684,6 +694,9 @@ void BrowserView::on_source_maybe_changed(){
     CoTaskMemFree(raw);
     if (url.empty() || url == page_url_) return;
     page_url_ = std::move(url);
+    // A new document is loading: its predecessor's title must not be offered as this page's
+    // label. DocumentTitleChanged fills it again as soon as the page sets one.
+    page_title_.clear();
 }
 
 void BrowserView::navigate(const std::string& url){
@@ -1008,6 +1021,7 @@ void BrowserView::shutdown(){
             impl_->webview->remove_SourceChanged(impl_->tok_source);
             impl_->webview->remove_NavigationStarting(impl_->tok_nav_starting);
             impl_->webview->remove_NavigationCompleted(impl_->tok_nav_completed);
+            impl_->webview->remove_DocumentTitleChanged(impl_->tok_title);
             impl_->webview->remove_NewWindowRequested(impl_->tok_new_window);
             impl_->webview->remove_WebResourceRequested(impl_->tok_web_request);
             clear_web_filter();

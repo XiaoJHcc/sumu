@@ -441,15 +441,18 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
 //   Unavailable  WebView2 missing/failed -> one centered line
 //   Home         first-screen form (nothing loaded yet)
 //
-// Address bar: [back] [forward] [reload] [URL field] [go] [play]. A submitted http(s) URL is a
-// NAVIGATION -- the page view shows an ordinary web page immediately, with no probing and no
+// Address bar: [back] [forward] [reload] [URL field] [go] [play] [star]. A submitted http(s) URL
+// is a NAVIGATION -- the page view shows an ordinary web page immediately, with no probing and no
 // fallback. The play button is the explicit manual native entry: it hands the bar's URL to the
 // decoder (any container FFmpeg can demux, no extension gate), and a failure there is reported as
 // an open error instead of being re-routed to the page. The other way into Native is the page
 // view's own handover: when the navigation's document IS a video, the page switches to Native by
-// itself (BrowserView::MediaNavigation). Nothing here leaves the page implicitly: settings, the
-// web-stream modal, the file picker, the export overlay and a successful native open all keep it
-// alive.
+// itself (BrowserView::MediaNavigation). The star favorites the COMMITTED page URL; the dropdown
+// under the field lists the favorites (see build_favorites_dropdown). Tooltips and that dropdown
+// reach into the page area, where the WebView2 child window would cover them -- they are lifted
+// into the popup layers (popup_layer.h) while the live page view is up. Nothing here leaves the
+// page implicitly: settings, the web-stream modal, the file picker, the export overlay and a
+// successful native open all keep it alive.
 void Player::build_browser_page(){
     ImGuiIO& io = ImGui::GetIO();
     sync_browser_page();
@@ -561,7 +564,8 @@ void Player::build_browser_page(){
             if (r.clicked) browser_reload();
         }
         ImGui::SameLine();
-        const float right_w = 2.0f * (ctrl_w + pad);
+        // Three right-side buttons: go, play, star (the field takes the remaining width).
+        const float right_w = 3.0f * (ctrl_w + pad);
         float field_w = ImGui::GetContentRegionAvail().x - right_w;
         if (field_w < ui_s(80.0f)) field_w = ui_s(80.0f);
         UrlFieldResult field;
@@ -570,12 +574,24 @@ void Player::build_browser_page(){
             field_w, &browser_addr_focus_, &browser_addr_select_all_);
         browser_addr_active_ = field.active;
         browser_addr_ctx_open_ = field.ctx_open;
+        { // the favorites dropdown is pinned to the field's own rect
+            const ImVec2 fmin = ImGui::GetItemRectMin();
+            const ImVec2 fmax = ImGui::GetItemRectMax();
+            browser_addr_field_rect_[0] = fmin.x;
+            browser_addr_field_rect_[1] = fmin.y;
+            browser_addr_field_rect_[2] = fmax.x;
+            browser_addr_field_rect_[3] = fmax.y;
+        }
         ImGui::EndDisabled();
         ImGui::SameLine();
         { // go: navigate / open the address
             IconButtonResult r = icon_button("##browser_go", ImVec2(ctrl_w, ctrl_h),
                 ui::AppIcon::OpenUrl, busy);
             if (r.clicked) field.submit = true;
+            // Tooltip over the page view goes through the popup layer (see popup_layer.h):
+            // ImGui draws it in this swapchain, the layer lifts it above the page view.
+            if (ImGui::IsItemHovered() && !ui_str_.browser_go.empty())
+                ImGui::SetTooltip("%s", ui_str_.browser_go.c_str());
         }
         ImGui::SameLine();
         { // native play: hands the URL in the bar to the decoder (no extension/container gate)
@@ -583,10 +599,27 @@ void Player::build_browser_page(){
             IconButtonResult r = icon_button("##browser_play", ImVec2(ctrl_w, ctrl_h),
                 ui::AppIcon::Play, disabled);
             if (r.clicked) browser_play_native();
+            if (ImGui::IsItemHovered() && !ui_str_.browser_play.empty())
+                ImGui::SetTooltip("%s", ui_str_.browser_play.c_str());
+        }
+        ImGui::SameLine();
+        { // star: favorite / unfavorite the COMMITTED page URL (never the unsubmitted text)
+            const std::string committed = browser_committed_url();
+            const bool favorited = browser_favorited(committed);
+            const bool disabled = busy || committed.empty();
+            IconButtonResult r = icon_button("##browser_star", ImVec2(ctrl_w, ctrl_h), disabled);
+            const ImU32 tint = disabled ? ui::theme::icon_color_dim_u32()
+                : (favorited ? ui::theme::accent_u32() : ui::theme::icon_color_u32());
+            ui::DrawIconButtonGlyph(r, favorited ? ui::AppIcon::StarFilled : ui::AppIcon::Star,
+                tint);
+            if (r.clicked && !disabled) browser_toggle_favorite();
         }
         ImGui::End();
         ImGui::PopStyleVar(2);
-        if (field.submit || field.submit_paste) browser_submit(browser_addr_buf_);
+        if (field.submit || field.submit_paste) {
+            fav_dropdown_open_ = false; // Enter / submit is one of the dropdown's close conditions
+            browser_submit(browser_addr_buf_);
+        }
     }
 
     // Failure of a native open: on Home the form shows the line itself; on Web/Native it is a
@@ -809,6 +842,12 @@ void Player::build_browser_page(){
         build_settings_panel(top_bar_h + (addr_visible ? addr_h : 0.0f));
     build_stream_popup();
 
+    // ---- favorites dropdown --------------------------------------------------------------
+    // Built last so it sits above the page content and the chrome in the main swapchain (where
+    // the page view is not up, this is the only way it is drawn); while the live page view IS up
+    // the popup layer lifts it into its own window instead.
+    build_favorites_dropdown();
+
     // ---- page view placement -------------------------------------------------------------
     // The child window covers exactly the page area, below the chrome strips, and only when the
     // page itself is what should be visible: not loading, not native, not covered by an overlay,
@@ -825,6 +864,137 @@ void Player::build_browser_page(){
             static_cast<int>(io.DisplaySize.x), static_cast<int>(page_h));
         browser_->set_visible(web_visible);
     }
+}
+
+// ---- address-bar favorites dropdown ---------------------------------------------------------
+// Rows under the URL field: one line each -- title (the entry's label, URL when the page never
+// reported one) truncated with an ellipsis, the URL in secondary text when it still fits, and an
+// X at the row's right edge. Clicking a row puts its URL in the field and navigates through the
+// address bar's own submit path; the X removes that favorite and keeps the list open.
+//
+// Visibility is a STICKY flag (Player::fav_dropdown_open_): pressing a row/X makes that button
+// the ActiveId and deactivates the InputText on PRESS, while the click itself fires on RELEASE,
+// so a "derived from the field's active state" test would close the list in the very frame the
+// user clicks a row. It opens when the field takes the caret and then stays open while the field
+// is active or the list itself is hovered.
+void Player::build_favorites_dropdown(){
+    const bool field_active = browser_addr_active_ && browser_addr_visible_;
+    const bool can_open = browser_addr_visible_ && !open_url_loading_ &&
+        !browser_favorites_.empty();
+    if (can_open && field_active && !fav_field_was_active_) fav_dropdown_open_ = true;
+    fav_field_was_active_ = field_active;
+    if (!fav_dropdown_open_) return;
+    if (!can_open) {
+        fav_dropdown_open_ = false;
+        return;
+    }
+
+    constexpr int kMaxVisibleRows = 8;
+    const float row_h = ui_s(ui::theme::kControlHeight);
+    const float pad = ui_s(ui::theme::kSpaceS);
+    const float x_w = row_h; // square hit area for the row's X
+    const int rows = static_cast<int>(browser_favorites_.size());
+    const int visible_rows = std::min(rows, kMaxVisibleRows);
+    const float field_x0 = browser_addr_field_rect_[0];
+    const float w = std::max(ui_s(120.0f), browser_addr_field_rect_[2] - field_x0);
+
+    ImGui::SetNextWindowPos(ImVec2(field_x0, browser_addr_field_rect_[3] + ui_s(2.0f)));
+    ImGui::SetNextWindowSize(ImVec2(w, static_cast<float>(visible_rows) * row_h + 2.0f * pad));
+    // No NoBringToFrontOnFocus: the list must come to the front when it is clicked. It is built
+    // after the page content (see build_browser_page), so it also starts above the address bar.
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing;
+    const ImVec2 win_pad(pad, pad);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, win_pad);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_s(ui::theme::kRadiusWindow));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f); // border self-drawn below
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::theme::kPanelBg);
+    ImGui::Begin("##sumu_favorites", nullptr, flags);
+
+    { // hairline outline, same floating-surface language as the modal / URL context menu
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetWindowPos();
+        const ImVec2 p1(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
+        dl->AddRect(ImVec2(p0.x + 0.5f, p0.y + 0.5f), ImVec2(p1.x - 0.5f, p1.y - 0.5f),
+            ui::theme::border_u32(), ui_s(ui::theme::kRadiusWindow), 0, 1.0f);
+    }
+
+    std::string navigate_url;
+    std::string remove_url;
+    const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem |
+        ImGuiHoveredFlags_ChildWindows);
+    // The scroll region paints its own ChildBg (the theme's list standard, kWindowBg) at Begin;
+    // the dropdown is one panel surface, so it takes the panel tone the window and the popup's
+    // backdrop already use.
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::theme::kPanelBg);
+    ImGui::BeginChild("##fav_rows", ImVec2(0.0f, static_cast<float>(visible_rows) * row_h));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float text_pad = ui_s(ui::theme::kSpaceM);
+    for (int i = 0; i < rows; ++i) {
+        const BrowserFavorite& fav = browser_favorites_[i];
+        ImGui::PushID(i);
+        const ImVec2 row_pos = ImGui::GetCursorScreenPos();
+        const float row_w = ImGui::GetContentRegionAvail().x;
+        const bool row_clicked = ImGui::InvisibleButton("##row", ImVec2(row_w - x_w, row_h));
+        const bool row_hovered = ImGui::IsItemHovered();
+        if (row_hovered) // the wash spans the whole row, the X included
+            dl->AddRectFilled(row_pos, ImVec2(row_pos.x + row_w, row_pos.y + row_h),
+                ui::theme::hover_fill_u32(), ui_s(ui::theme::kRadiusControl));
+        const float th = ImGui::GetTextLineHeight();
+        const float ty = row_pos.y + (row_h - th) * 0.5f;
+        const float text_w = row_w - x_w - 2.0f * text_pad;
+        const ImVec2 title_sz = ImGui::CalcTextSize(fav.title.c_str());
+        const ImVec2 url_sz = ImGui::CalcTextSize(fav.url.c_str());
+        const float gap = ui_s(ui::theme::kSpaceM);
+        const bool show_url = fav.title != fav.url; // an untitled entry's label already is its URL
+        if (show_url && title_sz.x + gap + url_sz.x <= text_w) { // label + URL on one line
+            dl->AddText(ImVec2(row_pos.x + text_pad, ty), ui::theme::text_u32(),
+                fav.title.c_str());
+            dl->AddText(ImVec2(row_pos.x + text_pad + title_sz.x + gap, ty),
+                ui::theme::text_secondary_u32(), fav.url.c_str());
+        } else {
+            const float text_x1 = row_pos.x + text_pad + text_w;
+            ImGui::RenderTextEllipsis(dl, ImVec2(row_pos.x + text_pad, ty),
+                ImVec2(text_x1, ty + th), text_x1, fav.title.c_str(), nullptr, &title_sz);
+        }
+        ImGui::SameLine(0.0f, 0.0f);
+        ui::IconButtonResult xr{};
+        xr.clicked = ImGui::InvisibleButton("##del", ImVec2(x_w, row_h));
+        xr.min = ImGui::GetItemRectMin();
+        xr.max = ImGui::GetItemRectMax();
+        xr.dl = ImGui::GetWindowDrawList();
+        const bool x_hovered = ImGui::IsItemHovered();
+        ui::DrawIconButtonGlyph(xr, ui::AppIcon::Close,
+            x_hovered ? ui::theme::error_u32() : ui::theme::text_secondary_u32());
+        if (row_clicked) navigate_url = fav.url;
+        if (xr.clicked) remove_url = fav.url; // keeps the list open
+        ImGui::PopID();
+    }
+    ImGui::PopStyleVar(); // ItemSpacing
+    ImGui::EndChild();
+    ImGui::PopStyleColor(); // ChildBg
+    ImGui::End();
+    ImGui::PopStyleColor(); // WindowBg
+    ImGui::PopStyleVar(3);
+
+    if (!navigate_url.empty()) {
+        const size_t n = std::min(navigate_url.size(), sizeof(browser_addr_buf_) - 1);
+        std::memcpy(browser_addr_buf_, navigate_url.c_str(), n);
+        browser_addr_buf_[n] = '\0';
+        fav_dropdown_open_ = false;
+        browser_submit(navigate_url);
+        return;
+    }
+    if (!remove_url.empty()) {
+        browser_remove_favorite(remove_url);
+        return;
+    }
+    // Any click outside the field and the list closes it (Esc/submit/leaving the page are handled
+    // by their own paths); a list nobody is interacting with does not linger.
+    if (!field_active && !hovered) fav_dropdown_open_ = false;
 }
 
 // Web-stream server modal (Phase 2): port + video-root folder + 启动/停止. Chrome is the

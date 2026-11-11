@@ -247,7 +247,9 @@ enum class ControlSize { Regular, Small };
   Play / Pause / Volume / VolumeMute（底栏播放与静音，播放键图标随状态切换，
   语义与顶栏一致：32px 按钮、7/16 glyph、2px 边距）+ Trash / FolderInput（导出页：
   预设删除、队列项删除（X 复用 Close）、路径选择文件夹，按钮统一为行高方块，
-  删除类平时 `kIconColorDim`、hover `kError`，走 `DrawIconButtonGlyph`）。
+  删除类平时 `kIconColorDim`、hover `kError`，走 `DrawIconButtonGlyph`）+
+  NavBack / NavForward / Reload（浏览器页地址栏）+ Star / StarFilled（地址栏收藏：
+  未收藏画描边星、已收藏画实心星并用 `kAccent` 着色）。
 
 ### BeginCard / EndCard（卡片容器）
 
@@ -301,14 +303,20 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
    `kPanelBg` + 下边缘 `kBorder` 发丝线）。**Native 内容下它是悬浮 chrome**：只在光标进入
    标题栏下缘向下延伸窗口高度 15% 的 reveal 区（标题栏自身也在命中范围内；比例与底部时间条
    共用 `kChromeRevealFraction`；全屏时仍按固定标题栏高度计算，显隐不改变边界）或地址输入正在使用时出现，隐藏时不占布局、不移动视频 viewport；
-   Web/Home/Loading 等状态它仍常驻。地址栏按钮不显示 tooltip，避免被 WebView2 子窗口遮挡。
+   Web/Home/Loading 等状态它仍常驻。按钮 tooltip 与地址栏收藏下拉都通过**弹出层**
+   （`native/src/popup_layer.*`）绘制，因此可以出现在网页之上（见下节）。
    控件行 32px 高、按 `kSpaceXS` 内缩，从左到右：
    **后退**（arrow-left）· **前进**（arrow-right）· **刷新**（rotate-cw）· URL 输入框
-   （占满剩余宽）· 访问（OpenUrl）· 播放（Play）。**没有「关闭网页」X**（已删除：页面内唯一的
+   （占满剩余宽）· 访问（OpenUrl）· 播放（Play）· **收藏星标**（star / star-filled）。
+   **没有「关闭网页」X**（已删除：页面内唯一的
    退出口是首屏表单的 Cancel），也没有标签页、书签、历史面板；历史按钮按引擎真实可用状态
    启用（无历史时禁用），刷新在 Native 内容下禁用（重载会丢掉当前会话认证用的地址）、在
    Home（没有已加载页面）时也禁用。播放按钮与「访问」的区别是语义而非样式：访问 = 交给
    WebView2 导航，播放 = 把地址栏当前 URL 交给原生解码器（`.flv`/带 query/无后缀都照收）。
+   星标作用于**已提交**的页面 URL（Web = 页视图当前 URL，Native = 会话打开时的 URL），没有
+   可收藏对象（首页/加载中）时禁用；未收藏是普通图标色描边星，已收藏是主题 accent 色实心星，
+   点击即增删收藏。访问与播放各有 tooltip（`browser_go` / `browser_play`），星标不带
+   tooltip（无新文案）。
 3. **页面内容**（`Player::browser_content_kind()`，优先级从高到低，五种互斥形态）：
    - **Loading**：原生 open 进行中，`ui::Spinner` + Cancel（走 `cancel_open_url()`）。
    - **Native**：播放中的会话就是页面内容——视频用普通播放的 viewport（只扣标题栏，
@@ -321,17 +329,40 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
 **布局铁律**：网页本体是**真实子窗口**，ImGui 画在它下面的一切都看不见。因此标题栏/
 地址栏必须排在它的矩形之上；Loading / Home / Unavailable 出现时、以及设置面板与 Web
 串流模态框打开期间、导出页接管窗口期间，子窗口一律 `set_visible(false)`（同时静音），
-关闭后恢复同一页面。open 失败提示是地址栏正下方一条独立的错误行窗口（Web/Native 下
-页面整体/网页上沿下移它的高度）。
+关闭后恢复同一页面。唯一能越过这条限制的是**弹出层**（`native/src/popup_layer.*`）：
+地址栏收藏下拉与地址栏按钮 tooltip 在活网页视图可见时被路由到它们自己的 owned 顶层窗口，
+因此可以浮到网页之上——它们仍按主客户区坐标布局，写法与其它 ImGui 窗口完全一样。
+open 失败提示是地址栏正下方一条独立的错误行窗口（Web/Native 下页面整体/网页上沿下移它的
+高度）。
 
-**页面只由自己关闭**：地址栏 Close 或首屏 Cancel 是唯一的出口（也是唯一会产生
-`browser_exit` 的地方）。原生打开成功、设置、打开文件、Web 串流、导出都**不**离开本页；
+**页面只由自己关闭**：首屏 Cancel 是唯一的出口（也是唯一会产生 `browser_exit` 的地方）。
+原生打开成功、设置、打开文件、Web 串流、导出都**不**离开本页；
 导出是独占覆盖层，退出后回到仍在的同一页。
 
 **不离开页面的覆盖层**：设置面板从 `top_bar + addr_bar`（地址栏隐藏时从 `top_bar`）开始画在
 页面内，且**画在网页快照底图之上**——打开设置时先 `CapturePreview` 抓一张当前网页 PNG 作
 底图，再隐藏活视图、把面板叠上去，页面本身不重建；抓图未就绪时网页保持可见、面板晚一帧，
 失败则退回「隐藏活视图」的旧表现。Web 串流模态框仍是让位（隐藏+静音）行为，关闭即恢复。
+
+### 地址栏收藏下拉（弹出层）
+
+地址栏输入框获得键盘焦点且收藏列表非空时，输入框正下方弹出收藏列表；保持输入框左边缘与
+宽度。**它是弹出层**（`native/src/popup_layer.*`）：一套 ImGui 窗口 + 一个被 Player 拥有的
+顶层窗口，只有活网页视图真的可见时才把该窗口的 draw list 摘进弹出窗口渲染，因此在网页之上
+看得见；其余状态照旧画在主 swapchain 里、位于地址栏与其他窗口之上。
+
+- 行高 = `kControlHeight`（32px），**最多 8 行**可见，之后在列表内滚动（细滚动条）。
+- 每行一行文字：标题（页面 `document.title`，空则用 URL，此时 URL 只显示这一次）超宽**省略号截断**；标题 + URL
+  在单行内放得下时，URL 以 `kTextSecondary` 逐字跟在后面；行尾固定一个 X（`AppIcon::Close`，
+  平时次级色、hover `kError`），命中区为该行宽度的方形块。
+- 容器 = `kPanelBg` + `kRadiusWindow` 圆角 + 1px `kBorder` 发丝描边（与地址栏右键菜单、
+  模态框同一套浮动面语言）；行 hover 用 `kHoverFill` + `kRadiusControl`。
+- 交互：点行 = 把该 URL 填进输入框并导航（走地址栏提交路径）；点 X = 删除该收藏且列表
+  保持展开；Esc / 回车（提交）/ 点击输入框与列表之外 / 导航 / 离开页面都关闭。
+  **不**做过滤、**不**做键盘行导航、不放任何说明文字。
+- 可见性用**粘性标志**（`Player::fav_dropdown_open_`），不每帧从输入框激活态推导：按下行/X
+  会让按钮取走 ActiveId 并在按下那一刻让 InputText 失焦，而点击在抬起时才生效，若每帧推导
+  就会在用户点行的那一帧把列表关掉。开：输入框刚取到焦点；保持：输入框仍激活或列表被 hover。
 
 **两个输入框**：地址栏与首屏表单各持独立 buffer + 独立 ImGui id，共用
 `Player::url_field()`（输入框 + 右键菜单）。不共享同一个 buffer —— 同一段文本被两个
@@ -344,7 +375,7 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
 `Player::poll_page_view_border()` 接管（见 `docs/native_core.md`），不能靠给网页留
 padding 绕过。
 
-改动本页后跑 `scripts/shot_browser.py` 目检六张图（首屏表单 / 真实网页 / 播放按钮 /
+改动本页后跑 `scripts/shot_browser.py` 目检七张图（首屏表单 / 真实网页 / 收藏下拉 / 播放按钮 /
 Native 内容（bar 露出）/ Native 内容（bar 隐藏）/ 设置叠在页面快照上），功能链路与真实输入
 分别由 `scripts/verify_browser.py`、`scripts/verify_browser_input.py` 断言。
 
@@ -428,7 +459,8 @@ Native 内容（bar 露出）/ Native 内容（bar 隐藏）/ 设置叠在页面
 检查：滚动条条数、垂直居中、label 列对齐、四边 12px 边距。
 
 改了浏览器页/地址栏布局后跑 `scripts/shot_browser.py`（`native/trace/browser_home.png`
-`browser_page.png` `browser_play.png` `browser_native.png`）：检查标题栏与地址栏是否
-拼成一条连续 chrome、地址栏七个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于
+`browser_page.png` `browser_favorites.png` `browser_play.png` `browser_native.png`
+`browser_native_bottom.png` `browser_settings.png`）：检查标题栏与地址栏是否
+拼成一条连续 chrome、地址栏八个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于
 地址栏下沿（不遮挡任何自绘 chrome）、首屏表单是否居中、Native 内容下视频是否从地址栏
-下沿开始且底栏可见。
+下沿开始且底栏可见、收藏下拉是否对齐输入框左右边缘且浮在网页之上（行距、省略号、行尾 X 列）。

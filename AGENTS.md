@@ -17,7 +17,7 @@ sumu（澄む）是一个**时钟驱动、全程 GPU** 的实时去马赛克预�
 
 - **呈现**：原生 **D3D11 flip-model swapchain**（DWM 原生、免撕裂）。present loop 跑原生线程，不吃 GIL。
 - **宿主**：极简 **Win32 窗口**，UI 覆盖层走 **Dear ImGui**（进度条 / scrub 缩略图 / 窗口 chrome / 设置旋钮 / 导出页 / 流媒体模态框）。
-- **网页**：URL 页内嵌 **WebView2**（系统 Evergreen Runtime，windowed child window 只覆盖地址栏以下；SDK 仅构建期，静态 loader，包内无 WebView2 DLL）。地址栏常驻（后退/前进/刷新/URL/访问/播放，无关闭 X——页面内唯一退出口是首屏 Cancel），页面内容在 Home/Web/Loading/Native/Unavailable 间切换。**地址栏提交先导航**：普通网页从确认那刻起由 WebView2 渲染，不依赖 FFmpeg 探测；点击链接或提交地址后的顶层导航响应若确认为视频流，则自动带上请求上下文与 CookieManager 的 cookie 进入原生播放，保留 query/percent 转义及重定向后的 URL，并取消对应的浏览器媒体下载。网页内嵌 `<video>`、iframe、fetch 等子资源不会触发接管；HTML/失败响应不得仅凭视频后缀切 Native。地址栏右侧**播放按钮**仍是手动入口，把它当前持有的 URL（带 query/percent 转义/`.flv`/无后缀一律照收，不设扩展名门槛）连同页面 Referer 与 CookieManager 的 cookie 直接交给 FFmpeg，失败按普通打开错误报告、不回退网页；成功后是**页内的 Native 内容**（地址栏转为悬浮 chrome，仅顶部 reveal 区/正在输入时出现，不占布局）。设置面板叠在 CapturePreview 抓取的网页快照之上（系统 WIC 解码，`windowscodecs`）。
+- **网页**：URL 页内嵌 **WebView2**（系统 Evergreen Runtime，windowed child window 只覆盖地址栏以下；SDK 仅构建期，静态 loader，包内无 WebView2 DLL）。地址栏常驻（后退/前进/刷新/URL/访问/播放/收藏星标，无关闭 X——页面内唯一退出口是首屏 Cancel；星标收藏**已提交**的页面 URL，下拉列表用它自己的顶层弹出窗口画在网页之上），页面内容在 Home/Web/Loading/Native/Unavailable 间切换。**地址栏提交先导航**：普通网页从确认那刻起由 WebView2 渲染，不依赖 FFmpeg 探测；点击链接或提交地址后的顶层导航响应若确认为视频流，则自动带上请求上下文与 CookieManager 的 cookie 进入原生播放，保留 query/percent 转义及重定向后的 URL，并取消对应的浏览器媒体下载。网页内嵌 `<video>`、iframe、fetch 等子资源不会触发接管；HTML/失败响应不得仅凭视频后缀切 Native。地址栏右侧**播放按钮**仍是手动入口，把它当前持有的 URL（带 query/percent 转义/`.flv`/无后缀一律照收，不设扩展名门槛）连同页面 Referer 与 CookieManager 的 cookie 直接交给 FFmpeg，失败按普通打开错误报告、不回退网页；成功后是**页内的 Native 内容**（地址栏转为悬浮 chrome，仅顶部 reveal 区/正在输入时出现，不占布局）。设置面板叠在 CapturePreview 抓取的网页快照之上（系统 WIC 解码，`windowscodecs`）。网页视图是真实子窗口、会盖住主 swapchain，因此**弹出层**（`native/src/popup_layer.*`）把地址栏收藏下拉与地址栏按钮 tooltip 画进自己的 owned 顶层窗口（同一个 ImGui context，present 线程 `Present(0,0)`），只在活网页视图可见时启用路由。
 - **语言**：**C++（VS2022 BuildTools）+ pybind11**，原生内核编译为模块 `sumu_core`（类 `Player`）暴露给 Python。
 - **解码**：基线走 **D3D11 硬解**（FFmpeg d3d11va）→ NV12 纹理 → shader → present，**基线不碰 CUDA**；AI 路径 NVDEC → torch，靠 **D3D11↔CUDA 零拷贝互操作**接起来。
 - **音频**：WASAPI，以 QPC 主时钟为准的**纯附加从属时钟**，不扰动 present 节奏。
@@ -49,7 +49,7 @@ python/sumu/             Python 侧编排
   app.py                 日常入口 main()：窗口 + 事件循环 + 后台模型预热 + 单实例/关窗驻留 + 导出/流媒体 UI 消费
   pipeline.py            build_models（dev 与 frozen 共用）
   scheduler.py           AI 调度：frontier gate / clip 化 / frame_cache / seek 重置
-  settings.py            持久化（音量/最近文件/进度续播/旋钮/语言）——纯 stdlib
+  settings.py            持久化（音量/最近文件/进度续播/旋钮/语言/浏览器收藏）——纯 stdlib
   i18n.py + locales/     UI 多语言（zh-CN / en / ja）
   single_instance.py     Windows 命名管道单实例转发
   ai/                    照搬自 lada 的 AI 核心（YOLO 检测、BasicVSR++、TRT 子引擎、blend-back）
@@ -92,7 +92,7 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `scripts\run_player.py [video] --seconds N [--seek-test] [--correctness]` | 端到端冒烟：接 Player+Scheduler，打印 ai_hit_rate / present；`--correctness` 用 PyAV CPU 解码交叉校验 RGBA 通道序与「马赛克确实被改」 |
 | `verify_i18n.py` / `verify_settings.py` / `verify_weights_resolve.py` | 无 GPU 快速检查：文案键对齐 / 设置往返与原子写 / 权重目录解析 |
 | `scripts/verify_browser.py` | 浏览器页 e2e：真实 WebView2 加载本地页面；断言普通网页导航不触发原生 open、网页内媒体（`<video>` 与脚本 fetch）不会切 Native、顶层视频导航（带 query/percent 转义、无后缀、重定向和下载）及真实链接点击自动原生播放并传递 Cookie/Referer，HTML 伪视频后缀、失败响应与过时导航不接管；含 back/forward/reload、Native 内容与「开成功不关页」、设置（快照底图叠加，开启中导航则旧底图作废重抓）/文件选择/Web 串流/导出都不离开页面，以及「导航作废在飞的 cookie 查询」「Native 地址栏 reveal」 |
-| `scripts/verify_browser_input.py` | 浏览器页真实输入：点击网页后点击地址栏 Ctrl+A 输入并回车真导航（无原生 open）；真实点击后退/前进/刷新按钮，且最左槽位是后退而非已删除的关闭 X；真实点击播放按钮把地址栏 URL 交给原生 open（含把带 query 的 `.flv` 地址打字进去再点播放）；真实点击标题栏全屏键进出全屏、全屏下标题栏与地址栏同步隐藏/顶部唤起且 viewport 不动；网页显示时真实拖动左/右/下边缘改变窗口且页面视图 bounds 跟随，且「页内按下再拖到边缘」不得缩放 |
+| `scripts/verify_browser_input.py` | 浏览器页真实输入：点击网页后点击地址栏 Ctrl+A 输入并回车真导航（无原生 open）；真实点击后退/前进/刷新按钮，且最左槽位是后退而非已删除的关闭 X；真实点击收藏星标（intent）、点开收藏下拉（弹出层是真实顶层窗口，行内屏幕像素不是网页底色，证明它在网页之上）、点行导航、点行尾 X 删除、Esc 关闭、hover 出 tooltip；真实点击播放按钮把地址栏 URL 交给原生 open（含把带 query 的 `.flv` 地址打字进去再点播放）；真实点击标题栏全屏键进出全屏、全屏下标题栏与地址栏同步隐藏/顶部唤起且 viewport 不动；网页显示时真实拖动左/右/下边缘改变窗口且页面视图 bounds 跟随，且「页内按下再拖到边缘」不得缩放 |
 | `scripts\verify_video_formats.py` | GPU 色彩/格式归一化：BT.601/709、limited/full、10-bit、PQ/HLG、旋转/镜像；CUDA 输出对照公式与独立 FFmpeg，`--ai` 检查 AI 输入/呈现桥 |
 | `scripts\verify_playback_timeline.py` | VFR 时间网格与持帧内容、seek、fps_div、CFR/短视频、拼接 TS 防回退覆盖边界 |
 | `scripts\verify_network_recovery.py` | 本地 HTTP Range 主动断流/503 后恢复、真实 EOF 不重试、关窗打断挂起读取 |

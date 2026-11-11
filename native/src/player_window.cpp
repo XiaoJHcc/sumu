@@ -389,6 +389,18 @@ void Player::ui_render_drawdata(){
     dd.CmdLists.swap(ui_active_->cmd_lists); // give ownership back to the snapshot
 }
 
+// ---- present thread: popup layers (address-bar dropdown / tooltip over the page view) ------
+//
+// Called from draw_and_present()/draw_splash() right after ui_render_drawdata() and before the
+// main Present(1,0), while already holding d3d_mutex_. Each layer renders only its own routed
+// frame, only when something new was published, and presents with a zero sync interval -- so
+// this adds no vblank wait to the video present loop (DESIGN I10).
+void Player::ui_render_popups(){
+    if (!ui_ready_) return;
+    if (fav_popup_) fav_popup_->render(device_.Get(), context_.Get());
+    if (tooltip_popup_) tooltip_popup_->render(device_.Get(), context_.Get());
+}
+
 // Win11 DWM window chrome for the borderless (hollow-NC) client: system rounded corners
 // (~8px at 96 DPI via DWMWCP_ROUND) and a drop shadow. WS_THICKFRAME alone usually keeps
 // the shadow, but WM_NCCALCSIZE hollowing can drop it -- a 1px frame extension re-arms DWM
@@ -505,6 +517,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
+            // An open address-bar dropdown consumes ESC (it closes on it) -- quitting/parking the
+            // player while the user just wanted to dismiss a list would be a trap.
+            if (self && self->handle_escape()) return 0;
             // ESC quits regardless of ImGui's keyboard-capture state (unchanged M1/M2
             // behavior) -- an escape hatch that must never be swallowed by a focused widget.
             // Under park_on_close it takes the same close_request detour as WM_CLOSE above.
@@ -652,6 +667,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_ACTIVATEAPP:
+        // Losing activation (another app comes to the front) hides the popup layers: an owned
+        // top-level window would otherwise keep floating over whatever the user switched to.
+        if (self) self->on_app_activated(wp != 0);
+        break;
     case WM_DROPFILES: {
         // M-C2: file(s) dropped on the window. In export mode every dropped file is queued for
         // export (multi-file); otherwise the first file is opened (multi-file open out of scope).

@@ -7,6 +7,10 @@
 #   browser_page.png   a real WebView2 page at the local server, address bar synced to it
 #   browser_play.png   a page carrying a <video>: the address bar with its (always available)
 #                      play button -- the manual native entry for whatever URL the bar holds
+#   browser_favorites.png
+#                      the address-bar favorites dropdown open OVER the live page: it is drawn in
+#                      its own top-level popup window (native/src/popup_layer.cpp), above the
+#                      WebView2 child window that covers the main swapchain
 #   browser_native.png the page's Native content with the floating address bar revealed (cursor
 #                      in the top strip): the video is letterboxed below the bar
 #   browser_native_bottom.png
@@ -287,6 +291,38 @@ def main():
     user32.SetCursorPos(*park)
     run(p, 0.3)
     grab("browser_page.png")
+
+    # 2b. the favorites dropdown over the live page. It is a top-level window owned by the player
+    #     (popup_layer.h), so it composites ABOVE the WebView2 child -- this composited desktop
+    #     grab is exactly what the user sees. Eyeball: rows start under the field with its left
+    #     edge and width, one line per row (title + URL, or a truncated title), the X column at
+    #     the right, panel tone + hairline outline.
+    st = p.browser_state()
+    p.set_browser_favorites([
+        {"url": st["url"], "title": "sumu browser page"},
+        {"url": f"{base}/video", "title": "sumu video page whose title is long enough to be cut"},
+        {"url": f"{base}/noext", "title": ""},  # no title -> the URL is the label
+    ])
+    run(p, 0.3)
+    user32.GetWindowRect(hwnd, ctypes.byref(rc))
+    click(rc.left + int((rc.right - rc.left) * 0.45), rc.top + int(54 * SCALE))
+    run(p, 1.0)
+    st = p.browser_state()
+    pop = st["popups"]["favorites"]
+    check("favorites: dropdown open above the live page",
+          st["favorites_open"] and pop["visible"] and pop["frames"] > 0, f"{pop}")
+    # Park the cursor below the list (still inside the page) so no row shows its hover wash.
+    user32.SetCursorPos(rc.left + int((rc.right - rc.left) * 0.45),
+                        rc.top + int((rc.bottom - rc.top) * 0.75))
+    run(p, 0.4)
+    grab("browser_favorites.png")
+    user32.keybd_event(0x1B, 0, 0, 0)  # Esc closes the dropdown (it does not quit the player)
+    user32.keybd_event(0x1B, 0, 0x0002, 0)
+    run(p, 0.6)
+    check("favorites: Esc closed the dropdown",
+          not p.browser_state()["favorites_open"], f"{p.browser_state()['favorites_open']}")
+    p.set_browser_favorites([])
+    run(p, 0.2)
 
     # 3. a page with a <video>: it keeps playing inside the page (nothing switches to Native) and
     #    the address bar's play button stays available as the manual native entry

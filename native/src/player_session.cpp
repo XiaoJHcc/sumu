@@ -42,6 +42,12 @@ Player::Player(int width_hint, int height_hint, bool maximized){
     create_shader_pipeline();
     ui_init(); // present thread not started yet (starts below) -- no context contention
                // for this one-time ImGui/backend warmup.
+    // Popup layers (popup_layer.h): the address bar's favorites dropdown and the tooltips that
+    // must appear ABOVE the WebView2 page view. Created before the present thread starts.
+    fav_popup_ = std::make_unique<PopupLayer>();
+    fav_popup_->attach(hwnd_);
+    tooltip_popup_ = std::make_unique<PopupLayer>();
+    tooltip_popup_->attach(hwnd_);
     init_cuda_driver(); // device-independent-of-video-size CUDA setup only; landing
                          // texture + registration happen in open_session() once src dims
                          // are known.
@@ -553,6 +559,16 @@ void Player::close(){
 
     // Present thread (the only ImGui-touching thread) has now joined -- safe to tear down
     // ImGui's device objects/context before DestroyWindow below.
+    // Popup windows first: their snapshots are freed through ImGui's allocator (so before
+    // ui_shutdown) and their swapchains belong to the joined present thread.
+    if (fav_popup_) {
+        fav_popup_->release();
+        fav_popup_.reset();
+    }
+    if (tooltip_popup_) {
+        tooltip_popup_->release();
+        tooltip_popup_.reset();
+    }
     // The page view is closed FIRST: its child window and WebView2 process must be gone before
     // the parent HWND is destroyed, and its async callbacks are cancelled by the same call.
     if (browser_) {
@@ -1004,6 +1020,19 @@ void Player::ui_tick(){
     ImGui::Render();
 
     ImDrawData* dd = ImGui::GetDrawData();
+    // ---- popup layer routing ---------------------------------------------------------------
+    // The page view (WebView2) is a real child HWND, so it composites above everything ImGui
+    // draws into the main swapchain: an address-bar dropdown or a tooltip that reaches into the
+    // page area would be invisible. While the live page view is actually up, those two windows
+    // are routed OUT of this frame into their own owned top-level windows (popup_layer.h). In
+    // every other state (Home, Native content, export, page view stepped aside, window minimized
+    // or the app in the background) routing is off and both windows draw in the main swapchain
+    // exactly as before -- zero behavior change outside the live web view.
+    const bool route_popups = ui_ready_ && browser_ && browser_->visible() && !export_mode_ &&
+        app_activated_ && hwnd_ && !IsIconic(hwnd_);
+    if (fav_popup_) fav_popup_->route(route_popups ? dd : nullptr, "##sumu_favorites");
+    if (tooltip_popup_) tooltip_popup_->route(route_popups ? dd : nullptr,
+        route_popups ? PopupLayer::active_tooltip_name() : nullptr);
     auto snap = std::make_unique<UiDrawSnapshot>();
     snap->total_vtx = dd->TotalVtxCount;
     snap->total_idx = dd->TotalIdxCount;
@@ -1014,8 +1043,15 @@ void Player::ui_tick(){
     for (int i = 0; i < dd->CmdLists.Size; ++i)
         snap->cmd_lists[i] = dd->CmdLists[i]->CloneOutput();
 
-    std::lock_guard<std::mutex> lk(ui_mutex_);
-    ui_pending_ = std::move(snap); // O(1) pointer move, only moment ui_mutex_ is held here
+    {
+        std::lock_guard<std::mutex> lk(ui_mutex_);
+        ui_pending_ = std::move(snap); // O(1) pointer move, only moment ui_mutex_ is held here
+    }
+
+    // Apply the routing decision to the real windows: position them, and show each one only once
+    // the present thread has drawn a frame at its current size.
+    if (fav_popup_) fav_popup_->sync();
+    if (tooltip_popup_) tooltip_popup_->sync();
 }
 
 // ---- UI intent recording (M3): main-thread-only. Called from WndProc (keyboard, via
@@ -1046,6 +1082,8 @@ void Player::hide_window(){
     // Just hide. Do NOT idle present_loop() here -- see park_on_close_'s comment in
     // player.h for the device-removed/invalid-handle failure that caused.
     if (browser_) browser_->set_visible(false); // no page view floating over a hidden window
+    if (fav_popup_) fav_popup_->hide();         // nor a popup floating over a hidden window
+    if (tooltip_popup_) tooltip_popup_->hide();
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
 }
 
@@ -1057,6 +1095,16 @@ void Player::show_window(){
         // may be denied -- the taskbar button just flashes then, which is acceptable.
         SetForegroundWindow(hwnd_);
     }
+}
+
+// WM_ACTIVATEAPP. Only the popups care: while the app is in the background nothing may float
+// above the window the user switched to. ui_tick() also stops routing while inactive, so a
+// hidden layer stays hidden until the app comes back.
+void Player::on_app_activated(bool active){
+    app_activated_ = active;
+    if (active) return;
+    if (fav_popup_) fav_popup_->hide();
+    if (tooltip_popup_) tooltip_popup_->hide();
 }
 
 // Web-stream popup request (main-thread-only, see UiIntents header comment). The offline
@@ -1241,6 +1289,7 @@ void Player::exit_browser_page(){
     browser_home_focus_ = false;
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
+    fav_dropdown_open_ = false; // leaving the page closes the favorites dropdown
     if (browser_) {
         browser_->set_visible(false);
         browser_->cancel_cookies(); // a lookup for a page that is gone must not start an open
@@ -1609,6 +1658,9 @@ void Player::browser_submit(const std::string& raw){
     }
     open_url_show_error_ = false;
     open_url_show_load_error_ = false;
+    // Submitting the address is one of the dropdown's close conditions (Esc, Enter, a click
+    // outside the field+dropdown, a navigation, leaving the page).
+    fav_dropdown_open_ = false;
 
     // A navigation is the newest action: retire a play click / handover still waiting for its
     // cookie answer, so its late answer can never compete with what the user just asked for.
@@ -1701,6 +1753,104 @@ void Player::browser_reload(){
     browser_web_ = true;
 }
 
+// ---- address-bar favorites -----------------------------------------------------------------
+//
+// The list itself lives in Python's settings store; this side mirrors it for the star's state
+// and the dropdown's rows. A click applies the change locally first (so the star and the list
+// react in the frame the click lands) AND records an intent -- Python applies that to the store
+// and echoes the authoritative list back through set_browser_favorites().
+//
+// URL identity is exact string equality after normalize_url_text() (the same normalization the
+// address bar applies to submitted text), never a host or prefix match.
+void Player::set_browser_favorites(const py::list& favorites){
+    browser_favorites_.clear();
+    const py::ssize_t count = py::len(favorites);
+    for (py::ssize_t i = 0; i < count; ++i) {
+        py::handle item = favorites[i];
+        if (!py::isinstance<py::dict>(item)) continue;
+        py::dict entry = py::reinterpret_borrow<py::dict>(item);
+        BrowserFavorite fav;
+        try {
+            if (entry.contains("url")) fav.url = normalize_url_text(py::cast<std::string>(entry["url"]));
+            if (entry.contains("title")) fav.title = py::cast<std::string>(entry["title"]);
+        } catch (const py::cast_error&) {
+            continue; // a malformed entry is dropped, never fatal
+        }
+        if (fav.url.empty()) continue;
+        if (fav.title.empty()) fav.title = fav.url;
+        browser_favorites_.push_back(std::move(fav));
+    }
+}
+
+// The URL the star acts on: what the address bar stands for as a COMMITTED page, never the text
+// the user is still typing. On the Web content that is the page view's own URL; on the Native
+// content it is the URL the session was opened from (which is exactly what the bar displays).
+// Home / Loading / Unavailable have nothing committed.
+std::string Player::browser_committed_url() const {
+    if (!browser_page_) return std::string();
+    switch (browser_content_kind()) {
+    case 1: // Web
+        return browser_ ? normalize_url_text(browser_->page_url()) : std::string();
+    case 3: // Native
+        return normalize_url_text(browser_addr_submitted_);
+    default:
+        return std::string();
+    }
+}
+
+std::string Player::browser_committed_title() const {
+    const std::string url = browser_committed_url();
+    if (url.empty()) return url;
+    if (browser_content_kind() == 1 && browser_) {
+        const std::string title = normalize_url_text(browser_->page_title());
+        if (!title.empty()) return title;
+    }
+    return url; // a session URL has no document title: the URL is its label
+}
+
+bool Player::browser_favorited(const std::string& url) const {
+    if (url.empty()) return false;
+    for (const BrowserFavorite& fav : browser_favorites_)
+        if (fav.url == url) return true;
+    return false;
+}
+
+void Player::browser_toggle_favorite(){
+    const std::string url = browser_committed_url();
+    if (url.empty() || open_url_loading_) return; // nothing committed / busy: no-op (star disabled)
+    if (browser_favorited(url)) {
+        browser_remove_favorite(url);
+        return;
+    }
+    BrowserFavorite fav;
+    fav.url = url;
+    fav.title = browser_committed_title();
+    if (fav.title.empty()) fav.title = url;
+    browser_favorites_.insert(browser_favorites_.begin(), fav); // Python's order: newest first
+    ui_intents_.favorite_add_url = fav.url;
+    ui_intents_.favorite_add_title = fav.title;
+}
+
+void Player::browser_remove_favorite(const std::string& url){
+    if (url.empty()) return;
+    for (auto it = browser_favorites_.begin(); it != browser_favorites_.end(); ++it) {
+        if (it->url != url) continue;
+        browser_favorites_.erase(it);
+        ui_intents_.favorite_remove_url = url;
+        return;
+    }
+}
+
+// WndProc's ESC path (see its WM_KEYDOWN case): while the favorites dropdown is up, ESC closes
+// it instead of quitting/parking the player.
+bool Player::handle_escape(){
+    if (browser_page_ && fav_dropdown_open_) {
+        fav_dropdown_open_ = false;
+        return true;
+    }
+    return false;
+}
+
 py::dict Player::browser_state() const {
     py::dict d;
     const int kind = browser_content_kind();
@@ -1756,6 +1906,44 @@ py::dict Player::browser_state() const {
         browser_page_rect_[2], browser_page_rect_[3]);
     d["home_rect"] = py::make_tuple(browser_home_rect_[0], browser_home_rect_[1],
         browser_home_rect_[2], browser_home_rect_[3]);
+    // ---- address-bar favorites + popup layers (see popup_layer.h) ---------------------------
+    // "favorites" is the display order Python pushed; "favorited" is the star's state for the
+    // committed page URL; "favorites_open" is the dropdown's visibility.
+    py::list favs;
+    for (const BrowserFavorite& fav : browser_favorites_) favs.append(fav.url);
+    d["favorites"] = favs;
+    d["favorited"] = browser_favorited(browser_committed_url());
+    d["favorites_open"] = fav_dropdown_open_;
+    // Each popup layer is a real top-level owned window with its own swapchain: scripts use the
+    // hwnd/visible/rect trio to prove the dropdown and tooltips really do rise above the page
+    // view, and "frames" to know the present thread has drawn into it.
+    auto popup_dict = [](const PopupLayer* layer) {
+        py::dict p;
+        int client[4] = { 0, 0, 0, 0 };
+        int screen[4] = { 0, 0, 0, 0 };
+        if (layer) {
+            layer->client_rect(client);
+            layer->screen_rect(screen);
+        }
+        const unsigned long long hwnd_value = layer
+            ? static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(layer->hwnd())) : 0ull;
+        p["hwnd"] = py::int_(hwnd_value);
+        p["visible"] = layer && layer->visible();
+        p["routed"] = layer && layer->routed();
+        p["client_rect"] = py::make_tuple(client[0], client[1], client[2], client[3]);
+        p["screen_rect"] = py::make_tuple(screen[0], screen[1], screen[2], screen[3]);
+        p["frames"] = layer ? layer->rendered_frames() : 0ull;
+        return p;
+    };
+    py::dict popups;
+    popups["favorites"] = popup_dict(fav_popup_.get());
+    popups["tooltip"] = popup_dict(tooltip_popup_.get());
+    d["popups"] = popups;
+    // Last address-field rect the bar laid out (client coords: x, y, w, h). The dropdown is
+    // pinned to its left edge and width, so a script can compare the two exactly.
+    d["addr_field_rect"] = py::make_tuple(browser_addr_field_rect_[0], browser_addr_field_rect_[1],
+        browser_addr_field_rect_[2] - browser_addr_field_rect_[0],
+        browser_addr_field_rect_[3] - browser_addr_field_rect_[1]);
     return d;
 }
 
@@ -2046,6 +2234,11 @@ py::dict Player::take_ui_intents(){
     d["export_preset_suffix"] = ui_intents_.export_preset_suffix;
     d["export_set_default"] = ui_intents_.export_set_default;
     d["export_drop_paths"] = ui_intents_.export_drop_paths;
+    // Address-bar favorites ("" == nothing pending). Python owns the list in settings.json; it
+    // applies these and echoes the result back with set_browser_favorites().
+    d["favorite_add_url"] = ui_intents_.favorite_add_url;
+    d["favorite_add_title"] = ui_intents_.favorite_add_title;
+    d["favorite_remove_url"] = ui_intents_.favorite_remove_url;
     ui_intents_ = UiIntents{}; // drain
     return d;
 }
