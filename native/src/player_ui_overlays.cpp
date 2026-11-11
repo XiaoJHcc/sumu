@@ -443,7 +443,7 @@ Player::UrlFieldResult Player::url_field(const char* id, char* buf, size_t cap, 
 //   Unavailable  WebView2 missing/failed -> one centered line
 //   Home         first-screen form (nothing loaded yet)
 //
-// Address bar: [back] [forward] [reload] [URL field] [go] [play] [star]. A submitted http(s) URL
+// Address bar: [back] [forward] [reload] [URL field] [star] [play]. A submitted http(s) URL
 // is a NAVIGATION -- the page view shows an ordinary web page immediately, with no probing and no
 // fallback. The play button is the explicit manual native entry: it hands the bar's URL to the
 // decoder (any container FFmpeg can demux, no extension gate), and a failure there is reported as
@@ -548,8 +548,8 @@ void Player::build_browser_page(){
             if (r.clicked) browser_reload();
         }
         ImGui::SameLine();
-        // Three right-side buttons: go, play, star (the field takes the remaining width).
-        const float right_w = 3.0f * (ctrl_w + pad);
+        // Two right-side buttons: star, play (the field takes the remaining width).
+        const float right_w = 2.0f * (ctrl_w + pad);
         float field_w = ImGui::GetContentRegionAvail().x - right_w;
         if (field_w < ui_s(80.0f)) field_w = ui_s(80.0f);
         UrlFieldResult field;
@@ -568,35 +568,27 @@ void Player::build_browser_page(){
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        { // go: navigate / open the address
-            IconButtonResult r = icon_button("##browser_go", ImVec2(ctrl_w, ctrl_h),
-                ui::AppIcon::OpenUrl, busy);
-            if (r.clicked) field.submit = true;
-            // Tooltip over the page view goes through the popup layer (see popup_layer.h):
-            // ImGui draws it in this swapchain, the layer lifts it above the page view.
-            if (ImGui::IsItemHovered() && !ui_str_.browser_go.empty())
-                ImGui::SetTooltip("%s", ui_str_.browser_go.c_str());
-        }
-        ImGui::SameLine();
-        { // native play: hands the URL in the bar to the decoder (no extension/container gate)
-            const bool disabled = busy || browser_addr_text().empty() || browser_cookie_pending_;
-            IconButtonResult r = icon_button("##browser_play", ImVec2(ctrl_w, ctrl_h),
-                ui::AppIcon::Play, disabled);
-            if (r.clicked) browser_play_native();
-            if (ImGui::IsItemHovered() && !ui_str_.browser_play.empty())
-                ImGui::SetTooltip("%s", ui_str_.browser_play.c_str());
-        }
-        ImGui::SameLine();
         { // star: favorite / unfavorite the COMMITTED page URL (never the unsubmitted text)
             const std::string committed = browser_committed_url();
             const bool favorited = browser_favorited(committed);
             const bool disabled = busy || committed.empty();
             IconButtonResult r = icon_button("##browser_star", ImVec2(ctrl_w, ctrl_h), disabled);
             const ImU32 tint = disabled ? ui::theme::icon_color_dim_u32()
-                : (favorited ? ui::theme::accent_u32() : ui::theme::icon_color_u32());
-            ui::DrawIconButtonGlyph(r, favorited ? ui::AppIcon::StarFilled : ui::AppIcon::Star,
-                tint);
+                : (favorited ? ui::theme::warning_u32() : ui::theme::icon_color_u32());
+            ui::DrawIconButtonGlyph(r, ui::AppIcon::Star, tint);
             if (r.clicked && !disabled) browser_toggle_favorite();
+        }
+        ImGui::SameLine();
+        { // native play: hands the URL in the bar to the decoder (no extension/container gate)
+            const bool disabled = busy || browser_addr_text().empty() || browser_cookie_pending_;
+            IconButtonResult r = icon_button("##browser_play", ImVec2(ctrl_w, ctrl_h), disabled);
+            ui::DrawIconButtonGlyph(r, ui::AppIcon::Play,
+                disabled ? ui::theme::icon_color_dim_u32() : ui::theme::warning_u32());
+            if (r.clicked) browser_play_native();
+            // Tooltip over the page view goes through the popup layer (see popup_layer.h):
+            // ImGui draws it in this swapchain, the layer lifts it above the page view.
+            if (ImGui::IsItemHovered() && !ui_str_.browser_play.empty())
+                ImGui::SetTooltip("%s", ui_str_.browser_play.c_str());
         }
         ImGui::End();
         ImGui::PopStyleVar(2);

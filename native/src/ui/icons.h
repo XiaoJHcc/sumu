@@ -33,8 +33,8 @@ enum class AppIcon {
     WinRestore,    // copy
     Fullscreen,    // maximize
     Close,         // x
-    Play,          // play
-    Pause,         // pause
+    Play,          // play-filled
+    Pause,         // pause-filled
     Volume,        // volume-2
     VolumeMute,    // volume-x
     Trash,         // trash (export preset/queue delete)
@@ -45,7 +45,7 @@ enum class AppIcon {
     NavForward,    // arrow-right (browser page: forward)
     Reload,        // rotate-cw (browser page: reload)
     Star,          // star (address bar: page not favorited)
-    StarFilled,    // star-filled (address bar: page favorited; tinted with the accent)
+    StarFilled,    // star-filled (unused filled variant)
 };
 
 namespace icons {

@@ -171,6 +171,7 @@ void Player::build_top_bar(float& out_height){
         if (max_title_w < 0.0f) max_title_w = 0.0f;
         const std::string full_name = export_mode_ ? ui_str_.export_title : sumu_ui::basename_of(video_path_);
         const std::string shown = sumu_ui::elide_text_to_width(full_name, max_title_w);
+        caption_drag_x0_ = ImGui::GetCursorScreenPos().x;
         ImGui::TextUnformatted(shown.c_str());
         if (!full_name.empty() && shown != full_name && ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", full_name.c_str());
@@ -178,8 +179,8 @@ void Player::build_top_bar(float& out_height){
     ImGui::SameLine();
     ImGui::SetCursorPosY((bar_h - btn_h) * 0.5f);
 
-    // Blank draggable region (native-titlebar-like drag), sized to leave room for the
-    // four right-side buttons so it doesn't eat their clicks.
+    // The title text and the blank region after it form one draggable caption, sized to leave
+    // room for the four right-side buttons so it doesn't eat their clicks.
     const int n_btns = 4; // minimize, maximize/restore, fullscreen, close
     float drag_w = ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * n_btns;
     if (drag_w < 0.0f) drag_w = 0.0f;
@@ -189,11 +190,8 @@ void Player::build_top_bar(float& out_height){
     // here gives OS-native drag/double-click-maximize/Aero-Snap, so no synthetic
     // WM_NCLBUTTONDOWN SendMessage is needed (that used to leave ImGui's mouse-down state
     // stuck until an extra click).
-    {
-        ImVec2 dmin = ImGui::GetItemRectMin();
-        ImVec2 dmax = ImGui::GetItemRectMax();
-        caption_drag_x0_ = dmin.x; caption_drag_x1_ = dmax.x; caption_drag_y1_ = bar_h;
-    }
+    caption_drag_x1_ = ImGui::GetItemRectMax().x;
+    caption_drag_y1_ = bar_h;
     ImGui::SameLine();
 
     { // minimize

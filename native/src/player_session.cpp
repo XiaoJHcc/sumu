@@ -917,9 +917,9 @@ void Player::resize_window_for_video(){
 }
 
 // ---- borderless custom-caption support (WM_NCCALCSIZE/WM_NCHITTEST, see WndProc) --------
-// caption_drag_x0_/x1_/y1_ are published each frame by build_top_bar() from its
-// "##drag_region" InvisibleButton's item rect (client-space, since the top-bar ImGui window
-// sits at client (0,0)) and consumed here by WndProc's WM_NCHITTEST to report HTCAPTION over
+// caption_drag_x0_/x1_/y1_ are published each frame by build_top_bar(), spanning the title text
+// and its following "##drag_region" InvisibleButton (client-space, since the top-bar ImGui window
+// sits at client (0,0)). WndProc's WM_NCHITTEST consumes the rect to report HTCAPTION over
 // that region -- giving OS-native window drag/double-click-to-maximize/Aero-Snap without a
 // synthetic WM_NCLBUTTONDOWN SendMessage (which used to leave ImGui's mouse-down state stuck
 // until an extra click). Zero-initialized so before the first frame renders (x1_ <= x0_)
@@ -2034,7 +2034,6 @@ void Player::set_ui_strings(const py::dict& d){
     take("open_url_loading", ui_str_.open_url_loading);
     take("open_url_load_failed", ui_str_.open_url_load_failed);
     take("browser_unavailable", ui_str_.browser_unavailable);
-    take("browser_go", ui_str_.browser_go);
     take("browser_play", ui_str_.browser_play);
     take("input_cut", ui_str_.input_cut);
     take("input_copy", ui_str_.input_copy);

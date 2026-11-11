@@ -961,7 +961,6 @@ private:
         std::string open_url_load_failed;
         // Embedded browser page (address bar labels/tooltips + the unavailable placeholder).
         std::string browser_unavailable;
-        std::string browser_go;
         std::string browser_play;
         // URL field right-click context menu (Cut/Copy/Paste/Select All).
         std::string input_cut;

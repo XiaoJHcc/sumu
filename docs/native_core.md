@@ -66,7 +66,7 @@ p.pump_messages() / p.should_quit()   # Win32 消息泵，需在主线程周期�
 # ---- 浏览器页（URL 页 + WebView2 内嵌页）----
 p.request_open_url_popup()  # 进入浏览器页（首屏/顶栏入口；不再弹 modal），记录 browser_enter
 p.exit_browser_page()       # 退出浏览器页（隐藏子窗口），记录 browser_exit
-p.browser_navigate(url)     # 地址栏「访问」：先由 WebView2 导航，顶层视频响应自动原生播放
+p.browser_navigate(url)     # 地址栏回车导航：先由 WebView2 导航，顶层视频响应自动原生播放
 p.browser_go_back()         # 地址栏后退 / 前进 / 刷新（Native 下 back/forward 会退回 Web
 p.browser_go_forward()      # 并暂停原生播放；reload 在 Native 下是 no-op）
 p.browser_reload()

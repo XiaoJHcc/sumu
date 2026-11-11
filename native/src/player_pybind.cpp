@@ -40,7 +40,7 @@ PYBIND11_MODULE(sumu_core, m)
         .def("open_url_cancel_requested", &Player::open_url_cancel_requested) // loading-state Cancel
         .def("cancel_open_url", &Player::cancel_open_url) // URL page Cancel; scripted cancel tests use it too
         // Embedded browser page (URL bar + WebView2). request_open_url_popup() stays the entry
-        // point the UI uses; browser_navigate/browser_play_native are the address bar's Go and
+        // point the UI uses; browser_navigate/browser_play_native are the address bar's submit and
         // native-play actions, exposed so scripts/verify_browser.py drives the real code paths.
         .def("request_open_url_popup", &Player::request_open_url_popup)
         .def("exit_browser_page", &Player::exit_browser_page)

@@ -11,7 +11,6 @@
   "open_url_loading": "開いています…",
   "open_url_load_failed": "この URL を開けませんでした",
   "browser_unavailable": "ウェブページを表示できません（WebView2 ランタイムなし）",
-  "browser_go": "移動",
   "browser_play": "ネイティブ再生",
   "input_cut": "切り取り",
   "input_copy": "コピー",

@@ -11,7 +11,6 @@
   "open_url_loading": "Opening…",
   "open_url_load_failed": "Could not open this URL",
   "browser_unavailable": "Web pages unavailable (WebView2 Runtime missing)",
-  "browser_go": "Go",
   "browser_play": "Play natively",
   "input_cut": "Cut",
   "input_copy": "Copy",

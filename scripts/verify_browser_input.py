@@ -319,14 +319,14 @@ def addr_button_center(hwnd, index):
 
 def addr_right_button_center(hwnd, index_from_right):
     """Center of a right-side address-bar button, counted from the RIGHT edge of the bar
-    (0 star / 1 play / 2 go): the field takes the remaining width, so these are anchored to the
+    (0 play / 1 star): the field takes the remaining width, so these are anchored to the
     bar's right edge (2px inset + 32px button + 32px per step)."""
     s = user32.GetDpiForWindow(hwnd) / 96.0
     _, _, cw, _ = client_rect(hwnd)
     return cw - s * (2.0 + 16.0 + index_from_right * 34.0), s * (36.0 + 18.0)
 
 
-STAR_FROM_RIGHT, PLAY_FROM_RIGHT, GO_FROM_RIGHT = 0, 1, 2
+PLAY_FROM_RIGHT, STAR_FROM_RIGHT = 0, 1
 
 
 def screen_pixel(x, y):
@@ -880,12 +880,12 @@ def main():
     check("Esc with the dropdown open does not quit the player", not player.should_quit(),
           f"{player.should_quit()}")
 
-    # A real hover on the go button: its tooltip must also rise above the page view.
-    move_client(hwnd, *addr_right_button_center(hwnd, GO_FROM_RIGHT))
+    # A real hover on the play button: its tooltip must also rise above the page view.
+    move_client(hwnd, *addr_right_button_center(hwnd, PLAY_FROM_RIGHT))
     ok = pump(player, 4.0, lambda: player.browser_state()["popups"]["tooltip"]["visible"])
     state = player.browser_state()
     tip = state["popups"]["tooltip"]
-    check("hovering the go button shows its tooltip above the page view",
+    check("hovering the play button shows its tooltip above the page view",
           ok and tip["hwnd"], f"{tip}")
     if ok:
         tip_rect = tip["screen_rect"]

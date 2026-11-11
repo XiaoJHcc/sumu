@@ -43,8 +43,8 @@ ICONS = [
     "copy",            # WinRestore
     "maximize",        # Fullscreen
     "x",               # Close
-    "play",            # Play
-    "pause",           # Pause
+    "play-filled",     # Play
+    "pause-filled",    # Pause
     "volume-2",        # Volume
     "volume-x",        # VolumeMute
     "trash",           # Trash (export preset/queue delete)

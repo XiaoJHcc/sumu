@@ -85,7 +85,8 @@ UI 行为约束不变：所有 build_* 只**记录 intent**（`ui_intents_.*` / 
 
 - 高度 `kTopBarHBase = 36`（modal 标题条 `kModalTitleH` 同高）；图标按钮 32×32，
   四边等距 `kSpaceXS = 2`（边距、按钮间距、垂直居中全部读这一个刻度）。
-  底栏高度与标题栏一致（共用 `top_bar_h()`）。
+  底栏高度与标题栏一致（共用 `top_bar_h()`）。标题文字与其后空白区域统一报告
+  `HTCAPTION`，支持系统原生窗口拖拽、双击最大化和 Aero Snap；右侧窗口按钮不参与。
 
 ### 图标按钮（标准规格）
 
@@ -244,12 +245,12 @@ enum class ControlSize { Regular, Small };
   `ui::AppIcon` 枚举**同序**追加 → 重跑脚本 → 编译。
 - 当前枚举：Settings / OpenFile / OpenUrl / WebServer / Export / WinMinimize /
   WinMaximize / WinRestore / Fullscreen / Close（顶栏 9 个 + modal 关闭 X 共用）+
-  Play / Pause / Volume / VolumeMute（底栏播放与静音，播放键图标随状态切换，
-  语义与顶栏一致：32px 按钮、7/16 glyph、2px 边距）+ Trash / FolderInput（导出页：
+  Play / Pause / Volume / VolumeMute（底栏播放与静音，播放/暂停均使用实心变体，
+  播放键图标随状态切换，语义与顶栏一致：32px 按钮、7/16 glyph、2px 边距）+ Trash / FolderInput（导出页：
   预设删除、队列项删除（X 复用 Close）、路径选择文件夹，按钮统一为行高方块，
   删除类平时 `kIconColorDim`、hover `kError`，走 `DrawIconButtonGlyph`）+
-  NavBack / NavForward / Reload（浏览器页地址栏）+ Star / StarFilled（地址栏收藏：
-  未收藏画描边星、已收藏画实心星并用 `kAccent` 着色）。
+  NavBack / NavForward / Reload（浏览器页地址栏）+ Star / StarFilled（地址栏两种状态
+  均使用 Star 描边星；已收藏用 `kWarning` 着色，StarFilled 资源暂不使用）。
 
 ### BeginCard / EndCard（卡片容器）
 
@@ -307,16 +308,15 @@ Esc 与 X 都会 `CloseCurrentPopup` 并把 `*open` 置 false（需要清理表�
    都通过**弹出层**（`native/src/popup_layer.*`）绘制，因此可以出现在网页之上（见下节）。
    控件行 32px 高、按 `kSpaceXS` 内缩，从左到右：
    **后退**（arrow-left）· **前进**（arrow-right）· **刷新**（rotate-cw）· URL 输入框
-   （占满剩余宽）· 访问（OpenUrl）· 播放（Play）· **收藏星标**（star / star-filled）。
+   （占满剩余宽）· **收藏星标**（star）· 播放（Play）。
    **没有「关闭网页」X**（已删除：页面内唯一的
    退出口是首屏表单的 Cancel），也没有标签页、书签、历史面板；历史按钮按引擎真实可用状态
    启用（无历史时禁用），刷新在 Native 内容下禁用（重载会丢掉当前会话认证用的地址）、在
-   Home（没有已加载页面）时也禁用。播放按钮与「访问」的区别是语义而非样式：访问 = 交给
-   WebView2 导航，播放 = 把地址栏当前 URL 交给原生解码器（`.flv`/带 query/无后缀都照收）。
+   Home（没有已加载页面）时也禁用。回车把地址交给 WebView2 导航；播放使用 `kWarning`
+   黄色实心图标，点击把地址栏当前 URL 交给原生解码器（`.flv`/带 query/无后缀都照收）。
    星标作用于**已提交**的页面 URL（Web = 页视图当前 URL，Native = 会话打开时的 URL），没有
-   可收藏对象（首页/加载中）时禁用；未收藏是普通图标色描边星，已收藏是主题 accent 色实心星，
-   点击即增删收藏。访问与播放各有 tooltip（`browser_go` / `browser_play`），星标不带
-   tooltip（无新文案）。
+   可收藏对象（首页/加载中）时禁用；未收藏是普通图标色描边星，已收藏是 `kWarning` 黄色描边星，
+   点击即增删收藏。播放带 tooltip（`browser_play`），星标不带 tooltip（无新文案）。
 3. **页面内容**（`Player::browser_content_kind()`，优先级从高到低，五种互斥形态）：
    - **Loading**：原生 open 进行中，`ui::Spinner` + Cancel（走 `cancel_open_url()`）。
    - **Native**：播放中的会话就是页面内容——视频用普通播放的 viewport（只扣标题栏，
@@ -465,6 +465,6 @@ Native 内容（bar 露出）/ Native 内容（bar 隐藏）/ 设置浮在活网
 改了浏览器页/地址栏布局后跑 `scripts/shot_browser.py`（`native/trace/browser_home.png`
 `browser_page.png` `browser_favorites.png` `browser_play.png` `browser_native.png`
 `browser_native_bottom.png` `browser_settings.png`）：检查标题栏与地址栏是否
-拼成一条连续 chrome、地址栏八个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于
+拼成一条连续 chrome、地址栏六个控件的高度/基线是否与标题栏按钮一致、网页是否严格止于
 地址栏下沿（不遮挡任何自绘 chrome）、首屏表单是否居中、Native 内容下视频是否从地址栏
 下沿开始且底栏可见、收藏下拉是否对齐输入框左右边缘且浮在网页之上（行距、省略号、行尾 X 列）。
