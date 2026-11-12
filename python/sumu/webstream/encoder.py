@@ -185,13 +185,16 @@ class NvencEncoder:
     `audio_source`: optional path/URL of the source media; its first audio stream is muxed as AAC.
     `start_seconds`: seek the audio input to this offset (matches a seeked video segment).
     `bt709`/`full_range`: colour matrix/range for the BGR->YUV conversion + output tags.
+    `pixel_aspect`: the SOURCE's sample aspect ratio (1.0 = square pixels). An anamorphic
+    720x480 SAR 853:720 source is fed as 720x480 frames but published as 16:9 -- see the
+    `-aspect` tag below.
     """
 
     def __init__(self, width: int, height: int, fps: float, mode: str, out: str,
                  encode: "EncodeOptions | None" = None, quality_first: bool = False,
                  audio_source: str | None = None, gop_seconds: float = 2.0,
                  start_seconds: float = 0.0, bt709: bool = True,
-                 full_range: bool = False):
+                 full_range: bool = False, pixel_aspect: float = 1.0):
         if mode not in ("hls", "mp4"):
             raise ValueError(f"bad mode {mode!r}")
         # Default = the live-streaming profile (h264 / 8 Mbps / p4 / AAC re-encode): browser HLS
@@ -245,6 +248,11 @@ class NvencEncoder:
         # Video encode: codec + preset + independent CQ/bitrate/maxrate knobs (each gated by its
         # *_enabled flag). NVENC VBR treats -cq (targetQuality), -b:v (averageBitRate) and
         # -maxrate (maxBitRate) as coexisting parameters, so any subset may be set together.
+        # Anamorphic source: the pipe carries the coded grid, so publish the true display shape as
+        # the output sample aspect ratio. -aspect only writes stream tags (NVENC still encodes the
+        # coded grid -- no scaling step), and square-pixel sources stay completely untouched.
+        if abs(float(pixel_aspect) - 1.0) > 1e-6:
+            cmd += ["-aspect", f"{max(1, int(round(w * float(pixel_aspect))))}:{h}"]
         cmd += ["-c:v", enc.codec_ffmpeg(), "-preset", enc.preset]
         if enc.codec == "hevc":
             # Apple/QuickTime compatibility tag (the user's bat habit; not set for H.264).

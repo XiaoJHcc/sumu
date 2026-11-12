@@ -542,7 +542,27 @@ void Player::render_thumbnail(ID3D11RenderTargetView* rtv){
     context_->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     ID3D11RenderTargetView* rtvs[] = { rtv };
     context_->OMSetRenderTargets(1, rtvs, nullptr);
-    D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(kThumbW), static_cast<float>(kThumbH), 0.0f, 1.0f };
+    // Letterbox inside the fixed 160x90 card by the source's DISPLAY shape, exactly like
+    // fit_viewport() does for the main picture: an anamorphic 3:2 grid or a 4:3 source must not be
+    // stretched to the card's 16:9. The clear makes the bars black instead of whatever this reused
+    // texture still holds from the previous blit.
+    const float thumb_w = static_cast<float>(kThumbW);
+    const float thumb_h = static_cast<float>(kThumbH);
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    context_->ClearRenderTargetView(rtv, black);
+    float dw = thumb_w;
+    float dh = thumb_h;
+    if (display_aspect_ > 0.0) {
+        const float aspect = static_cast<float>(display_aspect_);
+        if (thumb_w / thumb_h < aspect) {
+            dw = thumb_w;
+            dh = thumb_w / aspect;
+        } else {
+            dh = thumb_h;
+            dw = thumb_h * aspect;
+        }
+    }
+    D3D11_VIEWPORT vp{ (thumb_w - dw) * 0.5f, (thumb_h - dh) * 0.5f, dw, dh, 0.0f, 1.0f };
     context_->RSSetViewports(1, &vp);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vs_.Get(), nullptr, 0);
@@ -1364,17 +1384,18 @@ void Player::present_loop(){
 }
 
 // Aspect-preserving "fit inside the window" viewport (letterbox/pillarbox): scales the
-// video's native src_width_ x src_height_ by the largest factor that still fits both window
-// dimensions, centered -- the leftover is filled with black bars by the ClearRenderTargetView
-// in the draw paths below. The VS emits a full-NDC (-1..1) fullscreen triangle, so shrinking
-// the viewport just scales+centers that triangle into this sub-rect while UVs still span the
-// whole frame 0..1 -- no vertex/UV/shader change needed. Degenerate dims (pre-open / a 0-size
-// window mid-resize) fall back to the full window so we never divide by zero or emit a
-// zero-area viewport. Assumes square pixels (both sumu test videos + typical content); truly
-// anamorphic sources would need the display aspect ratio here instead of coded dims.
+// video's DISPLAY shape by the largest factor that still fits both window dimensions, centered --
+// the leftover is filled with black bars by the ClearRenderTargetView in the draw paths below. The
+// VS emits a full-NDC (-1..1) fullscreen triangle, so shrinking the viewport just scales+centers
+// that triangle into this sub-rect while UVs still span the whole frame 0..1 -- no
+// vertex/UV/shader change needed. Degenerate dims (pre-open / a 0-size window mid-resize) fall
+// back to the full window so we never divide by zero or emit a zero-area viewport. Letterboxing by
+// display_aspect_ rather than the coded grid is what keeps anamorphic sources (720x480 SAR
+// 853:720 == 16:9) from being drawn as 3:2.
 D3D11_VIEWPORT Player::fit_viewport() const{
-    float sw = static_cast<float>(src_width_);
-    float sh = static_cast<float>(src_height_);
+    // shape = display_aspect_ : 1.0 -- the SAR-corrected shape, never the coded pixel count.
+    float sw = display_aspect_ > 0.0 ? static_cast<float>(display_aspect_) : 1.0f;
+    float sh = 1.0f;
     float ww = static_cast<float>(win_width_);
     // Reserve the top strip for the self-drawn title bar (top_bar_h(), drawn by build_top_bar())
     // so the video is letterboxed into the area BELOW it rather than being partly covered by
@@ -1390,7 +1411,7 @@ D3D11_VIEWPORT Player::fit_viewport() const{
     float bar = fullscreen_.load(std::memory_order_relaxed) ? 0.0f : top_bar_h();
     float region_y = bar;
     float wh = static_cast<float>(win_height_) - bar;
-    if (sw <= 0.0f || sh <= 0.0f || ww <= 0.0f || wh <= 0.0f)
+    if (src_width_ <= 0 || src_height_ <= 0 || ww <= 0.0f || wh <= 0.0f)
         return D3D11_VIEWPORT{ 0.0f, 0.0f, static_cast<float>(win_width_),
                                static_cast<float>(win_height_), 0.0f, 1.0f };
     float scale = (ww / sw < wh / sh) ? (ww / sw) : (wh / sh);

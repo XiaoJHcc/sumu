@@ -21,6 +21,8 @@
 // Frame contract (see prepare_nv12_frame): every consumer always receives
 // display-oriented, BT.709, limited-range, 8-bit NV12. width()/height() report that normalized
 // display size; the coded size the codec actually produced is coded_width()/coded_height().
+// Anamorphic sources keep that grid as-is -- the shape correction is presentation-only, reported
+// separately by pixel_aspect().
 
 #pragma once
 
@@ -137,6 +139,12 @@ public:
     // Size the codec actually produced (pre-rotation), for diagnostics only.
     int coded_width() const { return coded_width_; }
     int coded_height() const { return coded_height_; }
+    // Pixel aspect ratio (pixel width / pixel height) the stream declares: 1.0 for square pixels,
+    // which is the overwhelmingly common case. Anamorphic sources -- DVD-style 720x480 carrying
+    // 853:720 -- are 16:9 on screen even though their coded grid is 3:2, so presentation geometry
+    // (letterbox viewport, window sizing, thumbnails) must scale by this. The pixel paths (ring,
+    // AI bridge, scrub blits) still work in coded pixels and ignore it.
+    double pixel_aspect() const { return pixel_aspect_; }
     // Timeline length in the fixed-fps grid the player lays over the stream (stream/format
     // duration * fps, floored by the physical frame count so a short declared duration can
     // never hide pictures that really exist). 0 means genuinely unknown (rare containers) --
@@ -233,6 +241,7 @@ private:
     AVRational time_base_{1, 1};
     int width_ = 0;
     int height_ = 0;
+    double pixel_aspect_ = 1.0; // sample_aspect_ratio (see pixel_aspect()); 1.0 == square pixels
     int64_t frame_count_ = 0;
 
     // std::atomic: written once (single-shot init) by the decode thread inside next_frame(),

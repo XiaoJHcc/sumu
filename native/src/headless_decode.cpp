@@ -289,6 +289,9 @@ public:
     int64_t frame_count() const { return frame_count_; }
     int width() const { return width_; }
     int height() const { return height_; }
+    // Source pixel aspect ratio (1.0 == square pixels); the encoder tags the output with the
+    // resulting display aspect ratio so anamorphic input is not published squashed.
+    double pixel_aspect() const { return decoder_.pixel_aspect(); }
     bool is_network() const { return decoder_.is_network(); }
 
     void close()
@@ -454,6 +457,7 @@ void init_headless_decode(py::module_& m)
         .def("frame_count", &HeadlessDecode::frame_count)
         .def("width", &HeadlessDecode::width)
         .def("height", &HeadlessDecode::height)
+        .def("pixel_aspect", &HeadlessDecode::pixel_aspect)
         .def("is_network", &HeadlessDecode::is_network)
         .def("close", &HeadlessDecode::close);
 }

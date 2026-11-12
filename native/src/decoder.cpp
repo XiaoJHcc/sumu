@@ -131,6 +131,7 @@ void Decoder::close()
     normalize_desc_ = {};
     coded_width_ = 0;
     coded_height_ = 0;
+    pixel_aspect_ = 1.0;
     display_rotation_cw_ = 0;
     display_hflip_ = false;
     if (pkt_) av_packet_free(&pkt_);
@@ -321,6 +322,17 @@ bool Decoder::configure_frame_normalization(std::string& error)
     normalize_desc_.dst_width = width_;
     normalize_desc_.dst_height = height_;
 
+    // The normalized frame is still stored in the coded grid -- only its on-screen shape changes,
+    // so this only reports the display aspect ratio the present side will letterbox by (a 90/270
+    // display matrix has already moved the anamorphic stretch onto the vertical axis).
+    if (pixel_aspect_ != 1.0) {
+        const double dar = swap
+            ? static_cast<double>(width_) / (static_cast<double>(height_) * pixel_aspect_)
+            : (static_cast<double>(width_) * pixel_aspect_) / static_cast<double>(height_);
+        fprintf(stderr, "[sumu] anamorphic source: pixel aspect %.4f, %dx%d coded -> display aspect %.4f\n",
+            pixel_aspect_, width_, height_, dar);
+    }
+
     needs_normalization_ = video_normalize_required(normalize_desc_);
     if (!needs_normalization_) return true;
 
@@ -459,6 +471,16 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     coded_height_ = stream->codecpar->height;
     width_ = coded_width_;
     height_ = coded_height_;
+    // Anamorphic sources: the coded grid is not the picture's shape. Prefer the video stream's own
+    // sample_aspect_ratio, fall back to FFmpeg's guess (container/bitstream tags), and read a
+    // missing or implausible ratio as square pixels -- a bogus 1:1000 tag would otherwise collapse
+    // the picture into a sliver.
+    AVRational sar = stream->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0) sar = stream->codecpar->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0)
+        sar = av_guess_sample_aspect_ratio(fmt_ctx_, stream, nullptr);
+    pixel_aspect_ = (sar.num > 0 && sar.den > 0) ? av_q2d(sar) : 1.0;
+    if (!(pixel_aspect_ > 0.25 && pixel_aspect_ < 4.0)) pixel_aspect_ = 1.0;
     if (width_ <= 0 || height_ <= 0 || time_base_.num <= 0 || time_base_.den <= 0) {
         error = "video metadata is incomplete";
         close();

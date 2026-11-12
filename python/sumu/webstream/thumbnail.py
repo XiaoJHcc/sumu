@@ -109,11 +109,15 @@ def _cache_path(path: str, st) -> str:
 
 def _extract_frame(path: str, seek: float, stream_idx: int | None, tmp: str) -> None:
     map_args = ["-map", f"0:{stream_idx}"] if stream_idx is not None else ["-map", "0:v:0"]
+    # Height comes from the input's DISPLAY aspect ratio (dar = coded aspect * SAR), not its coded
+    # grid: an anamorphic DVD-style 720x480 (SAR 853:720) must yield 480x270, not 480x320. setsar=1
+    # then makes the JPEG square-pixel, since browsers ignore pixel-aspect metadata.
+    scale = f"scale={THUMB_WIDTH}:h=trunc({THUMB_WIDTH}/dar/2)*2:flags=fast_bilinear,setsar=1"
     p = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          "-ss", f"{seek:.3f}", "-i", path, *map_args,
          "-frames:v", "1", "-an", "-sn",
-         "-vf", f"scale={THUMB_WIDTH}:-2:flags=fast_bilinear",
+         "-vf", scale,
          "-q:v", "4", "-y", tmp],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         startupinfo=_startupinfo(), timeout=60, check=False,

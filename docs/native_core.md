@@ -372,7 +372,12 @@ limited range、8-bit NV12**。`Decoder::prepare_nv12_frame()` 是这个契约�
   不是简单降位深。输出写进自己的 NV12 纹理（D3D11.1 平面 RTV，退化时用 VideoProcessor
   把 RGB 转成 BT.709 studio range NV12），失败明确报错，不静默给错图。
 - `Decoder::width()/height()` 返回归一化后的（旋转后）显示尺寸，`coded_width()/coded_height()`
-  是解码器实际产出的尺寸；下游只认前者。
+  是解码器实际产出的尺寸；下游只认前者。像素宽高比（`sample_aspect_ratio`）不进这套像素通路：
+  `Decoder::pixel_aspect()` 单独报出（1.0 = 方形像素），只有呈现几何消费它——Player 在
+  `open_session()` 折算出 `display_aspect_`（含旋转交换），`fit_viewport()`、开窗自适应和悬停
+  缩略图按它 letterbox，于是 DVD 式 720×480 SAR 853:720 的画面按 16:9 而不是 3:2 呈现；ring /
+  AI 桥 / scrub blit 仍在编码像素网格上工作。导出与 Web 串流由 `HeadlessDecode::pixel_aspect()`
+  把同一比例作为输出 SAR（`-aspect`）写给编码器，Web 封面按 DAR 缩放并 `setsar=1`。
 - 未标记色彩 tag 沿既有 BT.709 limited 契约；非 4:2:0 像素格式仍在 open 时明确拒绝。
 - 归一化只在主播放、seek、缩略图和 headless 的 D3D11 临界区内执行，解码与网络等待仍不持有
   `d3d_mutex_`；它设置的必要管线状态由下游每帧重设，用后立即解绑自己的 SRV/RTV。

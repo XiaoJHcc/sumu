@@ -110,7 +110,8 @@ class TranscodeEngine:
             enc = NvencEncoder(w, h, fps, mode, out, encode=encode, quality_first=quality_first,
                                audio_source=audio_source if audio_source is not None else source,
                                start_seconds=start_seconds,
-                               bt709=cfg.bt709, full_range=cfg.full_range)
+                               bt709=cfg.bt709, full_range=cfg.full_range,
+                               pixel_aspect=float(dec.pixel_aspect()))
             remaining = max(0, fc - start_frame) if fc > 0 else 0
 
             def _emit(proc, enc, remaining):

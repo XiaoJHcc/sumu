@@ -121,6 +121,18 @@ void Player::open_session(const std::string& video_path, const std::string& head
     src_height_ = decoder_.height();
     if (src_width_ <= 0 || src_height_ <= 0)
         throw std::runtime_error("decoder reported invalid dimensions");
+    // Pixel aspect: fold the source's sample aspect ratio into the DISPLAY shape (an anamorphic
+    // 720x480 SAR 853:720 is 16:9 on screen, not 3:2). A 90/270 display matrix has already swapped
+    // src_width_/src_height_, which moves the stretch onto the vertical axis -- the rotated branch
+    // below handles that. Presentation geometry only, so the ring/AI/scrub pixel paths are
+    // untouched.
+    {
+        const double par = decoder_.pixel_aspect();
+        const bool rotated = decoder_.coded_width() != src_width_;
+        display_aspect_ = rotated
+            ? static_cast<double>(src_width_) / (static_cast<double>(src_height_) * par)
+            : (static_cast<double>(src_width_) * par) / static_cast<double>(src_height_);
+    }
 
     // Resolution-aware ring depths (I8), plus network shallow profile when source is http(s).
     // Network: smaller PT/AI rings so decode-ahead and AI lead stay thin (less remote
@@ -854,7 +866,9 @@ void Player::on_resize(UINT w, UINT h){
 // ---- auto-size the window to the just-opened video ------------------------------------
 // Called from open_session() (main thread) once src_width_/src_height_ are known. Sizes the
 // window so the video renders point-for-point (1:1, no scaling) in the letterbox region
-// BELOW the title bar: client = src_width_ x (src_height_ + top_bar_h()). Constraints:
+// BELOW the title bar: client = display_width x (src_height_ + top_bar_h()), where display_width
+// is src_height_ * display_aspect_ -- i.e. the shape the picture actually has on screen, not the
+// coded grid (an anamorphic 720x480 SAR 853:720 opens as 853x480). Constraints:
 //   * width capped at 80% of the CURRENT monitor's work-area width;
 //   * the whole window must fit within that monitor's work area (height too);
 //   * when the 1:1 size exceeds either budget, the video is scaled down UNIFORMLY (aspect
@@ -882,8 +896,12 @@ void Player::resize_window_for_video(){
     const LONG work_h = mi.rcWork.bottom - mi.rcWork.top;
     if (work_w <= 0 || work_h <= 0) return;
 
-    const float sw = static_cast<float>(src_width_);
     const float sh = static_cast<float>(src_height_);
+    // Display width, not coded width: an anamorphic source has to open at its on-screen shape,
+    // otherwise the window bakes in 3:2 and every later letterbox agrees with the wrong shape.
+    const float sw = display_aspect_ > 0.0
+        ? sh * static_cast<float>(display_aspect_)
+        : static_cast<float>(src_width_);
     // Same strip math as fit_viewport(): only the title bar strip is reserved (the URL page's
     // address bar is floating chrome).
     const float bar = top_bar_h();

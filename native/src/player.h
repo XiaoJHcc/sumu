@@ -869,6 +869,11 @@ private:
 
     int src_width_ = 0;
     int src_height_ = 0;
+    // Display shape of the current source (width / height, SAR folded in, rotation swap already
+    // accounted for) -- what fit_viewport()/resize_window_for_video()/render_thumbnail() letterbox
+    // by. 0 means "no source open yet". The pixel paths (ring, AI bridge, scrub blits) keep using
+    // src_width_/src_height_ and never look at this.
+    double display_aspect_ = 0.0;
     // Session ring depths (set in open_session from pick_ring_capacities).
     // PT: decode-ahead + AI input. AI: short present ready-map (may be << PT at 4K).
     UINT ring_capacity_ = kRingCapacityDefault;
