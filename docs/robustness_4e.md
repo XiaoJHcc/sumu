@@ -297,7 +297,7 @@ present 节奏基线无回归。本次测试为单次运行（与既有方法论
 | `player.ai_hit_rate()` | 独立访问器 | 与 `stats()['ai_hit_rate']` 交叉核实数值完全一致（0.0 == 0.0） |
 | `player.present_stats()` | 累计 present 节奏摘要（`n/median_ms/p99_ms/max_ms/min_ms/mean_ms`） | 三场景各跑完一次均正确返回 |
 | `player.dump_present_trace(path)` | 导出逐次 present 的 ns 时间戳 | 三份 trace（`robustness_4k.csv`/`present_stress_seek_ai.csv`/`robustness_eof.csv`）全部成功导出，`scripts/analyze_present.py --format ns` 全部正确解析 |
-| `scheduler.get_stats()` | 10 个字段：`frames_detected/clips_restored/frames_pushed/frame_cache_misses/seek_resets/backlog_resyncs/cold_start_s/ai_frontier/scenes_open/frame_cache_size` | 三场景全程轮询，数字在 seek/backlog/miss 等场景下均如预期变化 |
+| `scheduler.get_stats()` | 调度统计：`frames_detected/clips_restored/frames_pushed/frame_cache_misses/seek_resets/config_resets/backlog_resyncs/cold_start_s/ai_frontier/scenes_open/frame_cache_size` 等 | 三场景全程轮询，数字在 seek/配置代际变化/backlog/miss 等场景下均如预期变化 |
 
 **诊断流程（本次验证实际用到的方法，可复用）**：
 

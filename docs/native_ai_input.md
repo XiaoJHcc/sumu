@@ -11,7 +11,7 @@ push_ai_frame 代码路径——纯增量。
 ## API 契约
 
 ```python
-result = p.get_cuda_nv12_by_frame(frame_num)  # -> dict
+result = p.get_cuda_nv12_by_frame(frame_num, generation=timeline_gen)  # generation 可省略
 # result["ready"]:       bool，False 时其余字段无意义，调用方必须自行重试/跳过
 # result["dev_ptr"]:     uint64，CUDA 设备指针（CUdeviceptr），Player 持久拥有的单缓冲区
 # result["width"]:       int，= 视频显示宽度（src_width_）
@@ -22,7 +22,8 @@ result = p.get_cuda_nv12_by_frame(frame_num)  # -> dict
 
 - **绝不阻塞 present**（I1/I2 硬约束）：cache miss（该 `frame_num` 当前不在 ring 里）立即返回
   `{ready: False, frame_num}`，不等待、不重试、不触碰 D3D11/CUDA。cache hit 才做 blit + CUDA
-  拷贝。
+  拷贝。传入 `generation` 时，若它不等于 `Player.timeline_generation()`，同样立即 miss；省略则保持
+  旧调用行为。Scheduler 总是携带当前代际，避免流中重配置后读到旧资源。
 - 返回的 NV12 缓冲区布局与 lada 的 `to_ndarray('nv12')`/spike3 一致：形状
   `(height*3//2, width)`，rows `[0,height)` = 全分辨率 luma，rows `[height, height*3/2)` =
   半分辨率交错 chroma。原生已将源色彩、HDR 与旋转归一化为**显示方向正确的 BT.709 limited

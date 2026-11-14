@@ -12,7 +12,7 @@
 #
 # 覆盖：时间轴长度（duration*fps 而非 nb_frames）、全时长播放与末尾暂停、seek 落点与其内容、
 # 持帧区间经 get_cuda_nv12_by_frame 的内容一致性、present 的 fresh 率、长持帧与解码前沿共存的
-# 环槽选择、拼接流的时间戳回退、fps_div=2、短视频、普通 CFR 回归。
+# 环槽选择、拼接流的时间戳回退与分段总长扩展、fps_div=2、短视频、普通 CFR 回归。
 import faulthandler
 import json
 import math
@@ -480,8 +480,8 @@ def check_media(media):
           f"{len(long_hold.visible)} pictures total over {long_hold.duration:.2f}s "
           f"(container claims {long_hold.physical} samples)", flush=True)
 
-    # 拼接流：解复用顺序里必须真的有一次显著向后跳（这是异常 PTS 的实物证据），且容器声明的
-    # 时长只覆盖第一段——后半段落在时间轴之外，是这种流已知的限制，不是本测试要抹平的东西。
+    # 拼接流：解复用顺序里必须真的有一次显著向后跳（这是异常 PTS 的实物证据），且容器初始
+    # 只声明第一段时长——原生分段策略必须随后按真实图片扩展，而不是停在初始声明末尾。
     joined_pts = Media.pts_ordered(media.joined)
     jumps = [(i, joined_pts[i - 1] - joined_pts[i]) for i in range(1, len(joined_pts))
              if joined_pts[i] < joined_pts[i - 1]]
@@ -796,31 +796,38 @@ def case_short(player, media):
 
 
 def case_joined(player, media):
-    """拼接流（时间戳回退）：回退的帧不能覆盖已经上屏的网格，时钟也不能被拉回去。"""
+    """拼接流：回退 PTS 接到前段之后，真实分段扩展总长，前后两段都完整播放。"""
     player.open(str(media.joined))
     fps = player.fps()
     hdr = Media.headers(media.joined)
-    declared = player.frame_count()
-    assert abs(declared - hdr["duration"] * fps) <= 3, (declared, hdr["duration"], fps)
+    initial_declared = player.frame_count()
+    assert abs(initial_declared - hdr["duration"] * fps) <= 3, (
+        initial_declared, hdr["duration"], fps)
     play = Play(player, "joined ts")
     player.play()
-    frame = play.wait_end(declared / fps + 15)
-    assert frame >= declared - 2, (frame, declared)
+    frame = play.wait_end(initial_declared / fps + 15)
     player.pause()
     play.run(0.05)
+    final_declared = player.frame_count()
+    assert final_declared >= initial_declared * 1.8, (initial_declared, final_declared)
+    assert frame >= final_declared - 2, (frame, final_declared)
 
-    # 整条时间轴上的每一格都必须还是第一段（逐帧变化）的画面。拼接点之后的帧若被映射回已经
-    # 上屏的格子，第二段的静止画面会盖上来，读回就会看到一长串逐字节相同的帧。
-    planes = probe_run(player, 0, min(declared, player.ring_capacity() - 16))
-    assert len(planes) >= declared - 2, (len(planes), declared)
+    # 第一段逐帧变化，第二段是静止彩条。两段都能按各自扩展后的帧号读回，且回退 PTS 没有把
+    # 第二段写到第一段的网格上。跨段精确 seek 仍由容器索引能力决定，这里只验证连续播放。
+    planes = probe_run(player, 0, min(final_declared, player.ring_capacity() - 16))
+    assert len(planes) >= final_declared - 2, (len(planes), final_declared)
     runs = runs_of(planes)
-    longest = max(hi - lo + 1 for lo, hi, _ in runs)
-    assert longest <= 2, (longest, [(lo, hi) for lo, hi, _ in runs[:6]])
-    assert player.seek(declared // 2) <= declared // 2 + 2
-    print(f"PASS: joined ts paused at its declared {frame + 1}/{declared} grid frames; "
-          f"this checks overwrite protection, not playback of the undeclared second segment; "
-          f"all {len(planes)} readable grid frames still hold "
-          f"first-segment content (longest identical stretch {longest} frame(s))", flush=True)
+    first_runs = [(lo, hi, m) for lo, hi, m in runs if hi < initial_declared]
+    second_runs = [(lo, hi, m) for lo, hi, m in runs if lo >= initial_declared]
+    assert first_runs and second_runs, [(lo, hi, m) for lo, hi, m in runs]
+    assert max(hi - lo + 1 for lo, hi, _ in first_runs) <= 2, first_runs
+    second_means = [mean_of(planes[n]) for n in sorted(planes) if n >= initial_declared]
+    assert len(second_means) >= 50 and max(second_means) - min(second_means) < 0.25, (
+        len(second_means), min(second_means), max(second_means))
+    assert player.seek(initial_declared // 2) <= initial_declared // 2 + 2
+    print(f"PASS: joined ts expanded {initial_declared} -> {final_declared} grid frames and "
+          f"paused at {frame}; first segment stays distinct, second segment is present as its own "
+          f"held content instead of overwriting the first", flush=True)
     player.close_current_session()
 
 

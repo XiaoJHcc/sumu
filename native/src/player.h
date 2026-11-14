@@ -615,15 +615,17 @@ public:
 
     // ---- AI insertion point --------------------------------------------------------------
 
-    void push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int fheight, size_t pitch_bytes);
+    void push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int fheight, size_t pitch_bytes,
+                       uint64_t generation = 0);
 
-    py::dict get_cuda_nv12_by_frame(int64_t frame_num);
+    py::dict get_cuda_nv12_by_frame(int64_t frame_num, uint64_t generation = 0);
 
     // ---- introspection -------------------------------------------------------------------
 
     double fps() const { return fps_; }
     int64_t frame_count() const { return frame_count_; }
     int64_t current_frame() const { return clock_frame_.load(std::memory_order_relaxed); }
+    uint64_t timeline_generation() const { return timeline_generation_.load(std::memory_order_relaxed); }
     std::pair<int, int> dims() const { return { src_width_, src_height_ }; }
 
     double ai_hit_rate() const;
@@ -830,6 +832,10 @@ private:
     void register_landing_with_cuda();
 
     void create_ai_input_bridge();
+
+    void release_session_gpu_resources();
+
+    void reconfigure_video_session(DecodedFrame& df, int64_t target_frame = -1);
 
     // ---- decode thread -----------------------------------------------------------------------
 
@@ -1351,6 +1357,7 @@ private:
 
     Decoder scrub_decoder_;
     std::thread scrub_thread_;
+    std::atomic<bool> scrub_stop_{ false };
     // Latest hovered bucket the scrub thread should serve; -1 = nothing pending. Coalescing: the
     // main thread just overwrites this with the newest bucket, so a fast drag drops intermediate
     // buckets and the thread always chases the most recent hover position.
@@ -1371,8 +1378,9 @@ private:
     std::mutex decoder_mutex_;
 
     Decoder decoder_;
+    uint64_t decoder_config_generation_ = 0;
     double source_fps_ = 60.0;       // container fps (fixed for the open file)
-    int64_t source_frame_count_ = 0; // container frame count
+    int64_t source_frame_count_ = 0; // container count, extended by segmented timelines
     double fps_ = 60.0;              // session fps = source_fps_ / fps_div (retimed)
     int64_t frame_count_ = 0;        // session frame count after retiming
     // Temporal downsample 1/N. Decode still full-rate; only every Nth source frame becomes a
@@ -1474,6 +1482,7 @@ private:
     std::atomic<int64_t> anchor_frame_{ 0 };   // content frame_num at anchor_qpc_ticks_
     std::atomic<int64_t> anchor_qpc_ticks_{ 0 }; // QPC ticks corresponding to anchor_frame_
     std::atomic<int64_t> clock_frame_{ 0 };    // last frame_num computed/shown by present_loop
+    std::atomic<uint64_t> timeline_generation_{ 0 };
     std::atomic<uint64_t> seek_version_{ 0 };
     std::atomic<int64_t> seek_slot_hint_{ 0 };
 

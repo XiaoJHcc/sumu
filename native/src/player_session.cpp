@@ -101,6 +101,7 @@ void Player::open_session(const std::string& video_path, const std::string& head
     // plain URL opens). They only reach FFmpeg's HTTP protocol options -- never the log.
     if (!decoder_.open(video_path, device_.Get(), decode_err, headers, cookies))
         throw std::runtime_error("decoder.open failed: " + decode_err);
+    decoder_config_generation_ = decoder_.config_generation();
     source_fps_ = decoder_.fps();
     source_frame_count_ = decoder_.frame_count();
     // Session timeline = source retimed by fps_div (1 = identity). Downstream present/AI/
@@ -279,6 +280,7 @@ void Player::open_session(const std::string& video_path, const std::string& head
         playing_.store(false, std::memory_order_relaxed);
         seek_slot_hint_.store(0, std::memory_order_relaxed);
         seek_version_.fetch_add(1, std::memory_order_relaxed);
+        timeline_generation_.fetch_add(1, std::memory_order_relaxed);
 
         if (has_audio_)
             audio_thread_ = std::thread(&Player::audio_loop, this);
@@ -310,6 +312,162 @@ void Player::open_session(const std::string& video_path, const std::string& head
     }
 }
 
+// Caller must detach present and stop every producer first. Clearing both UI snapshots is required
+// before thumbnail SRVs can be released safely; CUDA registrations die before their D3D textures.
+void Player::release_session_gpu_resources(){
+    std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+    {
+        std::lock_guard<std::mutex> ui_lock(ui_mutex_);
+        ui_pending_.reset();
+        ui_active_.reset();
+    }
+
+    if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
+    if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
+    if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
+    if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
+
+    pt_ring_tex_.Reset();
+    for (auto& srv : pt_srv_y_) srv.Reset();
+    for (auto& srv : pt_srv_uv_) srv.Reset();
+    {
+        std::lock_guard<std::mutex> ready_lock(ready_mutex_);
+        pt_srv_y_.clear();
+        pt_srv_uv_.clear();
+        pt_tag_.clear();
+        pt_end_tag_.clear();
+    }
+
+    ai_ring_tex_.Reset();
+    for (auto& srv : ai_srv_) srv.Reset();
+    {
+        std::lock_guard<std::mutex> ready_lock(ready_mutex_);
+        ai_srv_.clear();
+        ai_tag_.clear();
+    }
+
+    landing_tex_.Reset();
+    ai_in_y_tex_.Reset();
+    ai_in_y_rtv_.Reset();
+    ai_in_uv_tex_.Reset();
+    ai_in_uv_rtv_.Reset();
+
+    scrub_nv12_tex_.Reset();
+    scrub_srv_y_.Reset();
+    scrub_srv_uv_.Reset();
+    {
+        std::lock_guard<std::mutex> scrub_cache_lock(scrub_cache_mutex_);
+        scrub_cache_.clear();
+        scrub_cache_next_ = 0;
+        scrub_grid_.clear();
+        scrub_grid_rank_.clear();
+        scrub_grid_octave_.clear();
+        scrub_grid_stride_ = 0;
+        scrub_grid_done_ = 0;
+    }
+    scrub_request_frame_.store(-1, std::memory_order_relaxed);
+    scrub_grid_wanted_.store(false, std::memory_order_relaxed);
+}
+
+void Player::reconfigure_video_session(DecodedFrame& df, int64_t target_frame){
+    if (cu_ctx_)
+        check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (reconfigure_video_session)");
+    session_active_.store(false, std::memory_order_release);
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        if (present_in_splash_.load(std::memory_order_acquire)) break;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (static_cast<double>(now.QuadPart - t0.QuadPart) / qpc_freq_d() > 2.0)
+            throw std::runtime_error("video reconfiguration: present thread did not detach");
+        Sleep(1);
+    }
+    timeline_generation_.fetch_add(1, std::memory_order_relaxed);
+
+    scrub_stop_.store(true, std::memory_order_relaxed);
+    scrub_decoder_.request_interrupt();
+    scrub_cv_.notify_one();
+    if (scrub_thread_.joinable()) scrub_thread_.join();
+    scrub_stop_.store(false, std::memory_order_relaxed);
+    decoder_.flush_audio_queue();
+    release_session_gpu_resources();
+
+    decoder_config_generation_ = decoder_.config_generation();
+    src_width_ = decoder_.width();
+    src_height_ = decoder_.height();
+    if (src_width_ <= 0 || src_height_ <= 0)
+        throw std::runtime_error("video reconfiguration returned invalid dimensions");
+    const double par = decoder_.pixel_aspect();
+    const bool rotated = decoder_.coded_width() != src_width_;
+    display_aspect_ = rotated
+        ? static_cast<double>(src_width_) / (static_cast<double>(src_height_) * par)
+        : (static_cast<double>(src_width_) * par) / static_cast<double>(src_height_);
+
+    pick_ring_capacities(src_width_, src_height_, ring_capacity_, ai_ring_capacity_, network_source_);
+    ring_capacity_ = std::max(16u, std::min(ring_capacity_, kRingCapacityMax));
+    ai_ring_capacity_ = std::max(16u, std::min(ai_ring_capacity_, kRingCapacityMax));
+    const int64_t margin = network_source_ ? 4 : 10;
+    decode_ahead_max_ = std::max<int64_t>(1, static_cast<int64_t>(ring_capacity_) - margin);
+    create_ring_resources();
+    create_landing_texture();
+    register_landing_with_cuda();
+    create_ai_input_bridge();
+    pt_tag_.assign(ring_capacity_, -1);
+    pt_end_tag_.assign(ring_capacity_, -1);
+    ai_tag_.assign(ai_ring_capacity_, -1);
+
+    const int64_t frame_num = static_cast<int64_t>(std::ceil(df.pts_seconds * fps_ - 1e-5));
+    int64_t frame_end = frame_num;
+    if (df.duration_seconds > 0.0)
+        frame_end = static_cast<int64_t>(std::ceil((df.pts_seconds + df.duration_seconds) * fps_ - 1e-5)) - 1;
+    if (frame_count_ > 0) frame_end = std::min(frame_end, frame_count_ - 1);
+    if (frame_num < 0 || frame_num > frame_end)
+        throw std::runtime_error("video reconfiguration returned an invalid timestamp");
+    const UINT slot = wrap_pt_slot(frame_num);
+    std::string err;
+    {
+        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        if (!decoder_.prepare_nv12_frame(df, err))
+            throw std::runtime_error("video reconfiguration normalization failed: " + err);
+        context_->CopySubresourceRegion(pt_ring_tex_.Get(), slot, 0, 0, 0,
+            df.texture, df.array_slice, nullptr);
+    }
+    {
+        std::lock_guard<std::mutex> ready_lock(ready_mutex_);
+        pt_tag_[slot] = frame_num;
+        pt_end_tag_[slot] = frame_end;
+    }
+    pt_high_water_.store(frame_end, std::memory_order_relaxed);
+
+    const int64_t old_head = target_frame >= 0
+        ? target_frame : present_head_frame_.load(std::memory_order_relaxed);
+    const int64_t actual = old_head >= frame_num && old_head <= frame_end ? old_head : frame_num;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    anchor_qpc_ticks_.store(now.QuadPart, std::memory_order_relaxed);
+    anchor_frame_.store(actual, std::memory_order_relaxed);
+    clock_frame_.store(actual, std::memory_order_relaxed);
+    present_head_frame_.store(actual, std::memory_order_relaxed);
+    seek_slot_hint_.store(static_cast<int64_t>(slot), std::memory_order_relaxed);
+    seek_version_.fetch_add(1, std::memory_order_relaxed);
+    ++decode_frame_count_;
+    pending_resize_for_video_.store(true, std::memory_order_release);
+    session_active_.store(true, std::memory_order_release);
+
+    if (!network_source_) {
+        std::string scrub_err;
+        if (scrub_decoder_.open(video_path_, device_.Get(), scrub_err)) {
+            scrub_thread_ = std::thread(&Player::scrub_loop, this);
+            scrub_grid_wanted_.store(true, std::memory_order_relaxed);
+            scrub_cv_.notify_one();
+        } else {
+            fprintf(stderr, "[sumu] scrub decoder reconfiguration failed (%s) -- hover thumbnails disabled\n",
+                scrub_err.c_str());
+        }
+    }
+}
+
 // M-C1: joins/tears down only the session-scoped state (decode/audio threads, the D3D11
 // session textures/SRVs/tags, the session's CUDA registrations, the audio codec ctx, the
 // decoder itself) -- leaves the device layer (device_/context_/swapchain_/shader pipeline/
@@ -324,6 +482,7 @@ void Player::close_session(){
         check_cu(cuCtxSetCurrent(cu_ctx_), "cuCtxSetCurrent (close_session)");
 
     session_stop_.store(true, std::memory_order_relaxed);
+    scrub_stop_.store(true, std::memory_order_relaxed);
     decoder_.request_interrupt();
     scrub_decoder_.request_interrupt();
     scrub_cv_.notify_one(); // wake scrub_thread_ out of its wait so it observes session_stop_
@@ -333,6 +492,7 @@ void Player::close_session(){
     // BEFORE the d3d_lock block below -- joining it under d3d_mutex_ would risk self-deadlock.
     if (scrub_thread_.joinable()) scrub_thread_.join();
     session_stop_.store(false, std::memory_order_relaxed); // reset so a future open_session() starts clean
+    scrub_stop_.store(false, std::memory_order_relaxed);
 
     if (audio_codec_ctx_) avcodec_free_context(&audio_codec_ctx_);
 
@@ -355,93 +515,7 @@ void Player::close_session(){
     // decode_thread_/audio_thread_ above -- those threads also take d3d_mutex_ themselves
     // (decode_loop's ring writes, audio does not) and joining them under this lock would
     // risk a self-deadlock; the lock only wraps the resource teardown itself.
-    {
-        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
-
-        // H2 修复：UI 快照里可能烘着缩略图 SRV 的裸指针（hover 进度条时 build_bottom_bar()
-        // AddImage 进 draw list，见 player_ui_bars.cpp）—— 包括还没被 present 取走的
-        // ui_pending_ 和 present 每 tick 都在渲染的 ui_active_。本函数马上要在下面释放
-        // scrub 纹理/SRV，而 reopen 期间主线程阻塞在 open_session()（网络源最长 ~30s）、
-        // 没有新 ui_tick 发布新快照，present 的 splash 分支会继续渲染 ui_active_ 旧快照
-        // → 解引用已释放的 SRV。present 渲染快照必持 d3d_mutex_（draw_splash()/
-        // draw_and_present() 都在锁内调 ui_render_drawdata()），所以在此临界区内清空两个
-        // 快照后与 present 严格互斥：之后的 splash tick 走 ui_render_drawdata() 的
-        // nothing-published 分支不画 UI（合法状态，代价仅是 reopen 期间短暂没有窗口
-        // chrome，open_session 返回后 Python 的 ui_tick 立刻发布新快照）。锁序
-        // d3d → ui 与 ui_render_drawdata() 自身一致，无新锁序。
-        {
-            std::lock_guard<std::mutex> ui_lock(ui_mutex_);
-            ui_pending_.reset();
-            ui_active_.reset();
-        }
-
-        // CUDA unregister BEFORE releasing the D3D11 textures they wrap (cu_res_ wraps
-        // landing_tex_; ai_in_cu_res_y_/uv_ wrap ai_in_y_tex_/ai_in_uv_tex_) -- cu_ctx_
-        // itself is a device-layer resource and stays current/alive here (only close()'s
-        // final teardown below releases it), same ordering the original close() already
-        // used.
-        if (cu_res_) { cuGraphicsUnregisterResource(cu_res_); cu_res_ = nullptr; }
-        if (ai_in_cu_res_y_) { cuGraphicsUnregisterResource(ai_in_cu_res_y_); ai_in_cu_res_y_ = nullptr; }
-        if (ai_in_cu_res_uv_) { cuGraphicsUnregisterResource(ai_in_cu_res_uv_); ai_in_cu_res_uv_ = nullptr; }
-        if (ai_in_cu_buf_) { cuMemFree(ai_in_cu_buf_); ai_in_cu_buf_ = 0; }
-
-        // Explicit release of session-scoped D3D11 resources (pre-M-C1 these only ever
-        // went away implicitly, via ~Player's ComPtr destructors) -- clears the slate so
-        // present_loop's splash branch never indexes a half-torn-down ring while
-        // !session_active_, and so a future open_session() rebuilds everything from
-        // scratch. pt_tag_/ai_tag_ and the SRV vectors are also read under ready_mutex_
-        // by get_cuda_nv12_by_frame()/decode_loop() (a stale pt_tag_[slot] index into an
-        // already-.clear()'d vector was the second, independent crash this fix closes) --
-        // nested inside d3d_mutex_ here, matching decode_loop()'s/seek()'s existing lock
-        // order (d3d_mutex_ outer, ready_mutex_ inner), never the reverse.
-        pt_ring_tex_.Reset();
-        for (auto& srv : pt_srv_y_) srv.Reset();
-        for (auto& srv : pt_srv_uv_) srv.Reset();
-        {
-            std::lock_guard<std::mutex> ready_lock(ready_mutex_);
-            pt_srv_y_.clear();
-            pt_srv_uv_.clear();
-            pt_tag_.clear();
-            pt_end_tag_.clear();
-        }
-
-        ai_ring_tex_.Reset();
-        for (auto& srv : ai_srv_) srv.Reset();
-        {
-            std::lock_guard<std::mutex> ready_lock(ready_mutex_);
-            ai_srv_.clear();
-            ai_tag_.clear();
-        }
-
-        landing_tex_.Reset();
-
-        ai_in_y_tex_.Reset();
-        ai_in_y_rtv_.Reset();
-        ai_in_uv_tex_.Reset();
-        ai_in_uv_rtv_.Reset();
-
-        // M4 scrub thumbnail resources. scrub_thread_ is already joined (above), and any UI
-        // snapshot that could still reference a thumbnail SRV has been cleared at the top of
-        // this critical section (H2, see there) -- safe to release the NV12 blit source and
-        // the thumb pool. scrub_cache_ is also read by get_thumbnail() on the main thread; the
-        // same main thread runs close_session(), so there is no concurrent reader here, but
-        // take scrub_cache_mutex_ anyway to keep every scrub_cache_ access uniformly guarded.
-        scrub_nv12_tex_.Reset();
-        scrub_srv_y_.Reset();
-        scrub_srv_uv_.Reset();
-        {
-            std::lock_guard<std::mutex> scrub_cache_lock(scrub_cache_mutex_);
-            scrub_cache_.clear();
-            scrub_cache_next_ = 0;
-            scrub_grid_.clear();
-            scrub_grid_rank_.clear();
-            scrub_grid_octave_.clear();
-            scrub_grid_stride_ = 0;
-            scrub_grid_done_ = 0;
-        }
-        scrub_request_frame_.store(-1, std::memory_order_relaxed);
-        scrub_grid_wanted_.store(false, std::memory_order_relaxed);
-    }
+    release_session_gpu_resources();
 
     // Network-recovery flags are per session: a torn-down session must not report itself as
     // mid-recovery (decode_loop() is joined above, so nothing else can clear this afterwards).

@@ -94,9 +94,12 @@ PYBIND11_MODULE(sumu_core, m)
         .def("seek", &Player::seek, py::arg("frame_num"),
             py::call_guard<py::gil_scoped_release>())
         .def("push_ai_frame", &Player::push_ai_frame,
-            py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"), py::arg("pitch_bytes"))
-        .def("get_cuda_nv12_by_frame", &Player::get_cuda_nv12_by_frame, py::arg("frame_num"))
+            py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"),
+            py::arg("pitch_bytes"), py::arg("generation") = 0)
+        .def("get_cuda_nv12_by_frame", &Player::get_cuda_nv12_by_frame,
+            py::arg("frame_num"), py::arg("generation") = 0)
         .def("current_frame", &Player::current_frame)
+        .def("timeline_generation", &Player::timeline_generation)
         .def("frame_count", &Player::frame_count)
         .def("fps", &Player::fps)
         .def("dims", &Player::dims)

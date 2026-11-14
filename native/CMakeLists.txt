@@ -156,6 +156,8 @@ pybind11_add_module(sumu_core
     src/ui/widgets.cpp
     src/ui/icons.cpp
     src/decoder.cpp
+    src/media_source.cpp
+    src/video_decoder.cpp
     src/video_normalizer.cpp
     src/headless_decode.cpp
     "${IMGUI_DIR}/imgui.cpp"
@@ -195,6 +197,7 @@ target_link_libraries(sumu_core PRIVATE
     avformat
     avutil
     swresample
+    swscale
     "${CUDA_TOOLKIT_ROOT}/lib/x64/cuda.lib"
     # Static WebView2 loader: no runtime DLL to stage next to the .pyd/onedir bundle.
     "${WEBVIEW2_LOADER_LIB}"

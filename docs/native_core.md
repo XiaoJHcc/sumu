@@ -21,8 +21,9 @@ native/
                          文件，但 .pyd 本身不依赖运行期路径解析。
   shaders/present.hlsl    从 Spike 2 presenter.cpp 内联字符串原样搬出的 HLSL（VSMain 全屏三
                          角形 + PSMain_NV12 BT.709 limited-range 转换 + PSMain_AI 直通采样）。
-  src/decoder.h/.cpp      在 Spike 0/2 的 Decoder 基础上新增 seek_to_frame()、width()/
-                         height()/frame_count()。
+  src/decoder.h/.cpp      Decoder 门面：DecodeStatus、SourceState、时间轴、配置代际与统一帧契约
+  src/media_source.*      AVFormat/IO、流选择与音频包队列、VOD 重连和 live 重开
+  src/video_decoder.*     D3D11VA / software 两种视频后端；软件路径 libswscale→NV12→一次上传
   src/player.h            Player 类完整声明（UiIntents / UiStrings / 各 build_* 与状态）
   src/player_session.cpp  会话生命周期 open/reopen/close、UI 状态机、set_ui_strings、
                           take_ui_intents（含浏览器页的进出/交接）
@@ -359,6 +360,29 @@ tooltip；设置面板与它的 combo 列表、地址栏右键菜单同样按像
 看起来仍然"新鲜"，但内容是错的。把临界区扩大到整个"生产+发布"序列后，decode 线程的一次迭代和
 `seek()` 互斥，此竞态被彻底关闭。
 
+## 解码前端与配置代际
+
+`Decoder` 是 Player、HeadlessDecode 和 scrub 共用的稳定门面，内部职责分离为 `MediaSource`
+（AVFormat、IO、音频包队列、seek/reconnect）和 `VideoDecoder`（D3D11VA / software）。不新增
+demux 线程，现有 decode 线程仍同时驱动解封装与解码；present 不接触这些对象。
+
+`DecodeResult` 明确区分 `Frame / WouldBlock / Eof / NeedReconfigure / RecoverableIoError /
+FatalError`（`RetryWithSoftware` 只由门面内部消化）。暂时无数据不再与真实 EOF 共用 bool；
+`SourceState` 另行报告 Opening/Buffering/Ready/Starved/Reconfiguring/Recovering/Ended/Failed。
+
+- 非 4:2:0、硬解打开失败或硬解运行中失败时，软件后端用 libavcodec 解码、libswscale 转为
+  BT.709 limited 8-bit NV12，再经 staging texture 上传一次。此后 ring、AI、present、HeadlessDecode
+  全部复用既有 GPU 路径。硬解的 10-bit/HDR 精度不变；软件兼容路径不做 HDR tone mapping。
+- 每张帧按实际 AVFrame/D3D11 surface 校验尺寸和格式。尺寸、色彩或归一化描述改变时返回
+  `NeedReconfigure`；Player 让 present 进入既有 splash 安全握手，只重建尺寸相关 GPU 资源并发布
+  新配置首帧，decode/audio/present 线程和数据源不重建。直接 seek 到另一配置也走同一路径。
+- `Player.timeline_generation()` 在 open、seek 和重配置时递增；`push_ai_frame` /
+  `get_cuda_nv12_by_frame` 可携带 generation，旧代际调用直接失效。Scheduler 据此清空旧场景、
+  frame cache 和 pending regions，统计 `config_resets`。
+- 时间轴分 finite/live/segmented：live 没有固定总长，暂时无数据不暂停，重开播放列表时保留会话
+  时间轴；segmented 在显著 PTS 回退后扩展容器少报的总长，允许拼接 TS 全段连续播放。跨段精确
+  seek 仍受容器索引能力限制，不在保证内。
+
 ## 帧归一化契约
 
 下游 ring、scrub thumbnail、AI CUDA 桥与 HeadlessDecode 统一消费**显示方向正确、BT.709、
@@ -378,7 +402,8 @@ limited range、8-bit NV12**。`Decoder::prepare_nv12_frame()` 是这个契约�
   缩略图按它 letterbox，于是 DVD 式 720×480 SAR 853:720 的画面按 16:9 而不是 3:2 呈现；ring /
   AI 桥 / scrub blit 仍在编码像素网格上工作。导出与 Web 串流由 `HeadlessDecode::pixel_aspect()`
   把同一比例作为输出 SAR（`-aspect`）写给编码器，Web 封面按 DAR 缩放并 `setsar=1`。
-- 未标记色彩 tag 沿既有 BT.709 limited 契约；非 4:2:0 像素格式仍在 open 时明确拒绝。
+- 显式色彩 tag 优先；未标记 SD（宽 ≤1279 且高 ≤576）按 BT.601，未标记 HD 按 BT.709，range 默认
+  limited。非 4:2:0 不再拒绝，走上述软件兼容路径。
 - 归一化只在主播放、seek、缩略图和 headless 的 D3D11 临界区内执行，解码与网络等待仍不持有
   `d3d_mutex_`；它设置的必要管线状态由下游每帧重设，用后立即解绑自己的 SRV/RTV。
 
@@ -396,7 +421,7 @@ limited range、8-bit NV12**。`Decoder::prepare_nv12_frame()` 是这个契约�
    - 若目标帧号超出实际可解码范围（视频末尾附近的深度 seek），优雅地 clamp 到能拿到的最后
      一帧，而不是直接失败。
    - `first_pts_seconds_`/`loop_offset_seconds_` 这两个"帧号原点"锚点**从不**因 seek 而重置。
-     产品策略已改为**播完停最后一帧、不循环**（`next_frame()` 在 EOF 返回 false，不再推进
+     产品策略已改为**播完停最后一帧、不循环**（`next_frame()` 返回 `DecodeStatus::Eof`，不再推进
      `loop_offset_seconds_`；该字段会话内恒为 0，仅保留在 PTS 公式里）。这保证任意次数 seek
      之后帧号在全局意义上仍然一致。
 3. 把落地帧拷贝进 passthrough ring 对应的 slot，并**清空**（而非部分清空）`pt_tag_`/`ai_tag_`
@@ -418,17 +443,20 @@ limited range、8-bit NV12**。`Decoder::prepare_nv12_frame()` 是这个契约�
 
 seek 仍只重定位：目标落在长持帧区间内时显示该图片，并把时钟放到请求位置。区间所有者标签
 用于验证 stale 重放；长持帧跨过取模环周期时，后续图片优先使用空槽或已过期槽，不覆盖仍有效的
-图片。真实时间戳显著回退时接到上一帧之后，正向缺损保持原时间跨度；拼接 TS 若声明时长过短仍
-按声明末尾暂停，不保证跨重复时间戳段的精确 seek。验证入口：`scripts/verify_playback_timeline.py`。
+图片。真实时间戳显著回退时接到上一帧之后，正向缺损保持原时间跨度；拼接 TS 进入 segmented
+时间轴并按真实图片扩展总长，前后段都可连续播放，不保证跨重复时间戳段的精确 seek。验证入口：
+`scripts/verify_playback_timeline.py`。
 
 ## 网络与音频输出恢复
 
 HTTP/HTTPS 已知时长、支持 Range 的文件提前断流时，先由 FFmpeg 尝试重连；失败返回后，解码线程
 按有上限的退避重新打开失效连接与解封装器，再 seek 到当前播放时间附近；保留硬解 codec、GPU
 资源、播放器、模型与线程，也不重置 QPC 时钟。正常 seek 仍不重新打开任何资源。
-真实末尾不重试；关闭会话通过 AVIOInterruptCB 打断网络等待。未知时长直播、RTSP 与服务端不支持
-Range 的输入不在此恢复保证内。`Player.stats()` 提供网络恢复次数与状态，验证入口为
-`scripts/verify_network_recovery.py`。
+真实末尾不重试；关闭会话通过 AVIOInterruptCB 打断网络等待。未知时长 HLS live 使用独立的
+live 状态与重开路径，冻结 playlist / segment 503 期间时钟和 present 不停止，恢复发布后接续新帧；
+真正结束、ABR、RTSP 与非 HTTP 协议仍属 best-effort，不在同等保证内。`Player.stats()` 提供网络
+恢复次数、SourceState 与配置代际。验证入口为 `scripts/verify_network_recovery.py` 和
+`scripts/verify_decoder_compatibility.py`（后者同时覆盖软解、重配置、HLS VOD/live）。
 
 WASAPI 在音频线程内检测默认端点改变、设备失效及输出调用失败，释放旧端点及重采样缓冲后重建；
 无设备时有界退避，视频照常前进，新端点按当前视频时钟丢弃落后音频并重新同步。
@@ -441,7 +469,7 @@ WASAPI 在音频线程内检测默认端点改变、设备失效及输出调用�
 
 本地文件提前 EOF 或解码失败时，decode 线程每 250ms 尝试在当前播放时间附近重定位，只移动解码器、不重置时钟、不重建线程或资源。播放中追加下载数据可自动恢复当前时间附近的新画面，不补播已经经过的缺损时段。手动 seek 到尚未下载且无可解码帧的位置仍会返回异常，由主界面捕获并显示简短提示。
 
-恢复依赖容器已知完整时间轴；TS 等仅能从现有数据推断时长的文件仍按推断末尾暂停，未知时长输入则按实际 EOF 停止。本地自动重试不用于网络源，避免额外远程 seek。
+恢复依赖容器已知完整时间轴；TS 等仅能从现有数据推断时长的文件仍按推断末尾暂停，未知时长的非 live 输入按实际 EOF 停止。本地自动重试不用于网络源，避免额外远程 seek。
 
 可恢复坏数据日志按 Decoder 会话独立计数：首条保留示例，后续每 5s 至多输出一条累计摘要，关闭会话时补齐未报告计数。FFmpeg 回调只在当前线程的 Decoder 调用作用域内合并已知坏数据文案，自身 `AVERROR_INVALIDDATA` 返回也纳入计数；其他错误、fatal 日志及作用域外日志仍交给默认回调，不全局降低日志级别。验证入口为 `scripts/verify_decoder_logging.py`。
 

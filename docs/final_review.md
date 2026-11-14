@@ -212,9 +212,9 @@ PTS 持续区间支持 VFR 时间网格；HTTP 文件断流可恢复，WASAPI �
 剩余边界：
 
 - HDR 为固定参数 SDR tone mapping，不读取 mastering-display/MaxCLL 做动态适配，不做 HDR 直出。
-- 软解 fallback；解码中途分辨率/格式切换；SAR、去隔行；播放端字幕与音轨选择。
-- 拼接 TS 的重复时间戳仅防止回退画面覆盖，容器声明时长过短时仍按声明末尾暂停；未提供跨段精确 seek。
-- RTSP、未知时长直播与不支持 Range 的网络源不在 HTTP 文件恢复保证内。
+- 去隔行；播放端字幕与音轨选择。软件解码/通用像素格式与流中重配置已落地，SAR 已支持。
+- 拼接 TS 可扩展分段时间轴并全段连续播放，但仍未提供跨重复时间戳段的精确 seek。
+- HLS live 的冻结/暂时 503 已有恢复验证；真正结束、ABR、RTSP 与其他非 HTTP 直播仍属 best-effort。
 - D3D11 device-removed 恢复路径（M3）；物理音频热插拔/默认设备切换仍需人工验收。
 - P4/P5/P6 性能项（转码管线重叠、NV12→BGR 融合、Present 出锁）——按量测结果单独立项。
 - EOF 后播放键回 0 重播（UX 决策）。

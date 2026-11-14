@@ -1,38 +1,36 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 //
-// Promoted from spikes/spike0_d3d11_present/src/decoder.{h,cpp} (verbatim decode path) and
-// spikes/spike2_clock_mixing/src/decoder.{h,cpp}, plus a new seek_to_frame() for sumu's I6
-// ("seek = reposition, not teardown"). Product EOF policy is pause-on-last-frame (no loop);
-// FFmpeg d3d11va hardware decode of HEVC (or anything FFmpeg + the installed D3D11VA hwaccel
-// supports) straight into GPU-resident NV12/P010 D3D11 textures shared with the caller's
-// device -- no readback, no re-upload.
+// Decoder: the stable facade Player and HeadlessDecode hold. It owns one session -- a MediaSource
+// (AVFormat/IO/packets/audio queue/reconnect), a VideoDecoder backend (D3D11VA or software), the
+// presentation timeline that anchors every frame number to real decoded PTS (I5), and the GPU
+// frame normalizer -- and hands out DecodedFrames plus a typed DecodeStatus.
 //
-// AVFrame with format == AV_PIX_FMT_D3D11:
-//   frame->data[0] -> ID3D11Texture2D*  (a texture ARRAY; one physical texture backs the
-//                                         whole decode pool)
-//   frame->data[1] -> array slice index for this frame, stored as an integer cast to a
-//                     pointer (intptr_t), NOT a real pointer.
+// Frame contract (see prepare_nv12_frame): every consumer always receives display-oriented,
+// BT.709, limited-range, 8-bit NV12. width()/height() report that normalized display size; the
+// size the codec actually produced is coded_width()/coded_height(). Anamorphic sources keep that
+// grid as-is -- the shape correction is presentation-only, reported by pixel_aspect().
 //
-// We ask FFmpeg to build the hw_frames_ctx with BindFlags including
-// D3D11_BIND_SHADER_RESOURCE (in addition to the D3D11_BIND_DECODER it always needs) so we
-// can create SRVs straight on the decoder's own texture array slices.
+// Hardware decode keeps full precision into the normalizer (10-bit P010, HDR, full range, display
+// matrix are all normalized on the GPU). The software compatibility path (non-4:2:0 sources, or a
+// hardware decoder that is unavailable/fails) converts to 8-bit BT.709 limited NV12 in libswscale
+// first -- HDR there degrades to a non-tone-mapped 8-bit compatibility image rather than losing
+// the session.
 //
-// Frame contract (see prepare_nv12_frame): every consumer always receives
-// display-oriented, BT.709, limited-range, 8-bit NV12. width()/height() report that normalized
-// display size; the coded size the codec actually produced is coded_width()/coded_height().
-// Anamorphic sources keep that grid as-is -- the shape correction is presentation-only, reported
-// separately by pixel_aspect().
+// Threading: one thread drives decode calls at a time (Player's decode thread under
+// decoder_mutex_). next_frame()/seek_to_frame()/reconnect_to_frame() may create GPU resources but
+// never write immediate-context state; prepare_nv12_frame() does write context state and must be
+// called under the caller's D3D serialization (Player's d3d_mutex_).
 
 #pragma once
 
 #include <d3d11.h>
-#include <wrl/client.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
-#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -43,161 +41,242 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixfmt.h>
 }
 
-// One decoded frame, still GPU-resident. `texture`/`array_slice` identify the D3D11
-// subresource to sample; `pts_seconds` is the presentation timestamp in seconds (stream
-// time_base already applied), relative to the first frame ever decoded in this Decoder's
-// lifetime (see Decoder::first_pts_seconds_) -- this is the single stable origin that
-// frame_num = round(pts_seconds * fps) is computed against, seek or no seek (I5).
+class MediaSource;
+class VideoDecoder;
+struct VideoPicture;
+
+enum class VideoBackendKind
+{
+    None,
+    Hardware,
+    Software,
+};
+
+inline const char* video_backend_name(VideoBackendKind kind)
+{
+    switch (kind) {
+    case VideoBackendKind::Hardware: return "d3d11va";
+    case VideoBackendKind::Software: return "software";
+    default: return "none";
+    }
+}
+
+// Typed outcome of one decode step.
+//   Frame              -- out is filled with a new picture.
+//   WouldBlock         -- the source has nothing for us right now (live/unknown-duration stream
+//                         between packets). Not a failure: call again later.
+//   Eof                -- the stream really ended.
+//   NeedReconfigure    -- a picture IS handed out, but its geometry/format no longer matches the
+//                         session: resources sized from width()/height() must be rebuilt. Only
+//                         returned after the first frame (the first frame silently re-adopts).
+//   RetryWithSoftware  -- backend hint ("this hardware path cannot continue"); Decoder consumes it
+//                         itself and never returns it to callers.
+//   RecoverableIoError -- transport/bitstream hiccup; a seek or reconnect can resume.
+//   FatalError         -- out is not usable; the session is done.
+enum class DecodeStatus
+{
+    Frame,
+    WouldBlock,
+    Eof,
+    NeedReconfigure,
+    RetryWithSoftware,
+    RecoverableIoError,
+    FatalError,
+};
+
+struct DecodeResult
+{
+    DecodeStatus status = DecodeStatus::FatalError;
+    std::string error; // empty for Frame/Eof/WouldBlock; diagnostic otherwise
+
+    // Legacy truthiness: "did I get a picture". Pre-typed callers use it unchanged; anything that
+    // must tell WouldBlock/Eof/NeedReconfigure apart switches on `status`.
+    explicit operator bool() const { return status == DecodeStatus::Frame; }
+};
+
+// Coarse session state, for UI/diagnostics and for telling "still buffering" from "starved".
+enum class SourceState
+{
+    Opening,
+    Buffering,
+    Ready,
+    Starved,
+    Reconfiguring,
+    Recovering,
+    Ended,
+    Failed,
+};
+
+enum class TimelineKind
+{
+    Finite,
+    Live,
+    Segmented,
+};
+
+// One decoded frame, still GPU-resident. `texture`/`array_slice` identify the D3D11 subresource to
+// sample; `pts_seconds` is the presentation timestamp in seconds (stream time_base already
+// applied), relative to the first frame ever decoded in this Decoder's lifetime (I5: the single
+// stable origin frame_num = round(pts_seconds * fps) is computed against, seek or no seek).
+//
+// Lifetime: everything here is valid only until the next next_frame()/seek_to_frame()/
+// reconnect_to_frame()/close() -- exactly one picture is kept in flight.
 struct DecodedFrame
 {
-    ID3D11Texture2D* texture = nullptr; // NOT owned; alive as long as `owner_frame` is
+    ID3D11Texture2D* texture = nullptr; // NOT owned; null for a software frame until prepared
     UINT array_slice = 0;
     double pts_seconds = 0.0;
     // How long this picture stays on screen: the frame's own declared duration, or one frame
     // interval (1/fps) when the container does not carry one. Downstream maps it onto the
     // fixed-fps grid so a VFR picture answers for its whole hold interval.
     double duration_seconds = 0.0;
+
+    // ---- actual picture description (what is in `texture`, before normalization) ---------------
+    int width = 0;  // visible picture size
+    int height = 0;
+    // Hardware: the D3D11VA frames sw_format (NV12 / P010). Software: AV_PIX_FMT_NV12, the
+    // uploaded compatibility contract. Never the opaque AV_PIX_FMT_D3D11.
+    AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
+    int bit_depth = 8;
+    bool full_range = false;
+    VideoMatrix matrix = VideoMatrix::Bt709;
+    VideoTransfer transfer = VideoTransfer::Sdr;
+    bool primaries_2020 = false;
+
+    // ---- software compatibility access ---------------------------------------------------------
+    // True when the picture was decoded on the CPU. Its GPU texture is produced lazily by
+    // prepare_nv12_frame() (the upload is a GPU write and needs the caller's D3D serialization),
+    // so `texture` is null until then. cpu_plane[0]/[1] are the packed BT.709 limited 8-bit NV12
+    // planes it is uploaded from (luma, then interleaved chroma at half height).
+    bool software = false;
+    AVFrame* source_frame = nullptr; // backend-owned decoded frame (not to be freed)
+    const uint8_t* cpu_plane[2] = {nullptr, nullptr};
+    int cpu_linesize[2] = {0, 0};
+    uint64_t software_serial = 0; // internal: ties the CPU planes to the picture they came from
 };
 
 class Decoder
 {
 public:
-    Decoder() = default;
+    Decoder();
     ~Decoder();
+
+    Decoder(const Decoder&) = delete;
+    Decoder& operator=(const Decoder&) = delete;
 
     // device: caller's D3D11 device (already created, same one used for the swapchain).
     // Returns false + fills `error` on failure. Populates fps()/width()/height()/frame_count().
     // `path` may be a local filesystem path OR an http(s) URL (FFmpeg network protocols).
-    // Network URLs get timeout/reconnect/smaller probe options; see is_network().
     // `headers` / `cookies` are the optional HTTP request context the browser page captured for
-    // this URL ("Referer: …\r\nUser-Agent: …\r\n" / "a=1; b=2"), applied to the HTTP protocol
+    // this URL ("Referer: ...\r\nUser-Agent: ...\r\n" / "a=1; b=2"), applied to the HTTP protocol
     // only -- never for local files, never logged, and replayed by reconnect_to_frame().
+    // The backend is chosen here: D3D11VA for the 4:2:0 formats it can decode on this device,
+    // software for anything else and as the fallback when hardware open fails.
     bool open(const std::string& path, ID3D11Device* device, std::string& error,
               const std::string& headers = std::string(),
               const std::string& cookies = std::string());
 
     // True when the last successful open() treated `path` as a network URL (http/https).
     // Player uses this to pick the shallow IO profile (smaller ring, no scrub second open).
-    bool is_network() const { return is_network_; }
+    bool is_network() const;
+    bool is_live() const;
 
     // Scheme check only -- does not open anything. Shared with Player for early UI decisions.
     static bool looks_like_network_url(const std::string& path);
 
-    // Ask a blocked open() to bail out early: the AVIOInterruptCB installed on fmt_ctx_
-    // makes FFmpeg's next network IO checkpoint fail instead of waiting out rw_timeout.
+    // Ask a blocked open()/read to bail out early: the AVIOInterruptCB installed on the format
+    // context makes FFmpeg's next network IO checkpoint fail instead of waiting out rw_timeout.
     // Atomic store only -- safe to call from the UI thread while open() blocks a worker.
-    void request_interrupt() { interrupt_requested_.store(true, std::memory_order_relaxed); }
+    void request_interrupt();
 
-    // Decode until one frame is available. Returns false on EOF or unrecoverable error;
-    // no implicit looping. Player may retry seek_to_frame() across a local incomplete segment.
-    // The returned DecodedFrame is only
-    // valid until the next call to next_frame() or seek_to_frame() (we keep exactly one AVFrame
-    // "in flight" to bound VRAM use / decoder pool pressure).
-    bool next_frame(DecodedFrame& out);
+    // Decode until one picture is available. Never loops on EOF. A transient source stall is only
+    // waited out for buffered (known-duration) sources: a live/unknown-duration source answers
+    // WouldBlock instead of spinning or failing.
+    DecodeResult next_frame(DecodedFrame& out);
 
     // Normalize a decoded frame to the one contract every downstream path consumes:
     // display-oriented (display-matrix rotation/mirror applied), BT.709, limited range, 8-bit
-    // NV12, array slice 0 -- all on this device, no CPU involvement. A source that already
-    // matches is passed through untouched (frame left exactly as decoded, zero GPU work).
-    // On success `frame` points at either the decoded surface (fast path) or the normalizer's
-    // output surface; either way the caller may copy it with CopySubresourceRegion(...., nullptr)
-    // as before. Player callers must hold d3d_mutex_ around this call and the subsequent copy;
-    // HeadlessDecode uses its single-threaded immediate context. Returns false + `error` on any
-    // unsupported/unsatisfiable case (never a silently wrong image).
+    // NV12, array slice 0 -- all on this device. A source that already matches is passed through
+    // untouched (frame left exactly as decoded, zero GPU work). Software frames are uploaded to
+    // their reusable NV12 texture here. On success `frame` points at either the decoded surface
+    // (fast path) or the normalizer's output surface; either way the caller may copy it with
+    // CopySubresourceRegion(...., nullptr). Player callers must hold d3d_mutex_ around this call
+    // and the subsequent copy; HeadlessDecode uses its single-threaded immediate context.
+    // Returns false + `error` on any unsupported/unsatisfiable case (never a silently wrong image).
     bool prepare_nv12_frame(DecodedFrame& frame, std::string& error);
 
-    // EOF 状态：next_frame() 解到流末尾（pump 返回 0，即真实 EOF，不含解码错误）时置位，
-    // seek_to_frame()/close() 复位。原子 —— 由 decode 线程写、Player::open_session() 的
-    // 起始缓冲等待在另一线程读，用于区分「缓冲还没填满」与「流本来就短、已经解完了」
-    // （短视频总帧数可能低于起始缓冲高水位，不能用 frame_count_ 判 —— 裸流时它为 0）。
+    // EOF state: set when next_frame() reaches the real end of the stream (not on a decoding
+    // error); cleared by seek_to_frame()/reconnect_to_frame()/close(). Atomic -- written by the
+    // decode thread, read by Player::open_session()'s start-of-session buffering wait in another
+    // thread to tell "buffer not full yet" from "the stream is short and already finished".
     bool at_eof() const { return at_eof_.load(std::memory_order_acquire); }
     bool failed() const { return failed_.load(std::memory_order_acquire); }
+    // Diagnostic for the last failed()/RecoverableIoError outcome.
+    const std::string& last_error() const { return last_error_; }
 
-    // I6: seek = reposition, not teardown. Does NOT touch fmt_ctx_/codec_ctx_/hw_device_ref_
-    // lifetime at all -- av_seek_frame + AVSEEK_FLAG_BACKWARD to the nearest keyframe at or
-    // before target_frame, avcodec_flush_buffers, then decodes forward until the real decoded
-    // PTS (not the nominal target) reaches target_frame (I5: frame numbers are anchored to
-    // real decoded PTS). If target_frame lands at/after EOF, clamps to the last frame that
-    // could actually be decoded rather than failing outright, so a near-tail seek degrades
-    // gracefully. Returns the actual landed frame via `out`; caller derives the actual
-    // frame_num from out.pts_seconds (== llround(out.pts_seconds * fps())).
+    // I6: seek = reposition, not teardown. Does NOT touch the transport or codec lifetime at all --
+    // av_seek_frame + AVSEEK_FLAG_BACKWARD to the nearest keyframe at or before target_frame,
+    // flush, then decode forward until the real decoded PTS (not the nominal target) reaches
+    // target_frame (I5). If target_frame lands at/after EOF, clamps to the last frame that could
+    // actually be decoded rather than failing outright, so a near-tail seek degrades gracefully.
+    // Returns the actual landed frame via `out`; caller derives the actual frame_num from
+    // out.pts_seconds (== llround(out.pts_seconds * fps())).
     // nearest_keyframe: for coarse previews (scrub grid) -- after the BACKWARD seek, return the
     // FIRST decoded frame (the keyframe at/before target) instead of decoding forward to the exact
-    // target. Cuts per-seek work from a whole-GOP forward-decode to a single frame, so background
-    // grid fill barely competes with a foreground 4K decode. out lands on that keyframe's real PTS.
+    // target. Cuts per-seek work from a whole-GOP forward-decode to a single frame.
     bool seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
                        bool nearest_keyframe = false);
+    // Re-opens the URL (same headers/cookies) and repositions at target_frame. Only meaningful for
+    // network sources whose transport died; fails when the source no longer matches the session.
     bool reconnect_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error);
+    // Reopens a live playlist/transport without seeking or resetting the session timeline.
+    bool reconnect_live(std::string& error);
 
     double fps() const { return fps_; }
-    // Normalized (display) size: for a stream carrying a 90/270 display matrix this is the
-    // coded size swapped, so callers never have to know about rotation.
+    // Normalized (display) size: for a stream carrying a 90/270 display matrix this is the coded
+    // size swapped, so callers never have to know about rotation.
     int width() const { return width_; }
     int height() const { return height_; }
     // Size the codec actually produced (pre-rotation), for diagnostics only.
     int coded_width() const { return coded_width_; }
     int coded_height() const { return coded_height_; }
-    // Pixel aspect ratio (pixel width / pixel height) the stream declares: 1.0 for square pixels,
-    // which is the overwhelmingly common case. Anamorphic sources -- DVD-style 720x480 carrying
-    // 853:720 -- are 16:9 on screen even though their coded grid is 3:2, so presentation geometry
-    // (letterbox viewport, window sizing, thumbnails) must scale by this. The pixel paths (ring,
-    // AI bridge, scrub blits) still work in coded pixels and ignore it.
+    // Pixel aspect ratio (pixel width / pixel height) the stream declares: 1.0 for square pixels.
+    // Anamorphic sources are 16:9 on screen even though their coded grid is 3:2, so presentation
+    // geometry must scale by this; the pixel paths work in coded pixels and ignore it.
     double pixel_aspect() const { return pixel_aspect_; }
-    // Timeline length in the fixed-fps grid the player lays over the stream (stream/format
-    // duration * fps, floored by the physical frame count so a short declared duration can
-    // never hide pictures that really exist). 0 means genuinely unknown (rare containers) --
-    // callers should treat that as "no known upper bound" rather than crash.
+    // Timeline length in the fixed-fps grid the player lays over the stream. 0 means genuinely
+    // unknown (rare containers / live sources).
     int64_t frame_count() const { return frame_count_; }
 
-    // ---- audio (spike, additive) -- demux-only: this class never builds an audio
-    // AVCodecContext or decodes audio itself, it only pulls audio AVPackets off fmt_ctx_ (in
-    // pump_one_raw_frame(), same av_read_frame() call the video path already uses) and queues
-    // them for Player's own audio thread to pop, decode (software), resample, and play. No
-    // audio stream in the file is legitimate and silent -- has_audio() is simply false, callers
-    // must not treat that as an error (mirrors this class's existing silent-video-is-fine
-    // stance elsewhere).
-    bool has_audio() const { return audio_stream_idx_ >= 0; }
-    AVCodecParameters* audio_codecpar() const
+    // Bumped whenever the frame geometry/colour description or the decode backend changes, so a
+    // consumer holding derived GPU resources can tell its assumptions are stale.
+    uint64_t config_generation() const
     {
-        return has_audio() ? fmt_ctx_->streams[audio_stream_idx_]->codecpar : nullptr;
+        return config_generation_.load(std::memory_order_acquire);
     }
-    AVRational audio_time_base() const
-    {
-        return has_audio() ? fmt_ctx_->streams[audio_stream_idx_]->time_base : AVRational{ 1, 1 };
-    }
-    // Shared time-axis origin for the audio thread's A/V sync math (see player.cpp's
-    // audio_loop()): the raw PTS (seconds, stream time_base already applied) of the very first
-    // frame this Decoder ever decoded, established once in next_frame() and never changed by a
-    // seek (I5) -- identical origin present_loop()'s frame numbers are anchored to. Atomic (not
-    // just for pump_one_raw_frame()'s existing single-writer-thread use) because the audio
-    // thread now reads it from a different thread with no other synchronization.
+    SourceState source_state() const { return source_state_.load(std::memory_order_acquire); }
+    TimelineKind timeline_kind() const;
+    VideoBackendKind backend() const;
+
+    // ---- audio (demux-only -- this class never decodes audio itself) --------------------------
+    // It only pulls audio AVPackets off the transport (in pump_one_picture(), same av_read_frame()
+    // call the video path uses) and queues them for Player's own audio thread to pop, decode,
+    // resample and play. No audio stream in the file is legitimate and silent.
+    bool has_audio() const;
+    AVCodecParameters* audio_codecpar() const;
+    AVRational audio_time_base() const;
+    // Shared time-axis origin for the audio thread's A/V sync math: the raw PTS (seconds, stream
+    // time_base applied) of the very first frame this Decoder ever decoded, established once and
+    // never changed by a seek (I5). Atomic: read from Player's audio thread.
     double first_pts_seconds() const { return first_pts_seconds_; }
     bool have_first_pts() const { return have_first_pts_; }
-
-    // Pop one queued audio packet (FIFO order) into `dst` (caller-owned AVPacket, typically
-    // reused across calls -- av_packet_move_ref resets `dst` first) and its associated
-    // loop_offset (the decoder's loop_offset_seconds_ at the moment this packet was queued --
-    // see pump_one_raw_frame()/AudioPacketEntry below), written to `loop_offset_out`. Returns
-    // false if the queue is currently empty (dst/loop_offset_out left untouched). Thread-safe:
-    // this is the ONLY state shared between the decode thread (pump_one_raw_frame(), the
-    // producer) and Player's audio thread (the sole consumer) -- present_loop() never calls
-    // this.
+    // See MediaSource::pop_audio_packet.
     bool pop_audio_packet(AVPacket* dst, double& loop_offset_out);
-
-    // Seek coordination (additive): discards every audio packet currently queued, WITHOUT
-    // touching fmt_ctx_/codec_ctx_ lifetime (mirrors seek_to_frame()'s own I6 stance). Callers
-    // (Player::seek()) must call this under decoder_mutex_ BEFORE seek_to_frame() -- seek_to_
-    // frame()'s own forward-decode-to-target loop (same thread, same lock) may itself push
-    // fresh, already-correct-for-the-new-position audio packets via pump_one_raw_frame(); this
-    // method only needs to clear whatever stale, pre-seek packets decode_loop() had queued
-    // before the seek started.
-    void flush_audio_queue();
-
-    // Best-effort queue depth, for the audio thread's per-second drift/health log only (never
-    // used for control flow) -- see player.cpp's audio_loop().
-    size_t audio_queue_depth() const;
+    void flush_audio_queue(); // caller must call under decoder_mutex_ BEFORE seek_to_frame()
+    size_t audio_queue_depth() const; // diagnostics only, never control flow
 
     void close();
 
@@ -213,67 +292,77 @@ private:
     uint64_t reported_packets_ = 0;
     std::chrono::steady_clock::time_point next_log_summary_{};
 
-    static AVPixelFormat get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts);
-    bool ensure_hw_frames_ctx(AVCodecContext* ctx);
-    bool seek_to_start();
-    // Reads the stream's AV_PKT_DATA_DISPLAYMATRIX (if any) and derives the display transform.
-    // Never fails: a malformed/absent matrix means "no transform".
-    void resolve_display_transform(AVStream* stream);
-    // Fills normalize_desc_ from the codec tags + the resolved display transform, updates
-    // width_/height_ to the normalized display size, and builds the normalizer when the source
-    // needs one. Returns false + `error` when the conversion is impossible on this device.
-    bool configure_frame_normalization(std::string& error);
+    // Everything the normalizer needs to know about the surfaces arriving from the backend.
+    struct SourceFormat
+    {
+        int width = 0;
+        int height = 0;
+        AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
+        int bit_depth = 8;
+        bool full_range = false;
+        VideoMatrix matrix = VideoMatrix::Bt709;
+        VideoTransfer transfer = VideoTransfer::Sdr;
+        bool primaries_2020 = false;
+    };
 
-    // Shared "pull one hw frame out of the demuxer/decoder" pump, used by both next_frame()
-    // and seek_to_frame()'s forward-decode-to-target loop. Does NOT loop-on-EOF (both callers
-    // treat r==0 as end-of-stream: next_frame returns false, seek_to_frame clamps to last
-    // good). Returns 1 = got a frame (out filled, pts fields NOT yet remapped through
-    // loop_offset_/first_pts_ -- caller does that), 0 = EOF, -1 = unrecoverable error.
-    int pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out);
+    // Opens the best backend for this stream: hardware when FFmpeg exposes D3D11VA for it and the
+    // source is 4:2:0, software otherwise or as the fallback.
+    bool open_backend(bool allow_hardware, std::string& error);
+    // One-shot hardware -> software fallback inside a session (never a loop).
+    bool switch_to_software(const std::string& reason, std::string& error);
+    // Re-positions the transport and drops decoder/timeline state after a backend switch.
+    bool resume_at(double raw_pts_seconds, std::string& error);
 
-    AVFormatContext* fmt_ctx_ = nullptr;
-    AVCodecContext* codec_ctx_ = nullptr;
-    AVBufferRef* hw_device_ref_ = nullptr;
+    SourceFormat initial_source_format() const;
+    SourceFormat derive_source_format(const VideoPicture& picture) const;
+    // Builds/refreshes the GPU normalizer for `format`; no-op when nothing changed.
+    bool configure_output(const SourceFormat& format, std::string& error);
+
+    // One picture from the backend, demuxing as needed. Returns Frame/Eof/WouldBlock/... but never
+    // touches the timeline or the caller's frame.
+    DecodeStatus pump_one_picture(VideoPicture& picture, double& raw_pts_s, std::string& error);
+    // pump_one_picture + describe_picture, with the one-shot software fallback applied internally:
+    // Frame/NeedReconfigure come back fully described, everything else is passed through.
+    DecodeStatus pull_described(DecodedFrame& out, double& raw_pts_s, std::string& error);
+    // Fills `out` (description + validation), and reconfigures internally on colour/size changes.
+    DecodeStatus describe_picture(const VideoPicture& picture, DecodedFrame& out,
+                                  std::string& error);
+    DecodeResult fail(DecodeStatus status, const std::string& error);
+    void set_state(SourceState state) { source_state_.store(state, std::memory_order_release); }
+    // Stream PTS -> playback timeline (origin + discontinuity correction), with the monotonic guard
+    // for backwards jumps. Every DecodedFrame goes through this so video and audio stay aligned.
+    double map_timeline_pts(double raw_pts_s);
+
+    std::unique_ptr<MediaSource> source_;
+    std::unique_ptr<VideoDecoder> video_;
     AVPacket* pkt_ = nullptr;
-    AVFrame* frame_ = nullptr;
-    int video_stream_idx_ = -1;
+
     double fps_ = 60.0;
     AVRational time_base_{1, 1};
     int width_ = 0;
     int height_ = 0;
-    double pixel_aspect_ = 1.0; // sample_aspect_ratio (see pixel_aspect()); 1.0 == square pixels
+    double pixel_aspect_ = 1.0;
     int64_t frame_count_ = 0;
 
-    // std::atomic: written once (single-shot init) by the decode thread inside next_frame(),
-    // now also read from Player's audio thread (audio_loop()) with no other synchronization --
-    // see first_pts_seconds()'s comment above. Everywhere else in this file these are used
-    // exactly as plain double/bool (atomic<T>'s implicit conversion/assignment operators cover
-    // every existing read/write site unchanged).
-    std::atomic<bool> have_first_pts_{ false };
-    std::atomic<double> first_pts_seconds_{ 0.0 };
-    std::atomic<bool> at_eof_{ false }; // 见 at_eof() 注释；next_frame 置位、seek/close 复位
-    std::atomic<bool> failed_{ false };
-    bool draining_ = false;
+    std::atomic<bool> have_first_pts_{false};
+    std::atomic<double> first_pts_seconds_{0.0};
+    std::atomic<bool> at_eof_{false};
+    std::atomic<bool> failed_{false};
+    std::atomic<uint64_t> config_generation_{0};
+    std::atomic<SourceState> source_state_{SourceState::Opening};
+    std::string last_error_;
 
-    // AVIOInterruptCB backing flag (see request_interrupt()). Set by the UI thread to abort a
-    // blocked network open(); cleared at the top of every open() because the same callback
-    // also gates av_read_frame() during normal decode.
-    std::atomic<bool> interrupt_requested_{ false };
-    static int interrupt_cb(void* opaque);
+    bool draining_ = false;          // end-of-stream already signalled to the backend
+    bool have_delivered_frame_ = false;
+    bool software_fallback_used_ = false;
+
     double loop_offset_seconds_ = 0.0; // stays 0 (pause-on-last-frame); kept for pts formula
     // Raw stream PTS (time_base applied, NOT origin-shifted) of the last frame -- the base the
-    // no-timestamp fallback steps from, so it stays in the same domain it is subtracted from.
+    // no-timestamp fallback steps from, and the resume point of a backend switch.
     double last_raw_pts_seconds_ = 0.0;
     double last_out_pts_seconds_ = -1.0; // last timeline PTS handed out (origin shifted)
-    // Accumulated correction that keeps the timeline continuous across a significant backwards
-    // PTS jump (concatenated segments / restarted timestamps). Reset on seek -- see
-    // map_timeline_pts().
-    double discontinuity_offset_ = 0.0;
-    // raw stream PTS -> playback timeline (loop_offset + origin + discontinuity correction),
-    // with the monotonic guard for backwards jumps. Every caller that hands out a
-    // DecodedFrame goes through this, so video and the audio packets queued alongside it stay
-    // on one timeline.
-    double map_timeline_pts(double raw_pts_s);
+    double discontinuity_offset_ = 0.0;  // keeps the timeline continuous across PTS resets
+    bool segmented_timeline_ = false;
 
     ID3D11Device* d3d_device_ = nullptr; // not owned
 
@@ -284,36 +373,8 @@ private:
     VideoNormalizer normalizer_;
     int coded_width_ = 0;
     int coded_height_ = 0;
-    // Clockwise display rotation (0/90/180/270) and horizontal mirror from the container's
-    // display matrix, kept for diagnostics.
     int display_rotation_cw_ = 0;
     bool display_hflip_ = false;
-
-    // Set in open() from looks_like_network_url(path); cleared in close(). Drives FFmpeg
-    // format options (timeout/reconnect/probesize) and is read by Player for IO profile.
-    bool is_network_ = false;
-
-    // HTTP request context captured by the browser page (see open()). Kept for the session so
-    // reconnect_to_frame() can re-open the same URL with the same credentials -- dropping them
-    // would turn a mid-playback reconnect into a 403. Cleared in close().
-    std::string http_headers_;
-    std::string http_cookies_;
-
-    // ---- audio (spike, additive) -----------------------------------------------------------
-    int audio_stream_idx_ = -1; // -1 == no audio stream (legitimate, silent)
-
-    // Timestamp correction at demux time, including any detected backwards discontinuity.
-    struct AudioPacketEntry {
-        AVPacket* pkt;
-        double loop_offset;
-    };
-
-    // Bounded so a slow/stalled audio consumer can never grow this without limit: 512 packets
-    // is far more than the ~4s of audio headroom this needs even for small audio frames (e.g.
-    // ~10.9s at a typical 1024-sample/48kHz AAC frame), so steady state should never trip the
-    // drop path below -- if it does, that's the signal (see audio_pkt_dropped_).
-    static constexpr size_t kAudioQueueMaxPackets = 512;
-    mutable std::mutex audio_pkt_mutex_;
-    std::deque<AudioPacketEntry> audio_pkt_queue_; // guarded by audio_pkt_mutex_
-    uint64_t audio_pkt_dropped_ = 0;        // guarded by audio_pkt_mutex_; oldest-drop counter
+    bool reported_anamorphic_ = false;
+    bool reported_rotation_ = false;
 };

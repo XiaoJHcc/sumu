@@ -3,15 +3,15 @@
 #include "decoder.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
+#include "media_source.h"
+#include "video_decoder.h"
+
 extern "C" {
-#include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/log.h>
-#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -32,7 +32,105 @@ bool is_corrupt_media_message(const char* format)
     return false;
 }
 
+// 8-bit 4:2:0 (and its 10-bit P010 / planar variants) are the only sources the D3D11VA path can
+// hand to the normalizer; everything else goes straight to software decode, which converts to the
+// same NV12 contract with libswscale.
+bool is_hardware_candidate(AVPixelFormat format)
+{
+    switch (format) {
+    case AV_PIX_FMT_NONE: // not known yet (raw/live): try hardware, the first frame decides
+    case AV_PIX_FMT_NV12:
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_YUV420P10LE:
+        return true;
+    default:
+        return false;
+    }
 }
+
+int pixel_depth(AVPixelFormat format)
+{
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(format);
+    return desc && desc->comp[0].depth > 0 ? desc->comp[0].depth : 8;
+}
+
+bool is_jpeg_range_format(AVPixelFormat format)
+{
+    return format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUVJ422P ||
+        format == AV_PIX_FMT_YUVJ440P || format == AV_PIX_FMT_YUVJ444P;
+}
+
+struct ColourTags
+{
+    bool full_range = false;
+    VideoMatrix matrix = VideoMatrix::Bt709;
+    VideoTransfer transfer = VideoTransfer::Sdr;
+    bool primaries_2020 = false;
+};
+
+// Container/bitstream colour tags -> the vocabulary the GPU normalizer understands. Explicit tags
+// win; an untagged stream keeps the documented BT.709 / limited / SDR contract (so untagged 4:2:0
+// material passes through without a re-matrix), and unmarked HDR is BT.2020 by convention.
+ColourTags interpret_colour(AVColorRange range, AVColorSpace space,
+                            AVColorTransferCharacteristic trc, AVColorPrimaries primaries,
+                            AVPixelFormat format)
+{
+    ColourTags tags{};
+    if (range == AVCOL_RANGE_JPEG)
+        tags.full_range = true;
+    else if (range == AVCOL_RANGE_MPEG)
+        tags.full_range = false;
+    else
+        tags.full_range = is_jpeg_range_format(format); // legacy JPEG-range pixel formats
+
+    switch (space) {
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:
+        tags.matrix = VideoMatrix::Bt601;
+        break;
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL: // constant-luminance content is vanishingly rare; treat as NCL
+        tags.matrix = VideoMatrix::Bt2020;
+        break;
+    default:
+        break;
+    }
+
+    if (trc == AVCOL_TRC_SMPTE2084) tags.transfer = VideoTransfer::Pq;
+    else if (trc == AVCOL_TRC_ARIB_STD_B67) tags.transfer = VideoTransfer::Hlg;
+
+    tags.primaries_2020 = primaries == AVCOL_PRI_BT2020;
+    if (primaries == AVCOL_PRI_UNSPECIFIED)
+        tags.primaries_2020 = tags.transfer != VideoTransfer::Sdr || tags.matrix == VideoMatrix::Bt2020;
+    return tags;
+}
+
+// Presentation timestamp for a just-received AVFrame. Prefer best_effort_timestamp: for files with
+// B-frames whose container stamped PTS==DTS (common bad remux), frame->pts stays in decode order
+// and would map frame_num backwards (visible as nearby-frame flicker). best_effort_timestamp is
+// FFmpeg's presentation-order estimate (equals pts when the container timestamps are correct).
+// `fallback_raw_pts` is the previous frame's raw PTS plus one frame interval.
+double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base, double fallback_raw_pts)
+{
+    int64_t ts = AV_NOPTS_VALUE;
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) ts = frame->best_effort_timestamp;
+    else if (frame->pts != AV_NOPTS_VALUE) ts = frame->pts;
+    if (ts != AV_NOPTS_VALUE) return ts * av_q2d(time_base);
+    return fallback_raw_pts;
+}
+
+bool desc_matches(const VideoNormalizeDesc& a, const VideoNormalizeDesc& b)
+{
+    return a.src_width == b.src_width && a.src_height == b.src_height &&
+        a.dst_width == b.dst_width && a.dst_height == b.dst_height &&
+        a.bit_depth == b.bit_depth && a.full_range == b.full_range && a.matrix == b.matrix &&
+        a.transfer == b.transfer && a.primaries_2020 == b.primaries_2020 &&
+        a.rotation_cw == b.rotation_cw && a.hflip == b.hflip;
+}
+
+} // namespace
 
 thread_local Decoder* Decoder::logging_decoder_ = nullptr;
 
@@ -48,6 +146,7 @@ public:
         decoder_.flush_corrupt_logs();
         logging_decoder_ = previous_;
     }
+
 private:
     Decoder& decoder_;
     Decoder* previous_;
@@ -89,8 +188,7 @@ void Decoder::record_corrupt_data(const char* message, bool packet_error)
 
 void Decoder::flush_corrupt_logs(bool force)
 {
-    if (corrupt_messages_ == reported_messages_ && corrupt_packets_ == reported_packets_)
-        return;
+    if (corrupt_messages_ == reported_messages_ && corrupt_packets_ == reported_packets_) return;
     const auto now = std::chrono::steady_clock::now();
     if (!force && now < next_log_summary_) return;
     fprintf(stderr, "[sumu] recoverable media data: summary: ffmpeg_messages=%llu "
@@ -101,275 +199,119 @@ void Decoder::flush_corrupt_logs(bool force)
     next_log_summary_ = now + std::chrono::seconds(5);
 }
 
+Decoder::Decoder() = default;
+
 Decoder::~Decoder()
 {
     close();
 }
 
-int Decoder::interrupt_cb(void* opaque)
-{
-    const Decoder* self = static_cast<const Decoder*>(opaque);
-    return self->interrupt_requested_.load(std::memory_order_relaxed) ? 1 : 0;
-}
-
 void Decoder::close()
 {
-    {
-        // Free any audio packets still sitting in the queue -- by the time close() runs,
-        // Player has already joined both the decode thread (producer) and its own audio
-        // thread (consumer), so no concurrent access is actually possible here; the lock is
-        // just cheap insurance, consistent with the rest of this class's style.
-        std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-        while (!audio_pkt_queue_.empty()) {
-            AudioPacketEntry e = audio_pkt_queue_.front();
-            audio_pkt_queue_.pop_front();
-            av_packet_free(&e.pkt);
-        }
-    }
     normalizer_.reset();
     needs_normalization_ = false;
-    normalize_desc_ = {};
-    coded_width_ = 0;
-    coded_height_ = 0;
-    pixel_aspect_ = 1.0;
-    display_rotation_cw_ = 0;
-    display_hflip_ = false;
+    normalize_desc_ = VideoNormalizeDesc{};
     if (pkt_) av_packet_free(&pkt_);
-    if (frame_) av_frame_free(&frame_);
-    if (codec_ctx_) avcodec_free_context(&codec_ctx_);
-    if (hw_device_ref_) av_buffer_unref(&hw_device_ref_);
-    if (fmt_ctx_) avformat_close_input(&fmt_ctx_);
+    video_.reset();
+    source_.reset();
     flush_corrupt_logs(true);
     corrupt_messages_ = 0;
     corrupt_packets_ = 0;
     reported_messages_ = 0;
     reported_packets_ = 0;
     next_log_summary_ = {};
-    video_stream_idx_ = -1;
-    audio_stream_idx_ = -1;
-    // Reset session-derived state so a subsequent open() (reopen path, or a retry after a
-    // partial open failure) starts from a clean slate -- without this, have_first_pts_ stays
-    // true and the next session would inherit the previous file's PTS origin (I5 break).
+    // Reset session-derived state so a subsequent open() (reopen path, or a retry after a partial
+    // open failure) starts from a clean slate -- without this, have_first_pts_ stays true and the
+    // next session would inherit the previous file's PTS origin (I5 break).
     fps_ = 60.0;
+    time_base_ = AVRational{1, 1};
     width_ = 0;
     height_ = 0;
+    coded_width_ = 0;
+    coded_height_ = 0;
+    pixel_aspect_ = 1.0;
     frame_count_ = 0;
+    display_rotation_cw_ = 0;
+    display_hflip_ = false;
+    reported_anamorphic_ = false;
+    reported_rotation_ = false;
     have_first_pts_.store(false, std::memory_order_relaxed);
     first_pts_seconds_.store(0.0, std::memory_order_relaxed);
     at_eof_.store(false, std::memory_order_relaxed);
     failed_.store(false, std::memory_order_relaxed);
+    config_generation_.store(0, std::memory_order_relaxed);
     draining_ = false;
+    have_delivered_frame_ = false;
+    software_fallback_used_ = false;
     loop_offset_seconds_ = 0.0;
     last_out_pts_seconds_ = -1.0;
     last_raw_pts_seconds_ = 0.0;
     discontinuity_offset_ = 0.0;
+    segmented_timeline_ = false;
     d3d_device_ = nullptr;
-    is_network_ = false;
-    http_headers_.clear();
-    http_cookies_.clear();
-}
-
-AVPixelFormat Decoder::get_hw_format_thunk(AVCodecContext* ctx, const AVPixelFormat* fmts)
-{
-    Decoder* self = static_cast<Decoder*>(ctx->opaque);
-    for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == AV_PIX_FMT_D3D11) {
-            if (self->ensure_hw_frames_ctx(ctx))
-                return AV_PIX_FMT_D3D11;
-        }
-    }
-    return AV_PIX_FMT_NONE;
-}
-
-bool Decoder::ensure_hw_frames_ctx(AVCodecContext* ctx)
-{
-    if (ctx->hw_frames_ctx)
-        return true;
-
-    AVBufferRef* frames_ref = nullptr;
-    int ret = avcodec_get_hw_frames_parameters(ctx, hw_device_ref_, AV_PIX_FMT_D3D11, &frames_ref);
-    if (ret < 0) {
-        fprintf(stderr, "avcodec_get_hw_frames_parameters failed: %d\n", ret);
-        return false;
-    }
-
-    AVHWFramesContext* frames_ctx = reinterpret_cast<AVHWFramesContext*>(frames_ref->data);
-    AVD3D11VAFramesContext* frames_hwctx = reinterpret_cast<AVD3D11VAFramesContext*>(frames_ctx->hwctx);
-
-    // We need to be able to build an SRV directly on the decoder's own texture array
-    // slices -- that's the whole point of sharing the D3D11 device with the swapchain (no
-    // readback, no copy). D3D11_BIND_DECODER is already implied by the decoder; add
-    // SHADER_RESOURCE so the same texture can be bound as a shader input.
-    frames_hwctx->BindFlags |= D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
-    frames_hwctx->MiscFlags = 0;
-
-    // A couple of extra slices of headroom beyond what the decoder asked for so the
-    // present/copy side reading the "current" slice never races a decoder that wants to
-    // reuse it immediately.
-    if (frames_ctx->initial_pool_size > 0)
-        frames_ctx->initial_pool_size += 4;
-
-    ret = av_hwframe_ctx_init(frames_ref);
-    if (ret < 0) {
-        char errbuf[256];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "av_hwframe_ctx_init failed: %s\n", errbuf);
-        av_buffer_unref(&frames_ref);
-        return false;
-    }
-
-    ctx->hw_frames_ctx = frames_ref; // transfers ownership
-    return true;
-}
-
-void Decoder::resolve_display_transform(AVStream* stream)
-{
-    display_rotation_cw_ = 0;
-    display_hflip_ = false;
-    if (!stream || !stream->codecpar) return;
-
-    // AV_PKT_DATA_DISPLAYMATRIX (libavutil/display.h) is the container's presentation
-    // transform, stored as (a, b, u, c, d, v, x, y, w) 16.16 fixed point with
-    //   p' = a*p + c*q + x,  q' = b*p + d*q + y
-    // i.e. the linear part is [[a, c], [b, d]] in a y-down frame. It is the transform that has
-    // to be applied to the decoded frame for correct presentation.
-    const AVPacketSideData* side = av_packet_side_data_get(stream->codecpar->coded_side_data,
-        stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
-    if (!side || side->size < 9 * static_cast<int>(sizeof(int32_t))) return;
-
-    int32_t matrix[9] = {};
-    std::memcpy(matrix, side->data, sizeof(matrix));
-    const double a = matrix[0] / 65536.0;
-    const double b = matrix[1] / 65536.0;
-    const double c = matrix[3] / 65536.0;
-    const double d = matrix[4] / 65536.0;
-    const double det = a * d - b * c;
-    if (!std::isfinite(det) || std::fabs(det) < 1e-6) {
-        fprintf(stderr, "[sumu] ignoring singular display matrix\n");
-        return;
-    }
-    // det < 0 means the matrix mirrors; decompose as rotate-then-display-flip, i.e.
-    // A = R(theta) * F_hflip, which for a pure horizontal flip yields theta == 0.
-    const double degrees = det > 0
-        ? std::atan2(b, a) * 180.0 / 3.14159265358979323846
-        : std::atan2(-b, -a) * 180.0 / 3.14159265358979323846;
-    const double snapped = std::round(degrees / 90.0) * 90.0;
-    if (std::fabs(degrees - snapped) > 2.0)
-        fprintf(stderr, "[sumu] display matrix rotates %.2f degrees; snapping to %.0f "
-            "(only axis-aligned rotations are supported)\n", degrees, snapped);
-    int rotation = static_cast<int>(std::llround(snapped)) % 360;
-    if (rotation < 0) rotation += 360;
-    display_rotation_cw_ = rotation;
-    display_hflip_ = det < 0;
-}
-
-bool Decoder::configure_frame_normalization(std::string& error)
-{
-    const AVPixelFormat coded_fmt =
-        static_cast<AVPixelFormat>(fmt_ctx_->streams[video_stream_idx_]->codecpar->format);
-    const bool ten_bit = coded_fmt == AV_PIX_FMT_YUV420P10LE || coded_fmt == AV_PIX_FMT_P010LE;
-
-    // Range: an unmarked stream is limited, matching the (already untagged) 709 assumption
-    // below; the legacy JPEG-range pixel formats carry it implicitly.
-    bool full_range = codec_ctx_->color_range == AVCOL_RANGE_JPEG;
-    if (codec_ctx_->color_range == AVCOL_RANGE_UNSPECIFIED)
-        full_range = coded_fmt == AV_PIX_FMT_YUVJ420P;
-    else if (codec_ctx_->color_range != AVCOL_RANGE_MPEG && codec_ctx_->color_range != AVCOL_RANGE_JPEG)
-        full_range = coded_fmt == AV_PIX_FMT_YUVJ420P;
-
-    // Matrix: an untagged stream keeps the historical BT.709 contract, an explicit BT.470BG/
-    // SMPTE 170M tag is honoured as BT.601.
-    VideoMatrix matrix_kind = VideoMatrix::Bt709;
-    switch (codec_ctx_->colorspace) {
-    case AVCOL_SPC_BT470BG:
-    case AVCOL_SPC_SMPTE170M:
-        matrix_kind = VideoMatrix::Bt601;
-        break;
-    case AVCOL_SPC_BT2020_NCL:
-    case AVCOL_SPC_BT2020_CL: // constant-luminance content is vanishingly rare; treat as NCL
-        matrix_kind = VideoMatrix::Bt2020;
-        break;
-    default:
-        break;
-    }
-
-    VideoTransfer transfer = VideoTransfer::Sdr;
-    if (codec_ctx_->color_trc == AVCOL_TRC_SMPTE2084)
-        transfer = VideoTransfer::Pq;
-    else if (codec_ctx_->color_trc == AVCOL_TRC_ARIB_STD_B67)
-        transfer = VideoTransfer::Hlg;
-
-    // Primaries: an unmarked HDR stream is BT.2020 by convention, an unmarked SDR stream stays
-    // BT.709 (no primary conversion, which is what the present shader has always assumed).
-    bool primaries_2020 = codec_ctx_->color_primaries == AVCOL_PRI_BT2020;
-    if (codec_ctx_->color_primaries == AVCOL_PRI_UNSPECIFIED)
-        primaries_2020 = transfer != VideoTransfer::Sdr || matrix_kind == VideoMatrix::Bt2020;
-
-    normalize_desc_ = {};
-    normalize_desc_.src_width = coded_width_;
-    normalize_desc_.src_height = coded_height_;
-    normalize_desc_.bit_depth = ten_bit ? 10 : 8;
-    normalize_desc_.full_range = full_range;
-    normalize_desc_.matrix = matrix_kind;
-    normalize_desc_.transfer = transfer;
-    normalize_desc_.primaries_2020 = primaries_2020;
-    normalize_desc_.rotation_cw = display_rotation_cw_;
-    normalize_desc_.hflip = display_hflip_;
-    normalize_desc_.fps = fps_;
-    const bool swap = (display_rotation_cw_ % 180) != 0;
-    width_ = swap ? coded_height_ : coded_width_;
-    height_ = swap ? coded_width_ : coded_height_;
-    normalize_desc_.dst_width = width_;
-    normalize_desc_.dst_height = height_;
-
-    // The normalized frame is still stored in the coded grid -- only its on-screen shape changes,
-    // so this only reports the display aspect ratio the present side will letterbox by (a 90/270
-    // display matrix has already moved the anamorphic stretch onto the vertical axis).
-    if (pixel_aspect_ != 1.0) {
-        const double dar = swap
-            ? static_cast<double>(width_) / (static_cast<double>(height_) * pixel_aspect_)
-            : (static_cast<double>(width_) * pixel_aspect_) / static_cast<double>(height_);
-        fprintf(stderr, "[sumu] anamorphic source: pixel aspect %.4f, %dx%d coded -> display aspect %.4f\n",
-            pixel_aspect_, width_, height_, dar);
-    }
-
-    needs_normalization_ = video_normalize_required(normalize_desc_);
-    if (!needs_normalization_) return true;
-
-    if (!normalizer_.initialize(d3d_device_, normalize_desc_, error))
-        return false;
-    if (display_rotation_cw_ != 0 || display_hflip_)
-        fprintf(stderr, "[sumu] display matrix: rotate %d deg clockwise%s, %dx%d -> %dx%d\n",
-            display_rotation_cw_, display_hflip_ ? " + horizontal flip" : "",
-            coded_width_, coded_height_, width_, height_);
-    return true;
-}
-
-bool Decoder::prepare_nv12_frame(DecodedFrame& frame, std::string& error)
-{
-    if (!needs_normalization_) return true; // already the downstream contract
-    if (!normalizer_.process(frame.texture, frame.array_slice, error)) return false;
-    frame.texture = normalizer_.output_texture();
-    frame.array_slice = 0;
-    return true;
+    last_error_.clear();
+    set_state(SourceState::Ended);
 }
 
 bool Decoder::looks_like_network_url(const std::string& path)
 {
-    // Minimal scheme check for the network IO profile. Emby/Jellyfin DirectPlay and plain
-    // http.server both land here; file paths and UNC shares stay on the local profile.
-    // Case-insensitive prefix only -- no full URL parse (FFmpeg does the real open).
-    auto starts_with_ci = [](const std::string& s, const char* prefix) {
-        const size_t n = std::strlen(prefix);
-        if (s.size() < n) return false;
-        for (size_t i = 0; i < n; ++i) {
-            if (std::tolower(static_cast<unsigned char>(s[i])) !=
-                std::tolower(static_cast<unsigned char>(prefix[i])))
-                return false;
-        }
-        return true;
-    };
-    return starts_with_ci(path, "http://") || starts_with_ci(path, "https://");
+    return MediaSource::looks_like_network_url(path);
+}
+
+void Decoder::request_interrupt()
+{
+    if (source_) source_->request_interrupt();
+}
+
+bool Decoder::is_network() const
+{
+    return source_ && source_->is_network();
+}
+
+bool Decoder::is_live() const
+{
+    return source_ && source_->is_network() && !source_->info().duration_known;
+}
+
+TimelineKind Decoder::timeline_kind() const
+{
+    if (segmented_timeline_) return TimelineKind::Segmented;
+    return is_live() ? TimelineKind::Live : TimelineKind::Finite;
+}
+
+VideoBackendKind Decoder::backend() const
+{
+    return video_ ? video_->kind() : VideoBackendKind::None;
+}
+
+bool Decoder::has_audio() const
+{
+    return source_ && source_->has_audio();
+}
+
+AVCodecParameters* Decoder::audio_codecpar() const
+{
+    return source_ ? source_->audio_codecpar() : nullptr;
+}
+
+AVRational Decoder::audio_time_base() const
+{
+    return source_ ? source_->audio_time_base() : AVRational{1, 1};
+}
+
+bool Decoder::pop_audio_packet(AVPacket* dst, double& loop_offset_out)
+{
+    return source_ && source_->pop_audio_packet(dst, loop_offset_out);
+}
+
+void Decoder::flush_audio_queue()
+{
+    if (source_) source_->flush_audio_queue();
+}
+
+size_t Decoder::audio_queue_depth() const
+{
+    return source_ ? source_->audio_queue_depth() : 0;
 }
 
 bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& error,
@@ -378,264 +320,597 @@ bool Decoder::open(const std::string& path, ID3D11Device* device, std::string& e
     static std::once_flag log_once;
     std::call_once(log_once, [] { av_log_set_callback(&Decoder::log_callback); });
     LogScope log_scope(*this);
-    // Always start from a clean slate -- a previous partial failure (or a reopen after
-    // close_session) must not leave half-allocated FFmpeg contexts for the next attempt.
+    // Always start from a clean slate -- a previous partial failure (or a reopen) must not leave
+    // half-allocated FFmpeg contexts for the next attempt.
     close();
+    set_state(SourceState::Opening);
     d3d_device_ = device;
-    is_network_ = looks_like_network_url(path);
-    // Keep the request context for reconnect_to_frame() (a mid-playback reconnect must replay
-    // the same Referer/Cookie or a hotlink-protected source answers 403). Never logged.
-    http_headers_ = is_network_ ? headers : std::string();
-    http_cookies_ = is_network_ ? cookies : std::string();
-    // Fresh slate for the interrupt flag -- the callback installed below also gates
-    // av_read_frame() during normal decode, so a stale "cancelled" from a previous aborted
-    // open must not leak into the new session.
-    interrupt_requested_.store(false, std::memory_order_relaxed);
-
-    // Pre-allocate the format context so we can install AVIOInterruptCB BEFORE
-    // avformat_open_input: request_interrupt() then aborts a blocked network open at
-    // FFmpeg's next IO checkpoint instead of waiting out rw_timeout (URL page cancel).
-    // avformat_close_input() frees the context on every exit path, opened or not.
-    fmt_ctx_ = avformat_alloc_context();
-    if (!fmt_ctx_) {
-        error = "avformat_alloc_context failed";
+    if (!device) {
+        error = "null D3D11 device";
+        set_state(SourceState::Failed);
         return false;
     }
-    fmt_ctx_->interrupt_callback.callback = &Decoder::interrupt_cb;
-    fmt_ctx_->interrupt_callback.opaque = this;
 
-    // Network sources: timeout + reconnect + smaller probe. Local files keep FFmpeg defaults
-    // (deep probe is fine on disk and preserves existing open latency characteristics).
-    // Options dict is consumed/owned by avformat_open_input on success; free on all paths.
-    AVDictionary* fmt_opts = nullptr;
-    if (is_network_) {
-        // rw_timeout is microseconds for the FFmpeg network protocols.
-        av_dict_set(&fmt_opts, "rw_timeout", "15000000", 0);          // 15s
-        av_dict_set(&fmt_opts, "reconnect", "1", 0);
-        av_dict_set(&fmt_opts, "reconnect_streamed", "1", 0);
-        av_dict_set(&fmt_opts, "reconnect_on_network_error", "1", 0);
-        av_dict_set(&fmt_opts, "reconnect_delay_max", "5", 0);
-        // Faster open on remote: don't read multi-MB probes the way local defaults may.
-        av_dict_set(&fmt_opts, "probesize", "1048576", 0);            // 1 MiB
-        av_dict_set(&fmt_opts, "analyzeduration", "2000000", 0);      // 2s (µs)
-        // Hint that HTTP Range seeks are expected (DirectPlay / static file servers).
-        av_dict_set(&fmt_opts, "seekable", "1", 0);
-        // Browser-page request context: FFmpeg's HTTP protocol takes extra header lines
-        // ("Name: value\r\n"…) and the Cookie header value separately. Only non-empty values are
-        // set, so a plain URL open keeps FFmpeg's defaults. Never echoed to the log.
-        if (!http_headers_.empty())
-            av_dict_set(&fmt_opts, "headers", http_headers_.c_str(), 0);
-        if (!http_cookies_.empty())
-            av_dict_set(&fmt_opts, "cookies", http_cookies_.c_str(), 0);
-        fprintf(stderr, "[sumu] decoder open network URL (timeout/reconnect/shallow probe%s)\n",
-            (http_headers_.empty() && http_cookies_.empty()) ? "" : ", page request context");
-    }
-
-    if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, &fmt_opts) < 0) {
-        av_dict_free(&fmt_opts);
-        error = "avformat_open_input failed for " + path;
+    source_ = std::make_unique<MediaSource>();
+    if (!source_->open(path, headers, cookies, error)) {
         close();
+        set_state(SourceState::Failed);
         return false;
     }
-    av_dict_free(&fmt_opts);
-
-    if (is_network_ && fmt_ctx_) {
-        // Belt-and-suspenders: also clamp on the context in case a demuxer ignores dict keys.
-        fmt_ctx_->probesize = 1 * 1024 * 1024;
-        fmt_ctx_->max_analyze_duration = 2 * AV_TIME_BASE; // 2s
-    }
-
-    const int probe = avformat_find_stream_info(fmt_ctx_, nullptr);
-    if (interrupt_requested_.load(std::memory_order_relaxed)) {
-        error = "video open cancelled";
-        close();
-        return false;
-    }
-    if (probe < 0)
-        fprintf(stderr, "[sumu] incomplete stream probe (%d), trying available video metadata\n", probe);
-
-    const AVCodec* decoder = nullptr;
-    int idx = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
-    if (idx < 0) {
-        error = "no video stream found";
-        close();
-        return false;
-    }
-    video_stream_idx_ = idx;
-    AVStream* stream = fmt_ctx_->streams[idx];
-    time_base_ = stream->time_base;
-    AVRational rate = av_guess_frame_rate(fmt_ctx_, stream, nullptr);
-    if (rate.num > 0 && rate.den > 0)
-        fps_ = av_q2d(rate);
-    coded_width_ = stream->codecpar->width;
-    coded_height_ = stream->codecpar->height;
-    width_ = coded_width_;
+    const MediaStreamInfo& info = source_->info();
+    fps_ = info.fps;
+    time_base_ = info.time_base;
+    coded_width_ = info.coded_width;
+    coded_height_ = info.coded_height;
+    width_ = coded_width_; // replaced by configure_output() with the display size
     height_ = coded_height_;
-    // Anamorphic sources: the coded grid is not the picture's shape. Prefer the video stream's own
-    // sample_aspect_ratio, fall back to FFmpeg's guess (container/bitstream tags), and read a
-    // missing or implausible ratio as square pixels -- a bogus 1:1000 tag would otherwise collapse
-    // the picture into a sliver.
-    AVRational sar = stream->sample_aspect_ratio;
-    if (sar.num <= 0 || sar.den <= 0) sar = stream->codecpar->sample_aspect_ratio;
-    if (sar.num <= 0 || sar.den <= 0)
-        sar = av_guess_sample_aspect_ratio(fmt_ctx_, stream, nullptr);
-    pixel_aspect_ = (sar.num > 0 && sar.den > 0) ? av_q2d(sar) : 1.0;
-    if (!(pixel_aspect_ > 0.25 && pixel_aspect_ < 4.0)) pixel_aspect_ = 1.0;
-    if (width_ <= 0 || height_ <= 0 || time_base_.num <= 0 || time_base_.den <= 0) {
-        error = "video metadata is incomplete";
-        close();
-        return false;
-    }
-
-    // 下游环缓冲/scrub/AI 桥/headless 统一消费 8-bit BT.709 limited NV12。8-bit 4:2:0 与
-    // 10-bit 4:2:0（P010）都接入同一契约：后者由 VideoNormalizer 在 GPU 上按色彩 tag 归一化
-    // （含 HDR tone mapping / 旋转），不是简单降位深；其余 4:2:2 / 4:4:4 等格式在 open 路径
-    // 显式拒绝，避免 CopySubresourceRegion 不转换格式而静默黑屏。判定用 codecpar->format：
-    // avformat_find_stream_info 后 parser 已确定位深/色度格式，codec_ctx_->sw_pix_fmt
-    // 此时仍可能未确定。
-    {
-        const AVPixelFormat coded_fmt = static_cast<AVPixelFormat>(stream->codecpar->format);
-        const bool ten_bit_420 = coded_fmt == AV_PIX_FMT_YUV420P10LE ||
-            coded_fmt == AV_PIX_FMT_P010LE;
-        if (coded_fmt != AV_PIX_FMT_NV12 &&
-            coded_fmt != AV_PIX_FMT_YUV420P &&
-            coded_fmt != AV_PIX_FMT_YUVJ420P &&
-            !ten_bit_420) {
-            const char* fmt_name = av_get_pix_fmt_name(coded_fmt);
-            error = "unsupported_pix_fmt:" + std::string(fmt_name ? fmt_name : "unknown");
-            close();
-            return false;
-        }
-    }
-
-    resolve_display_transform(stream);
-
-    // Audio (spike, additive): demux-only, best-effort. related_stream=idx nudges FFmpeg to
-    // prefer an audio stream muxed alongside the chosen video stream when a container has
-    // several. No audio track is a legitimate, silent result (-1), not an error -- callers
-    // (Player::open()) must treat has_audio()==false the same as "no audio in this file".
-    audio_stream_idx_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, idx, nullptr, 0);
-
-    {
-        double dur_s = -1.0;
-        if (stream->duration != AV_NOPTS_VALUE && stream->duration > 0)
-            dur_s = stream->duration * av_q2d(stream->time_base);
-        else if (fmt_ctx_->duration != AV_NOPTS_VALUE && fmt_ctx_->duration > 0)
-            dur_s = static_cast<double>(fmt_ctx_->duration) / AV_TIME_BASE;
-        frame_count_ = dur_s > 0
-            ? static_cast<int64_t>(std::llround(dur_s * fps_))
-            : std::max<int64_t>(0, stream->nb_frames);
-    }
-
-    codec_ctx_ = avcodec_alloc_context3(decoder);
-    if (!codec_ctx_) {
-        error = "avcodec_alloc_context3 failed";
-        close();
-        return false;
-    }
-    if (avcodec_parameters_to_context(codec_ctx_, stream->codecpar) < 0) {
-        error = "avcodec_parameters_to_context failed";
-        close();
-        return false;
-    }
-
-    // Build an AVHWDeviceContext wrapping OUR d3d device instead of letting FFmpeg create
-    // its own -- this is what makes the decoded texture live on the same device as our
-    // swapchain so we can sample/copy it with zero copy.
-    hw_device_ref_ = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
-    if (!hw_device_ref_) {
-        error = "av_hwdevice_ctx_alloc failed";
-        close();
-        return false;
-    }
-    AVHWDeviceContext* device_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ref_->data);
-    AVD3D11VADeviceContext* d3d11_ctx = reinterpret_cast<AVD3D11VADeviceContext*>(device_ctx->hwctx);
-    d3d_device_->AddRef();
-    d3d11_ctx->device = d3d_device_;
-
-    if (av_hwdevice_ctx_init(hw_device_ref_) < 0) {
-        error = "av_hwdevice_ctx_init failed";
-        close();
-        return false;
-    }
-
-    codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ref_);
-    codec_ctx_->opaque = this;
-    codec_ctx_->get_format = &Decoder::get_hw_format_thunk;
-    codec_ctx_->thread_count = 1; // single-threaded decode: keeps this on one D3D11 call sequence
-    // Required for correct pts/dts → frame timestamp conversion (esp. B-frames). Without this,
-    // files whose container stamps PTS==DTS despite has_b_frames>0 can leave frame->pts in
-    // decode order; best_effort_timestamp then can't recover a presentation timeline either.
-    codec_ctx_->pkt_timebase = stream->time_base;
-    if (stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0)
-        codec_ctx_->framerate = stream->avg_frame_rate;
-
-    AVDictionary* opts = nullptr;
-    if (avcodec_open2(codec_ctx_, decoder, &opts) < 0) {
-        av_dict_free(&opts);
-        error = "avcodec_open2 failed";
-        close();
-        return false;
-    }
-    av_dict_free(&opts);
-
-    // Frame contract: everything downstream (present / AI / headless / scrub) consumes
-    // display-oriented BT.709 limited 8-bit NV12. Build the GPU normalizer here when the source
-    // is anything else (10-bit, full range, non-709 matrix, HDR, display-matrix rotation) so an
-    // unsupported combination fails the open with a reason instead of producing a wrong image.
-    if (!configure_frame_normalization(error)) {
-        error = "frame normalization failed: " + error;
-        close();
-        return false;
-    }
+    pixel_aspect_ = info.pixel_aspect;
+    frame_count_ = info.frame_count;
+    display_rotation_cw_ = info.rotation_cw;
+    display_hflip_ = info.hflip;
 
     pkt_ = av_packet_alloc();
-    frame_ = av_frame_alloc();
-    if (!pkt_ || !frame_) {
-        error = "failed to allocate decoder packet/frame";
+    if (!pkt_) {
+        error = "failed to allocate decoder packet";
         close();
+        set_state(SourceState::Failed);
         return false;
+    }
+
+    if (!open_backend(is_hardware_candidate(info.pix_fmt), error)) {
+        close();
+        set_state(SourceState::Failed);
+        return false;
+    }
+    // Frame contract: everything downstream (present / AI / headless / scrub) consumes
+    // display-oriented BT.709 limited 8-bit NV12. Build the GPU normalizer here when the source is
+    // anything else (10-bit, full range, non-709 matrix, HDR, display-matrix rotation) so an
+    // unsupported combination fails the open with a reason instead of producing a wrong image.
+    if (!configure_output(initial_source_format(), error)) {
+        error = "frame normalization failed: " + error;
+        close();
+        set_state(SourceState::Failed);
+        return false;
+    }
+    set_state(SourceState::Buffering);
+    return true;
+}
+
+bool Decoder::open_backend(bool allow_hardware, std::string& error)
+{
+    const MediaStreamInfo& info = source_->info();
+    const AVCodecParameters* params = source_->video_codecpar();
+
+    if (allow_hardware) {
+        std::unique_ptr<VideoDecoder> hardware = create_hardware_video_decoder();
+        std::string hardware_error;
+        if (hardware->open(params, info.time_base, info.frame_rate, d3d_device_, hardware_error)) {
+            video_ = std::move(hardware);
+            return true;
+        }
+        fprintf(stderr, "[sumu] d3d11va decode unavailable (%s); falling back to software decode\n",
+            hardware_error.c_str());
+    } else {
+        const char* name = av_get_pix_fmt_name(info.pix_fmt);
+        fprintf(stderr, "[sumu] software decode for pixel format %s (hardware path takes 4:2:0)\n",
+            name ? name : "unknown");
+    }
+
+    std::unique_ptr<VideoDecoder> software = create_software_video_decoder();
+    std::string software_error;
+    if (!software->open(params, info.time_base, info.frame_rate, d3d_device_, software_error)) {
+        error = allow_hardware
+            ? "no usable video decoder (software fallback: " + software_error + ")"
+            : "no usable video decoder: " + software_error;
+        return false;
+    }
+    video_ = std::move(software);
+    return true;
+}
+
+bool Decoder::switch_to_software(const std::string& reason, std::string& error)
+{
+    // Exactly one fallback per session: a hardware failure that survives it is final, so this can
+    // never turn into a retry loop.
+    if (software_fallback_used_ || !source_ || !video_) {
+        error = reason;
+        return false;
+    }
+    software_fallback_used_ = true;
+    const MediaStreamInfo& info = source_->info();
+    std::unique_ptr<VideoDecoder> software = create_software_video_decoder();
+    std::string software_error;
+    if (!software->open(source_->video_codecpar(), info.time_base, info.frame_rate, d3d_device_,
+            software_error)) {
+        error = "hardware decode failed (" + reason + ") and software decode is unavailable: " +
+            software_error;
+        return false;
+    }
+    // The picture the hardware path died on was never delivered: resume one frame interval past
+    // the last delivered one so the caller sees a continuous timeline.
+    const double step = 1.0 / (fps_ > 0.0 ? fps_ : 1.0);
+    std::string resume_error;
+    const bool resumed = is_live() ? source_->reconnect(resume_error, true)
+                                   : resume_at(last_raw_pts_seconds_ + step, resume_error);
+    if (!resumed) {
+        error = "hardware decode failed (" + reason + ") and the stream cannot be repositioned "
+            "for the software fallback: " + resume_error;
+        return false;
+    }
+    video_ = std::move(software);
+    draining_ = false;
+    failed_.store(false, std::memory_order_relaxed);
+    config_generation_.fetch_add(1, std::memory_order_release);
+    set_state(SourceState::Recovering);
+    fprintf(stderr, "[sumu] decoder: hardware decode failed (%s); continuing with software decode\n",
+        reason.c_str());
+    return true;
+}
+
+bool Decoder::resume_at(double raw_pts_seconds, std::string& error)
+{
+    draining_ = false;
+    at_eof_.store(false, std::memory_order_relaxed);
+    if (video_) video_->flush();
+    return source_->seek_to(raw_pts_seconds, error);
+}
+
+Decoder::SourceFormat Decoder::initial_source_format() const
+{
+    SourceFormat format{};
+    if (video_ && video_->kind() == VideoBackendKind::Software) {
+        // The software path hands the normalizer its own 8-bit BT.709 limited NV12, so only the
+        // geometry (and a display matrix) can still need GPU work.
+        format.width = (coded_width_ + 1) & ~1;
+        format.height = (coded_height_ + 1) & ~1;
+        format.pix_fmt = AV_PIX_FMT_NV12;
+        format.bit_depth = 8;
+        return format;
+    }
+    const AVCodecParameters* params = source_ ? source_->video_codecpar() : nullptr;
+    format.width = coded_width_;
+    format.height = coded_height_;
+    format.pix_fmt = params ? static_cast<AVPixelFormat>(params->format) : AV_PIX_FMT_NONE;
+    format.bit_depth = pixel_depth(format.pix_fmt);
+    if (params) {
+        const ColourTags tags = interpret_colour(params->color_range, params->color_space,
+            params->color_trc, params->color_primaries, format.pix_fmt);
+        format.full_range = tags.full_range;
+        format.matrix = tags.matrix;
+        format.transfer = tags.transfer;
+        format.primaries_2020 = tags.primaries_2020;
+    }
+    return format;
+}
+
+Decoder::SourceFormat Decoder::derive_source_format(const VideoPicture& picture) const
+{
+    SourceFormat format{};
+    const AVFrame* frame = picture.frame;
+    if (picture.software) {
+        // libswscale already produced the downstream contract; only even-dimension rounding can
+        // add padding past the visible picture.
+        format.width = (frame->width + 1) & ~1;
+        format.height = (frame->height + 1) & ~1;
+        format.pix_fmt = AV_PIX_FMT_NV12;
+        format.bit_depth = 8;
+        return format;
+    }
+    format.width = frame->width;
+    format.height = frame->height;
+    format.pix_fmt = video_ ? video_->produced_format() : AV_PIX_FMT_NONE;
+    format.bit_depth = pixel_depth(format.pix_fmt);
+    // The frame carries the tags that actually describe it (and shows a mid-stream change), but
+    // decoders that never copy the container's tags into the frame leave them unspecified -- fall
+    // back to the stream's codec parameters there instead of silently assuming BT.709 limited SDR.
+    AVColorRange range = frame->color_range;
+    AVColorSpace space = frame->colorspace;
+    AVColorTransferCharacteristic trc = frame->color_trc;
+    AVColorPrimaries primaries = frame->color_primaries;
+    if (const AVCodecParameters* params = source_ ? source_->video_codecpar() : nullptr) {
+        if (range == AVCOL_RANGE_UNSPECIFIED) range = params->color_range;
+        if (space == AVCOL_SPC_UNSPECIFIED) space = params->color_space;
+        if (trc == AVCOL_TRC_UNSPECIFIED) trc = params->color_trc;
+        if (primaries == AVCOL_PRI_UNSPECIFIED) primaries = params->color_primaries;
+    }
+    const ColourTags tags = interpret_colour(range, space, trc, primaries, format.pix_fmt);
+    format.full_range = tags.full_range;
+    format.matrix = tags.matrix;
+    format.transfer = tags.transfer;
+    format.primaries_2020 = tags.primaries_2020;
+    return format;
+}
+
+bool Decoder::configure_output(const SourceFormat& format, std::string& error)
+{
+    VideoNormalizeDesc desc{};
+    desc.src_width = format.width;
+    desc.src_height = format.height;
+    desc.bit_depth = format.bit_depth;
+    desc.full_range = format.full_range;
+    desc.matrix = format.matrix;
+    desc.transfer = format.transfer;
+    desc.primaries_2020 = format.primaries_2020;
+    desc.rotation_cw = display_rotation_cw_;
+    desc.hflip = display_hflip_;
+    desc.fps = fps_;
+    // The normalized frame is still stored in the coded grid -- only its on-screen shape changes,
+    // so a 90/270 display matrix swaps the reported display size.
+    const bool swap = (display_rotation_cw_ % 180) != 0;
+    desc.dst_width = swap ? format.height : format.width;
+    desc.dst_height = swap ? format.width : format.height;
+
+    const bool needed = video_normalize_required(desc);
+    const bool ready = !needs_normalization_ || std::strcmp(normalizer_.path_name(), "none") != 0;
+    if (needed == needs_normalization_ && ready && desc_matches(normalize_desc_, desc)) {
+        width_ = desc.dst_width;
+        height_ = desc.dst_height;
+        return true;
+    }
+
+    width_ = desc.dst_width;
+    height_ = desc.dst_height;
+    normalize_desc_ = desc;
+    needs_normalization_ = needed;
+    if (!needed) {
+        normalizer_.reset();
+    } else if (!normalizer_.initialize(d3d_device_, desc, error)) {
+        // Never leave a half-configured normalizer in place: the caller must not get a wrong image.
+        normalizer_.reset();
+        needs_normalization_ = false;
+        return false;
+    }
+
+    // A geometry/colour/backend change invalidates anything a consumer derived from the previous
+    // picture description.
+    config_generation_.fetch_add(1, std::memory_order_release);
+
+    if (pixel_aspect_ != 1.0 && !reported_anamorphic_) {
+        reported_anamorphic_ = true;
+        const double dar = swap
+            ? static_cast<double>(width_) / (static_cast<double>(height_) * pixel_aspect_)
+            : (static_cast<double>(width_) * pixel_aspect_) / static_cast<double>(height_);
+        fprintf(stderr, "[sumu] anamorphic source: pixel aspect %.4f, %dx%d coded -> display aspect %.4f\n",
+            pixel_aspect_, width_, height_, dar);
+    }
+    if (needs_normalization_ && (display_rotation_cw_ != 0 || display_hflip_) &&
+        !reported_rotation_) {
+        reported_rotation_ = true;
+        fprintf(stderr, "[sumu] display matrix: rotate %d deg clockwise%s, %dx%d -> %dx%d\n",
+            display_rotation_cw_, display_hflip_ ? " + horizontal flip" : "",
+            coded_width_, coded_height_, width_, height_);
     }
     return true;
 }
 
-
-bool Decoder::seek_to_start()
+bool Decoder::prepare_nv12_frame(DecodedFrame& frame, std::string& error)
 {
-    avcodec_flush_buffers(codec_ctx_);
-    int ret = av_seek_frame(fmt_ctx_, video_stream_idx_, 0, AVSEEK_FLAG_BACKWARD);
-    return ret >= 0;
+    if (frame.software && !frame.texture) {
+        if (!video_) {
+            error = "decoder is not open";
+            return false;
+        }
+        // The upload is a GPU write: it happens here (under the caller's D3D serialization), never
+        // on the bare decode call.
+        VideoPicture uploaded;
+        if (!video_->upload(frame.software_serial, uploaded, error)) return false;
+        frame.texture = uploaded.texture;
+        frame.array_slice = uploaded.array_slice;
+    }
+    if (!frame.texture) {
+        error = "decoded frame has no GPU surface";
+        return false;
+    }
+    if (!needs_normalization_) return true; // already the downstream contract
+    if (!normalizer_.process(frame.texture, frame.array_slice, error)) return false;
+    frame.texture = normalizer_.output_texture();
+    frame.array_slice = 0;
+    return true;
 }
 
-// Presentation timestamp for a just-received AVFrame.
-// Prefer best_effort_timestamp: for files with B-frames whose container stamped PTS==DTS
-// (common bad remux), frame->pts stays in decode order and would map frame_num backwards
-// (visible as nearby-frame flicker). best_effort_timestamp is FFmpeg's presentation-order
-// estimate (equals pts when the container timestamps are already correct).
-// `fallback_raw_pts` is the previous frame's raw PTS plus one frame interval: the frame's own
-// raw PTS from ffprobe is already in the origin-shifted domain, so the fallback must be too.
-static double frame_raw_pts_seconds(const AVFrame* frame, AVRational time_base,
-                                    double fallback_raw_pts)
+DecodeStatus Decoder::pump_one_picture(VideoPicture& picture, double& raw_pts_s,
+                                       std::string& error)
 {
-    int64_t ts = AV_NOPTS_VALUE;
-    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-        ts = frame->best_effort_timestamp;
-    else if (frame->pts != AV_NOPTS_VALUE)
-        ts = frame->pts;
-    if (ts != AV_NOPTS_VALUE)
-        return ts * av_q2d(time_base);
-    return fallback_raw_pts;
+    LogScope log_scope(*this);
+    constexpr int kMaxRecoverableErrors = 256;
+    const double step = 1.0 / (fps_ > 0.0 ? fps_ : 1.0);
+    int recoverable = 0;
+    for (;;) {
+        if (!source_ || !video_ || !pkt_) {
+            error = "decoder is not open";
+            return DecodeStatus::FatalError;
+        }
+        // MediaSource's interrupt flag also gates av_read_frame(), but a decode step can run a
+        // while before the next read: check it here so request_interrupt() aborts this loop at
+        // the next boundary instead of after the ring drains.
+        if (source_->interrupt_requested()) {
+            error = "decode interrupted";
+            return DecodeStatus::FatalError;
+        }
+        const DecodeStatus decoded = video_->decode(picture, error);
+        switch (decoded) {
+        case DecodeStatus::Frame:
+            raw_pts_s = frame_raw_pts_seconds(picture.frame, time_base_,
+                last_raw_pts_seconds_ + step);
+            last_raw_pts_seconds_ = raw_pts_s;
+            return decoded;
+        case DecodeStatus::Eof:
+            return decoded;
+        case DecodeStatus::WouldBlock:
+            break; // the backend needs more input
+        case DecodeStatus::RecoverableIoError:
+            record_corrupt_data(error.c_str(), true);
+            if (++recoverable > kMaxRecoverableErrors) {
+                error = "too many corrupt packets: " + error;
+                return DecodeStatus::RecoverableIoError;
+            }
+            continue;
+        default:
+            return decoded; // RetryWithSoftware / FatalError
+        }
+
+        if (draining_) {
+            // Input requested after end-of-stream was signalled: that really is the end.
+            return DecodeStatus::Eof;
+        }
+        const double timeline_offset = loop_offset_seconds_ + discontinuity_offset_;
+        const MediaReadStatus read = source_->read_video_packet(pkt_, timeline_offset, error);
+        switch (read) {
+        case MediaReadStatus::Packet:
+            video_->send_packet(pkt_, error); // a failure surfaces through the next decode()
+            av_packet_unref(pkt_);
+            break;
+        case MediaReadStatus::Eof:
+            draining_ = true;
+            video_->send_packet(nullptr, error);
+            break;
+        case MediaReadStatus::WouldBlock:
+            return DecodeStatus::WouldBlock;
+        case MediaReadStatus::CorruptData:
+            record_corrupt_data(error.c_str(), true);
+            if (++recoverable > kMaxRecoverableErrors) return DecodeStatus::RecoverableIoError;
+            break;
+        case MediaReadStatus::RecoverableIoError:
+            // Transport trouble is not answerable by reading again (every attempt can burn the
+            // full rw_timeout): surface it so the caller's reconnect/backoff path owns the retry.
+            return DecodeStatus::RecoverableIoError;
+        case MediaReadStatus::Interrupted:
+            if (error.empty()) error = "decode interrupted";
+            return DecodeStatus::FatalError;
+        case MediaReadStatus::FatalError:
+        default:
+            return DecodeStatus::FatalError;
+        }
+    }
+}
+
+DecodeStatus Decoder::describe_picture(const VideoPicture& picture, DecodedFrame& out,
+                                       std::string& error)
+{
+    const AVFrame* frame = picture.frame;
+    if (!frame || frame->width <= 0 || frame->height <= 0) {
+        error = "decoder produced an invalid picture";
+        return DecodeStatus::FatalError;
+    }
+
+    out = DecodedFrame{};
+    out.software = picture.software;
+    out.source_frame = picture.software ? picture.frame : nullptr;
+    out.software_serial = picture.serial;
+    out.cpu_plane[0] = picture.cpu_plane[0];
+    out.cpu_plane[1] = picture.cpu_plane[1];
+    out.cpu_linesize[0] = picture.cpu_linesize[0];
+    out.cpu_linesize[1] = picture.cpu_linesize[1];
+    out.width = frame->width;
+    out.height = frame->height;
+    const double step = 1.0 / (fps_ > 0.0 ? fps_ : 1.0);
+    // Hold length on the source timeline: whatever the container declared for this picture, else
+    // one frame interval. Never invented for a gap.
+    out.duration_seconds = frame->duration > 0
+        ? static_cast<double>(frame->duration) * av_q2d(time_base_)
+        : step;
+
+    const SourceFormat format = derive_source_format(picture);
+    out.pix_fmt = format.pix_fmt;
+    out.bit_depth = format.bit_depth;
+    out.full_range = format.full_range;
+    out.matrix = format.matrix;
+    out.transfer = format.transfer;
+    out.primaries_2020 = format.primaries_2020;
+
+    if (picture.software) {
+        if (!picture.cpu_plane[0] || !picture.cpu_plane[1] ||
+            picture.cpu_linesize[0] < out.width) {
+            error = "software picture has no NV12 CPU planes";
+            return DecodeStatus::FatalError;
+        }
+    } else {
+        if (!picture.texture) {
+            error = "hardware decoder produced no D3D11 texture";
+            return DecodeStatus::RetryWithSoftware;
+        }
+        D3D11_TEXTURE2D_DESC td{};
+        picture.texture->GetDesc(&td);
+        const DXGI_FORMAT expected =
+            format.bit_depth > 8 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+        if (td.Format != expected) {
+            // CopySubresourceRegion never converts formats: a surface that is not the promised one
+            // would silently produce a black/garbled picture, so treat it as a decoder fault.
+            char buf[192];
+            snprintf(buf, sizeof(buf),
+                "hardware decoder surface format %d, expected %d for a %d-bit stream",
+                static_cast<int>(td.Format), static_cast<int>(expected), format.bit_depth);
+            error = buf;
+            return DecodeStatus::RetryWithSoftware;
+        }
+        if (picture.array_slice >= td.ArraySize ||
+            static_cast<int>(td.Width) < out.width ||
+            static_cast<int>(td.Height) < out.height) {
+            char buf[192];
+            snprintf(buf, sizeof(buf),
+                "hardware decoder surface %ux%u[%u] cannot hold a %dx%d picture",
+                static_cast<unsigned>(td.Width), static_cast<unsigned>(td.Height),
+                picture.array_slice, out.width, out.height);
+            error = buf;
+            return DecodeStatus::RetryWithSoftware;
+        }
+        out.texture = picture.texture;
+        out.array_slice = picture.array_slice;
+    }
+
+    // Geometry: the first picture silently re-adopts the container's metadata (bitstream-accurate
+    // cropping), anything after that is a real reconfiguration the caller has to follow.
+    bool reconfigured = false;
+    if (out.width != coded_width_ || out.height != coded_height_) {
+        reconfigured = have_delivered_frame_;
+        coded_width_ = out.width;
+        coded_height_ = out.height;
+        if (source_) source_->adopt_frame_size(out.width, out.height);
+    }
+    const uint64_t generation_before = config_generation_.load(std::memory_order_acquire);
+    if (!configure_output(format, error)) {
+        error = "frame normalization failed: " + error;
+        return DecodeStatus::FatalError;
+    }
+    if (have_delivered_frame_ && config_generation_.load(std::memory_order_acquire) != generation_before)
+        reconfigured = true;
+    return reconfigured ? DecodeStatus::NeedReconfigure : DecodeStatus::Frame;
+}
+
+DecodeStatus Decoder::pull_described(DecodedFrame& out, double& raw_pts_s, std::string& error)
+{
+    for (;;) {
+        VideoPicture picture;
+        double raw = 0.0;
+        DecodeStatus status = pump_one_picture(picture, raw, error);
+        if (status == DecodeStatus::Frame) {
+            status = describe_picture(picture, out, error);
+            if (status == DecodeStatus::Frame || status == DecodeStatus::NeedReconfigure) {
+                raw_pts_s = raw;
+                return status;
+            }
+        }
+        if (status == DecodeStatus::RetryWithSoftware) {
+            const std::string reason = error;
+            std::string switch_error;
+            if (switch_to_software(reason, switch_error)) continue;
+            error = switch_error;
+            return DecodeStatus::FatalError;
+        }
+        return status;
+    }
+}
+
+DecodeResult Decoder::fail(DecodeStatus status, const std::string& error)
+{
+    last_error_ = error;
+    failed_.store(status == DecodeStatus::FatalError, std::memory_order_release);
+    set_state(status == DecodeStatus::FatalError ? SourceState::Failed
+                                                 : SourceState::Recovering);
+    if (!error.empty()) fprintf(stderr, "[sumu] decode error: %s\n", error.c_str());
+    DecodeResult result;
+    result.status = status;
+    result.error = error;
+    return result;
+}
+
+DecodeResult Decoder::next_frame(DecodedFrame& out)
+{
+    if (!source_ || !video_ || !pkt_) {
+        DecodeResult result;
+        result.status = at_eof() ? DecodeStatus::Eof : DecodeStatus::FatalError;
+        if (result.status == DecodeStatus::FatalError) result.error = "decoder is not open";
+        return result;
+    }
+    if (at_eof()) {
+        DecodeResult result;
+        result.status = DecodeStatus::Eof;
+        return result;
+    }
+    if (failed()) {
+        DecodeResult result;
+        result.status = DecodeStatus::FatalError;
+        result.error = last_error_;
+        return result;
+    }
+
+    // A buffered (known-duration) source normally never stalls: give a short network hiccup a few
+    // hundred milliseconds before reporting it. A live/unknown-duration source answers WouldBlock
+    // straight away instead -- there, waiting is the normal state, not an error.
+    constexpr int kMaxStarveRetries = 256;
+    const bool buffered = source_->info().duration_known;
+    int starve_retries = 0;
+
+    for (;;) {
+        std::string error;
+        double raw_pts_s = 0.0;
+        const DecodeStatus status = pull_described(out, raw_pts_s, error);
+        switch (status) {
+        case DecodeStatus::Frame:
+        case DecodeStatus::NeedReconfigure:
+            if (!have_first_pts_) {
+                first_pts_seconds_.store(raw_pts_s, std::memory_order_relaxed);
+                have_first_pts_.store(true, std::memory_order_release);
+            }
+            out.pts_seconds = map_timeline_pts(raw_pts_s);
+            have_delivered_frame_ = true;
+            {
+                DecodeResult result;
+                result.status = status;
+                if (status == DecodeStatus::NeedReconfigure) {
+                    result.error = "stream geometry changed";
+                    set_state(SourceState::Reconfiguring);
+                } else {
+                    set_state(SourceState::Ready);
+                }
+                return result;
+            }
+        case DecodeStatus::WouldBlock:
+            if (buffered && starve_retries++ < kMaxStarveRetries) {
+                Sleep(1);
+                continue;
+            }
+            set_state(buffered ? SourceState::Recovering : SourceState::Starved);
+            {
+                DecodeResult result;
+                result.status = buffered ? DecodeStatus::RecoverableIoError
+                                         : DecodeStatus::WouldBlock;
+                if (buffered) result.error = "source stopped delivering data";
+                return result;
+            }
+        case DecodeStatus::RecoverableIoError:
+            set_state(SourceState::Recovering);
+            {
+                DecodeResult result;
+                result.status = DecodeStatus::RecoverableIoError;
+                result.error = error;
+                return result;
+            }
+        case DecodeStatus::Eof:
+            at_eof_.store(true, std::memory_order_release);
+            set_state(SourceState::Ended);
+            {
+                DecodeResult result;
+                result.status = DecodeStatus::Eof;
+                return result;
+            }
+        case DecodeStatus::RetryWithSoftware: // consumed inside pull_described()
+        case DecodeStatus::FatalError:
+        default:
+            return fail(DecodeStatus::FatalError, error);
+        }
+    }
 }
 
 // Raw stream PTS -> playback timeline, the single place every DecodedFrame's pts_seconds is
-// produced from (next_frame / seek_to_frame / nearest_keyframe).
+// produced from (next_frame / seek / nearest_keyframe).
 //
 // The monotonic guard handles streams whose timestamps restart or jump backwards mid-file
 // (concatenated TS segments, restarted encoders): a backwards jump beyond a generous threshold
-// shifts the whole remaining stream forward so the timeline keeps advancing instead of
-// rewinding into already-presented grid positions (which froze playback at the join). Small
-// non-monotonicities (B-frame reordering residue, VFR jitter) pass through untouched, and
-// forward holes are real missing content -- they are never compressed away.
+// shifts the whole remaining stream forward so the timeline keeps advancing instead of rewinding
+// into already-presented grid positions (which froze playback at the join). Small
+// non-monotonicities (B-frame reordering residue, VFR jitter) pass through untouched, and forward
+// holes are real missing content -- they are never compressed away.
 double Decoder::map_timeline_pts(double raw_pts_s)
 {
     double pts_s = loop_offset_seconds_ + (raw_pts_s - first_pts_seconds_) + discontinuity_offset_;
@@ -644,6 +919,7 @@ double Decoder::map_timeline_pts(double raw_pts_s)
     double back_jump = 8.0 * step;
     if (back_jump < 0.5) back_jump = 0.5;
     if (last_out_pts_seconds_ >= 0.0 && pts_s < last_out_pts_seconds_ - back_jump) {
+        segmented_timeline_ = true;
         discontinuity_offset_ += (last_out_pts_seconds_ + step) - pts_s;
         pts_s = last_out_pts_seconds_ + step;
     }
@@ -651,329 +927,146 @@ double Decoder::map_timeline_pts(double raw_pts_s)
     return pts_s;
 }
 
-int Decoder::pump_one_raw_frame(DecodedFrame& out, double& raw_pts_s_out)
-{
-    LogScope log_scope(*this);
-    constexpr int kMaxRecoverableErrors = 256;
-    int errors = 0;
-    for (;;) {
-        if (interrupt_requested_.load(std::memory_order_relaxed)) return -1;
-        av_frame_unref(frame_);
-
-        int recv = avcodec_receive_frame(codec_ctx_, frame_);
-        if (recv == 0) {
-            if (frame_->format != AV_PIX_FMT_D3D11 || !frame_->data[0]) {
-                fprintf(stderr, "unexpected decoder output format %d\n", frame_->format);
-                return -1;
-            }
-            out.texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
-            out.array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
-            const double step = 1.0 / (fps_ > 0.0 ? fps_ : 1.0);
-            raw_pts_s_out = frame_raw_pts_seconds(frame_, time_base_, last_raw_pts_seconds_ + step);
-            last_raw_pts_seconds_ = raw_pts_s_out;
-            // Hold length on the source timeline: whatever the container declared for this
-            // packet, else one frame interval. Never invented for a gap.
-            out.duration_seconds = (frame_->duration > 0)
-                ? static_cast<double>(frame_->duration) * av_q2d(time_base_)
-                : step;
-            return 1;
-        }
-        if (recv == AVERROR_EOF) return 0;
-        if (recv == AVERROR_INVALIDDATA) {
-            record_corrupt_data("avcodec_receive_frame: invalid data", true);
-            if (++errors <= kMaxRecoverableErrors) continue;
-            return -1;
-        }
-        if (recv != AVERROR(EAGAIN)) {
-            fprintf(stderr, "avcodec_receive_frame failed: %d\n", recv);
-            return -1;
-        }
-        if (draining_) return 0;
-
-        int read = av_read_frame(fmt_ctx_, pkt_);
-        if (read < 0) {
-            av_packet_unref(pkt_);
-            if (read == AVERROR_INVALIDDATA) {
-                record_corrupt_data("av_read_frame: invalid data", true);
-                if (++errors <= kMaxRecoverableErrors) continue;
-                return -1;
-            }
-            if (read == AVERROR(EAGAIN) && ++errors <= kMaxRecoverableErrors) {
-                Sleep(1);
-                continue;
-            }
-            if (read == AVERROR_EXIT || interrupt_requested_.load(std::memory_order_relaxed))
-                return -1;
-            if (read != AVERROR_EOF && read != AVERROR(EIO)) {
-                fprintf(stderr, "av_read_frame failed: %d\n", read);
-                return -1;
-            }
-            draining_ = true;
-            int send = avcodec_send_packet(codec_ctx_, nullptr);
-            if (send < 0 && send != AVERROR_EOF) return -1;
-            continue;
-        }
-        if (pkt_->stream_index == video_stream_idx_) {
-            int send = avcodec_send_packet(codec_ctx_, pkt_);
-            av_packet_unref(pkt_);
-            if (send < 0) {
-                if (send == AVERROR_INVALIDDATA) {
-                    record_corrupt_data("avcodec_send_packet: invalid data", true);
-                    if (++errors <= kMaxRecoverableErrors) continue;
-                    return -1;
-                }
-                fprintf(stderr, "avcodec_send_packet failed: %d\n", send);
-                return -1;
-            }
-        } else {
-            if (audio_stream_idx_ >= 0 && pkt_->stream_index == audio_stream_idx_) {
-                AVPacket* apkt = av_packet_alloc();
-                if (apkt) {
-                    av_packet_move_ref(apkt, pkt_);
-                    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-                    // Stamped with the discontinuity correction in effect at this demux
-                    // position, so audio rides the same timeline as the video frames decoded
-                    // around it (a cut shifts both tracks together instead of desyncing them).
-                    audio_pkt_queue_.push_back(AudioPacketEntry{ apkt,
-                        loop_offset_seconds_ + discontinuity_offset_ });
-                    if (audio_pkt_queue_.size() > kAudioQueueMaxPackets) {
-                        AudioPacketEntry drop = audio_pkt_queue_.front();
-                        audio_pkt_queue_.pop_front();
-                        av_packet_free(&drop.pkt);
-                        ++audio_pkt_dropped_;
-                    }
-                }
-            }
-            av_packet_unref(pkt_);
-        }
-    }
-}
-
-bool Decoder::next_frame(DecodedFrame& out)
-{
-    if (at_eof() || failed()) return false;
-    double raw_pts_s = 0.0;
-    int r = pump_one_raw_frame(out, raw_pts_s);
-    if (r < 0) {
-        failed_.store(true, std::memory_order_release);
-        return false;
-    }
-    if (r == 0) {
-        at_eof_.store(true, std::memory_order_release);
-        return false;
-    }
-
-    if (!have_first_pts_) {
-        first_pts_seconds_ = raw_pts_s;
-        have_first_pts_ = true;
-    }
-    out.pts_seconds = map_timeline_pts(raw_pts_s);
-    return true;
-}
-
-bool Decoder::reconnect_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error)
-{
-    LogScope log_scope(*this);
-    if (!is_network_ || !fmt_ctx_ || !fmt_ctx_->pb || !fmt_ctx_->url ||
-        (fmt_ctx_->iformat->flags & AVFMT_NOFILE)) {
-        error = "network input cannot be reconnected as a seekable file";
-        return false;
-    }
-    AVFormatContext* replacement = avformat_alloc_context();
-    if (!replacement) {
-        error = "network reconnect could not allocate a format context";
-        return false;
-    }
-    replacement->interrupt_callback = fmt_ctx_->interrupt_callback;
-    AVDictionary* options = nullptr;
-    av_dict_set(&options, "rw_timeout", "15000000", 0);
-    av_dict_set(&options, "reconnect", "1", 0);
-    av_dict_set(&options, "reconnect_streamed", "1", 0);
-    av_dict_set(&options, "reconnect_on_network_error", "1", 0);
-    av_dict_set(&options, "reconnect_delay_max", "5", 0);
-    av_dict_set(&options, "seekable", "1", 0);
-    av_dict_set(&options, "probesize", "1048576", 0);
-    av_dict_set(&options, "analyzeduration", "2000000", 0);
-    // Same request context as the original open() (see http_headers_/http_cookies_): a
-    // reconnect that dropped them would be rejected by a referer/cookie-guarded source.
-    if (!http_headers_.empty())
-        av_dict_set(&options, "headers", http_headers_.c_str(), 0);
-    if (!http_cookies_.empty())
-        av_dict_set(&options, "cookies", http_cookies_.c_str(), 0);
-    int ret = avformat_open_input(&replacement, fmt_ctx_->url, nullptr, &options);
-    av_dict_free(&options);
-    if (ret >= 0) ret = avformat_find_stream_info(replacement, nullptr);
-    if (ret < 0 || interrupt_requested_.load(std::memory_order_relaxed)) {
-        char message[AV_ERROR_MAX_STRING_SIZE] = {};
-        av_strerror(ret < 0 ? ret : AVERROR_EXIT, message, sizeof(message));
-        error = std::string("network reconnect failed: ") + message;
-        avformat_close_input(&replacement);
-        return false;
-    }
-    const int video = av_find_best_stream(replacement, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    const int audio = video >= 0
-        ? av_find_best_stream(replacement, AVMEDIA_TYPE_AUDIO, -1, video, nullptr, 0) : -1;
-    const AVCodecParameters* params = video >= 0 ? replacement->streams[video]->codecpar : nullptr;
-    const AVCodecParameters* old_audio = audio_codecpar();
-    const AVCodecParameters* new_audio = audio >= 0 ? replacement->streams[audio]->codecpar : nullptr;
-    const bool audio_matches = old_audio && new_audio
-        ? old_audio->codec_id == new_audio->codec_id &&
-          old_audio->sample_rate == new_audio->sample_rate &&
-          av_channel_layout_compare(&old_audio->ch_layout, &new_audio->ch_layout) == 0 &&
-          av_cmp_q(audio_time_base(), replacement->streams[audio]->time_base) == 0
-        : !old_audio && !new_audio;
-    if (!params || params->codec_id != codec_ctx_->codec_id ||
-        params->width != coded_width_ || params->height != coded_height_ ||
-        av_cmp_q(time_base_, replacement->streams[video]->time_base) != 0 || !audio_matches ||
-        !(replacement->pb && (replacement->pb->seekable & AVIO_SEEKABLE_NORMAL))) {
-        error = "network source changed format or is no longer seekable";
-        avformat_close_input(&replacement);
-        return false;
-    }
-    // Demuxers can retain their own IO pointers; replace the transport and demuxer together.
-    avformat_close_input(&fmt_ctx_);
-    fmt_ctx_ = replacement;
-    video_stream_idx_ = video;
-    audio_stream_idx_ = audio;
-    flush_audio_queue();
-    return seek_to_frame(target_frame, out, error);
-}
-
 bool Decoder::seek_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error,
                             bool nearest_keyframe)
 {
     LogScope log_scope(*this);
+    if (!source_ || !video_) {
+        error = "decoder is not open";
+        return false;
+    }
     if (!have_first_pts_) {
         error = "seek_to_frame called before any frame decoded (no PTS origin yet)";
         return false;
     }
     if (target_frame < 0) target_frame = 0;
 
-    // seek = reposition：离开 EOF 状态，之后 next_frame() 会重新产帧（或再次走到 EOF 时
-    // 重新置位）。即便下面 av_seek_frame 失败，flush 后的位置也已不再是「确定的 EOF」，
-    // 清掉仍是正确信号。
+    // seek = reposition: leave the EOF state, a later next_frame() produces pictures again (and
+    // re-latches EOF if the stream really ends there).
     at_eof_.store(false, std::memory_order_relaxed);
 
     // Map the requested content frame number back into the raw stream PTS domain using the
-    // ORIGINAL first_pts_seconds_/loop_offset_ established at open() -- frame numbers stay
-    // globally anchored to that one origin across any number of seeks (I5). A seek never
-    // touches loop_offset_seconds_/first_pts_seconds_ (loop_offset stays 0 for the session
-    // under pause-on-last-frame; the term remains in the formula for a single code path).
-    // The discontinuity correction is reset below, so this linear mapping is the plain origin
-    // relation: after a seek the timeline is re-anchored at the raw stream axis.
-    double target_seconds_local = static_cast<double>(target_frame) / fps_; // in loop_offset_ domain
-    double target_seconds_raw = (target_seconds_local - loop_offset_seconds_) + first_pts_seconds_;
-    int64_t seek_ts = static_cast<int64_t>(std::llround(target_seconds_raw / av_q2d(time_base_)));
+    // ORIGINAL first_pts_seconds_ established at open() -- frame numbers stay globally anchored to
+    // that one origin across any number of seeks (I5).
+    const double target_seconds_local = static_cast<double>(target_frame) / fps_;
+    const double target_seconds_raw =
+        (target_seconds_local - loop_offset_seconds_) + first_pts_seconds_;
 
     draining_ = false;
     failed_.store(false, std::memory_order_relaxed);
-    if (fmt_ctx_->pb) {
-        fmt_ctx_->pb->eof_reached = 0;
-        fmt_ctx_->pb->error = 0;
-    }
-    avcodec_flush_buffers(codec_ctx_);
-    int ret = av_seek_frame(fmt_ctx_, video_stream_idx_, seek_ts, AVSEEK_FLAG_BACKWARD);
-    if (ret < 0) {
-        error = "av_seek_frame failed";
-        return false;
-    }
+    video_->flush();
+    if (!source_->seek_to(target_seconds_raw, error)) return false;
     // A reposition legitimately jumps the timeline backwards: drop the monotonic guard and any
-    // discontinuity correction accumulated before the seek (it only described the old position;
-    // a cut encountered again after the seek is detected again from here on).
+    // discontinuity correction accumulated before the seek (it only described the old position).
     discontinuity_offset_ = 0.0;
     last_out_pts_seconds_ = -1.0;
+    set_state(SourceState::Buffering);
 
-    // Decode forward from the keyframe av_seek_frame landed on until the picture ON SCREEN at
-    // target_frame is found (I5): a picture covers [ceil(pts*fps), ceil((pts+duration)*fps)-1]
-    // of the fixed grid, so a VFR picture answers for its whole hold and forward decoding stops
-    // on that picture instead of running on to the next one. Bounded loop: a HEVC GOP is
-    // essentially never long enough to need more than a few hundred frames of forward decode
-    // even on a deep seek, since av_seek_frame itself did the O(log n) jump to the nearest
-    // keyframe regardless of how far away target_frame is.
-    // Coarse-preview fast path: take the keyframe av_seek_frame landed on (one decode) and stop.
-    if (nearest_keyframe) {
-        double raw_pts_s = 0.0;
-        DecodedFrame df;
-        int r = pump_one_raw_frame(df, raw_pts_s);
-        if (r <= 0) { error = "nearest_keyframe: no frame decoded after seek"; return false; }
-        out = df;
-        out.pts_seconds = map_timeline_pts(raw_pts_s);
-        return true;
-    }
-
+    constexpr int kMaxStarveRetries = 256;
     constexpr int kMaxForwardFrames = 600;
+    int starve_retries = 0;
     bool have_any = false;
     DecodedFrame last_good{};
     double last_good_pts_s = 0.0;
 
-    for (int i = 0; i < kMaxForwardFrames; ++i) {
-        double raw_pts_s = 0.0;
+    // Coarse-preview fast path: take the keyframe av_seek_frame landed on (one decode) and stop.
+    int64_t budget = nearest_keyframe ? 1 : kMaxForwardFrames;
+    while (budget-- > 0) {
         DecodedFrame df;
-        int r = pump_one_raw_frame(df, raw_pts_s);
-        if (r < 0) {
-            error = "pump_one_raw_frame failed during seek_to_frame";
-            return false;
+        double raw_pts_s = 0.0;
+        const DecodeStatus status = pull_described(df, raw_pts_s, error);
+        if (status == DecodeStatus::WouldBlock) {
+            if (++starve_retries > kMaxStarveRetries) {
+                error = "seek stalled: source stopped delivering data";
+                set_state(SourceState::Starved);
+                return false;
+            }
+            Sleep(1);
+            ++budget; // waiting for data does not consume forward-decode budget
+            continue;
         }
-        if (r == 0) {
+        if (status == DecodeStatus::Eof) {
             // Hit EOF while decoding forward toward target_frame (near-tail seek): clamp to
             // whatever we already have instead of failing the whole seek.
             break;
         }
+        if (status != DecodeStatus::Frame && status != DecodeStatus::NeedReconfigure) {
+            if (error.empty()) error = "seek_to_frame: decode failed";
+            return false;
+        }
         const double pts_s = map_timeline_pts(raw_pts_s);
         df.pts_seconds = pts_s;
+        if (nearest_keyframe) {
+            out = df;
+            set_state(SourceState::Ready);
+            return true;
+        }
         last_good = df;
         last_good_pts_s = pts_s;
         have_any = true;
 
+        // The picture covers [ceil(pts*fps), ceil((pts+duration)*fps)-1] of the fixed grid (I5),
+        // so a VFR picture answers for its whole hold and forward decoding stops on that picture.
         const int64_t grid_start = static_cast<int64_t>(std::ceil(pts_s * fps_ - 1e-5));
         const int64_t grid_end = (df.duration_seconds > 0.0)
             ? static_cast<int64_t>(std::ceil((pts_s + df.duration_seconds) * fps_ - 1e-5)) - 1
             : grid_start;
-        // Covered by this picture, or this picture starts past the target (a gap with no
-        // picture at target_frame -- the next sample is the closest answer there is).
+        // Covered by this picture, or this picture starts past the target (a gap with no picture
+        // at target_frame -- the next sample is the closest answer there is).
         if (target_frame <= grid_end || grid_start > target_frame) {
             out = df;
+            set_state(SourceState::Ready);
             return true;
         }
     }
 
+    if (nearest_keyframe && !have_any) {
+        error = "nearest_keyframe: no frame decoded after seek";
+        return false;
+    }
     if (have_any) {
-        // Ran out of forward-decode budget or hit EOF before reaching target_frame exactly
-        // -- land on the last frame we actually got (near-tail-of-video or pathologically
-        // long-GOP case). Graceful degradation, never a hard failure.
+        // Ran out of forward-decode budget or hit EOF before reaching target_frame exactly: land
+        // on the last frame we actually got (near-tail-of-video or pathologically long-GOP case).
+        // Graceful degradation, never a hard failure.
         out = last_good;
         out.pts_seconds = last_good_pts_s;
+        set_state(SourceState::Ready);
         return true;
     }
-
     error = "seek_to_frame: no frame could be decoded after seek";
     return false;
 }
 
-bool Decoder::pop_audio_packet(AVPacket* dst, double& loop_offset_out)
+bool Decoder::reconnect_to_frame(int64_t target_frame, DecodedFrame& out, std::string& error)
 {
-    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-    if (audio_pkt_queue_.empty()) return false;
-    AudioPacketEntry e = audio_pkt_queue_.front();
-    audio_pkt_queue_.pop_front();
-    av_packet_move_ref(dst, e.pkt);
-    av_packet_free(&e.pkt);
-    loop_offset_out = e.loop_offset;
-    return true;
-}
-
-void Decoder::flush_audio_queue()
-{
-    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-    while (!audio_pkt_queue_.empty()) {
-        AudioPacketEntry e = audio_pkt_queue_.front();
-        audio_pkt_queue_.pop_front();
-        av_packet_free(&e.pkt);
+    LogScope log_scope(*this);
+    if (!source_ || !video_) {
+        error = "decoder is not open";
+        return false;
     }
+    if (!source_->reconnect(error)) return false;
+    set_state(SourceState::Recovering);
+    // The transport was swapped; MediaSource validated that the codec/geometry/audio still match,
+    // so the decoder keeps running and only needs its buffered state dropped.
+    video_->flush();
+    draining_ = false;
+    at_eof_.store(false, std::memory_order_relaxed);
+    failed_.store(false, std::memory_order_relaxed);
+    return seek_to_frame(target_frame, out, error);
 }
 
-size_t Decoder::audio_queue_depth() const
+bool Decoder::reconnect_live(std::string& error)
 {
-    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
-    return audio_pkt_queue_.size();
+    LogScope log_scope(*this);
+    if (!is_live()) {
+        error = "input is not a live network source";
+        return false;
+    }
+    if (!source_->reconnect(error, true)) return false;
+    video_->flush();
+    draining_ = false;
+    at_eof_.store(false, std::memory_order_relaxed);
+    failed_.store(false, std::memory_order_relaxed);
+    set_state(SourceState::Recovering);
+    return true;
 }

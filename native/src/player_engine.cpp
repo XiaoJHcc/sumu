@@ -118,6 +118,10 @@ int64_t Player::seek(int64_t frame_num){
     std::string err;
     if (!decoder_.seek_to_frame(source_target, df, err))
         throw std::runtime_error("seek_to_frame failed: " + err);
+    if (decoder_.config_generation() != decoder_config_generation_) {
+        reconfigure_video_session(df, frame_num);
+        return current_frame();
+    }
 
     // Same grid mapping decode_loop() uses (real PTS + duration -> [start, end] grid
     // interval), so the tagged slot answers find_pt_slot_locked() for every frame the
@@ -183,6 +187,7 @@ int64_t Player::seek(int64_t frame_num){
         seek_slot_hint_.store(static_cast<int64_t>(slot), std::memory_order_relaxed);
     }
     seek_version_.fetch_add(1, std::memory_order_relaxed);
+    timeline_generation_.fetch_add(1, std::memory_order_relaxed);
 
     return actual_frame;
 }
@@ -191,8 +196,10 @@ int64_t Player::seek(int64_t frame_num){
 // tensor representing the AI-processed frame for content frame number `frame_num`. Never
 // blocks the present thread -- only ever touches the small landing texture via CUDA,
 // then a single D3D11 copy into the ready-map slot, then flips that slot's tag.
-void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int fheight, size_t pitch_bytes){
+void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int fheight,
+                           size_t pitch_bytes, uint64_t generation){
     require_open();
+    if (generation != 0 && generation != timeline_generation()) return;
     if (fwidth != src_width_ || fheight != src_height_)
         throw std::runtime_error("push_ai_frame: frame size does not match source video size");
 
@@ -211,6 +218,7 @@ void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int 
     // load observes false, those resources are being (or about to be) torn down, so bail as
     // a no-op rather than mapping/copying into them. acquire pairs with reopen()'s release.
     if (!session_active_.load(std::memory_order_acquire)) return;
+    if (generation != 0 && generation != timeline_generation()) return;
 
     try {
         check_cu(cuGraphicsMapResources(1, &cu_res_, 0), "cuGraphicsMapResources");
@@ -292,7 +300,7 @@ void Player::push_ai_frame(int64_t frame_num, uint64_t dev_ptr, int fwidth, int 
 // single persistent landing_tex_ in the reverse direction) -- callers must finish
 // consuming/copying it (e.g. via the ported `_nv12_to_bgr_hwc_gpu`) before the next call
 // to this method, since that call will overwrite the same memory.
-py::dict Player::get_cuda_nv12_by_frame(int64_t frame_num){
+py::dict Player::get_cuda_nv12_by_frame(int64_t frame_num, uint64_t generation){
     require_open();
     UINT slot = UINT_MAX;
     auto miss = [frame_num]() {
@@ -304,11 +312,13 @@ py::dict Player::get_cuda_nv12_by_frame(int64_t frame_num){
     {
         std::lock_guard<std::mutex> lk(ready_mutex_);
         if (!session_active_.load(std::memory_order_acquire)) return miss();
+        if (generation != 0 && generation != timeline_generation()) return miss();
         slot = find_pt_slot_locked(frame_num);
         if (slot == UINT_MAX) return miss();
     }
     std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
     if (!session_active_.load(std::memory_order_acquire)) return miss();
+    if (generation != 0 && generation != timeline_generation()) return miss();
     {
         std::lock_guard<std::mutex> lk(ready_mutex_);
         slot = find_pt_slot_locked(frame_num);
@@ -428,6 +438,8 @@ py::dict Player::stats(){
     d["network_recovery_attempts"] = network_recovery_attempts_.load(std::memory_order_relaxed);
     d["network_recovery_successes"] = network_recovery_successes_.load(std::memory_order_relaxed);
     d["network_recovering"] = network_recovering_.load(std::memory_order_relaxed);
+    d["config_generation"] = timeline_generation();
+    d["source_state"] = static_cast<int>(decoder_.source_state());
     // VFR diagnostics (no UI consumer): how many passthrough slots currently hold a picture,
     // and the longest grid interval one picture stays on screen for. 1 == plain CFR.
     int64_t ready_slots = 0, hold_max = 0;
@@ -721,7 +733,8 @@ void Player::scrub_loop(){
     }
     int64_t last_handled = -1;
     while (true) {
-        if (session_stop_.load(std::memory_order_relaxed) || stop_.load(std::memory_order_relaxed))
+        if (session_stop_.load(std::memory_order_relaxed) || scrub_stop_.load(std::memory_order_relaxed) ||
+                           stop_.load(std::memory_order_relaxed))
             return;
 
         int64_t req = scrub_request_frame_.load(std::memory_order_relaxed);
@@ -745,6 +758,7 @@ void Player::scrub_loop(){
                 std::unique_lock<std::mutex> lk(scrub_cv_mutex_);
                 scrub_cv_.wait_for(lk, std::chrono::milliseconds(grid_play_throttle_ms_), [&] {
                     return session_stop_.load(std::memory_order_relaxed) ||
+                           scrub_stop_.load(std::memory_order_relaxed) ||
                            stop_.load(std::memory_order_relaxed) ||
                            scrub_request_frame_.load(std::memory_order_relaxed) != last_handled;
                 });
@@ -757,6 +771,7 @@ void Player::scrub_loop(){
         std::unique_lock<std::mutex> lk(scrub_cv_mutex_);
         scrub_cv_.wait_for(lk, std::chrono::milliseconds(200), [&] {
             return session_stop_.load(std::memory_order_relaxed) ||
+                   scrub_stop_.load(std::memory_order_relaxed) ||
                    stop_.load(std::memory_order_relaxed) ||
                    scrub_request_frame_.load(std::memory_order_relaxed) != last_handled ||
                    (scrub_grid_wanted_.load(std::memory_order_relaxed) &&
@@ -1071,16 +1086,30 @@ void Player::decode_loop(){
             }
 
             DecodedFrame df;
-            if (!decoder_.next_frame(df)) {
+            const DecodeResult decoded = decoder_.next_frame(df);
+            if (decoded.status == DecodeStatus::WouldBlock)
+                goto decode_idle;
+            if (decoded.status == DecodeStatus::NeedReconfigure) {
+                try {
+                    reconfigure_video_session(df);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[sumu] video reconfiguration failed: %s\n", e.what());
+                    playing_.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                continue;
+            }
+            if (decoded.status != DecodeStatus::Frame) {
                 const int64_t high = pt_high_water_.load(std::memory_order_relaxed);
                 const int64_t head = present_head_frame_.load(std::memory_order_relaxed);
                 const auto now = std::chrono::steady_clock::now();
                 const bool playing = playing_.load(std::memory_order_relaxed);
                 if (!playing)
                     network_recovering_.store(false, std::memory_order_relaxed); // nothing to recover while paused
+                const bool live = decoder_.is_live();
                 if (!playing || !decoder_.have_first_pts() ||
-                    frame_count_ <= 0 || high >= frame_count_ - 1 ||
-                    head >= frame_count_ - 1 || now < next_recovery)
+                    (!live && (frame_count_ <= 0 || high >= frame_count_ - 1 ||
+                               head >= frame_count_ - 1)) || now < next_recovery)
                     goto decode_idle;
                 const int div = std::max(1, fps_div_.load(std::memory_order_relaxed));
                 std::string err;
@@ -1088,10 +1117,11 @@ void Player::decode_loop(){
                     network_recovering_.store(true, std::memory_order_relaxed);
                     network_recovery_attempts_.fetch_add(1, std::memory_order_relaxed);
                 }
-                const int64_t target = std::min(head + 2, frame_count_ - 1) * div;
-                const bool recovered = network_source_
-                    ? decoder_.reconnect_to_frame(target, df, err)
-                    : decoder_.seek_to_frame(target, df, err);
+                const int64_t target = live ? 0 : std::min(head + 2, frame_count_ - 1) * div;
+                const bool recovered = live
+                    ? decoder_.reconnect_live(err)
+                    : network_source_ ? decoder_.reconnect_to_frame(target, df, err)
+                                      : decoder_.seek_to_frame(target, df, err);
                 if (!recovered) {
                     recovery_failures = std::min(recovery_failures + 1, 4u);
                     const unsigned delay_ms = network_source_ ? std::min(2000u, 500u << recovery_failures) : 250u;
@@ -1104,9 +1134,13 @@ void Player::decode_loop(){
                 if (network_source_) {
                     network_recovery_successes_.fetch_add(1, std::memory_order_relaxed);
                     network_recovering_.store(false, std::memory_order_relaxed);
-                    fprintf(stderr, "[sumu] network playback recovered at %.3fs\n", df.pts_seconds);
+                    if (live)
+                        fprintf(stderr, "[sumu] live network source reopened\n");
+                    else
+                        fprintf(stderr, "[sumu] network playback recovered at %.3fs\n", df.pts_seconds);
                 }
                 recovery_failures = 0;
+                if (live) continue;
             }
 
             // Real-PTS grid mapping: a picture occupies [start, end] of the fixed-fps timeline,
@@ -1120,6 +1154,15 @@ void Player::decode_loop(){
             if (df.duration_seconds > 0.0) {
                 frame_end = static_cast<int64_t>(std::ceil((df.pts_seconds + df.duration_seconds) * fps_ - 1e-5)) - 1;
                 if (frame_end < frame_num) continue;
+            }
+            if (decoder_.timeline_kind() == TimelineKind::Segmented && source_fps_ > 0.0) {
+                const int64_t source_end = static_cast<int64_t>(std::ceil(
+                    (df.pts_seconds + df.duration_seconds) * source_fps_ - 1e-5)) - 1;
+                if (source_end >= source_frame_count_) {
+                    source_frame_count_ = source_end + 1;
+                    recompute_session_rate();
+                    if (!network_source_) invalidate_scrub_timeline();
+                }
             }
             if (frame_count_ > 0) frame_end = std::min(frame_end, frame_count_ - 1);
             if (frame_num < 0 || frame_num > frame_end) continue;
@@ -1274,7 +1317,7 @@ void Player::present_loop(){
                 if (!just_seeked && computed <= last_frame_local) computed = last_frame_local + 1;
                 frame = computed;
                 int64_t end_frame = frame_count_ > 0 ? frame_count_ - 1 : INT64_MAX;
-                if (frame_count_ <= 0 && decoder_.at_eof()) {
+                if (frame_count_ <= 0 && decoder_.at_eof() && !decoder_.is_live()) {
                     const int64_t decoded_end = pt_high_water_.load(std::memory_order_relaxed);
                     if (decoded_end >= 0) end_frame = decoded_end;
                 }
@@ -1523,8 +1566,8 @@ double Player::compute_master_s() const{
 void Player::recompute_session_rate(){
     int div = fps_div_.load(std::memory_order_relaxed);
     if (div < 1) div = 1;
-    // Session fps/count: dense retimed timeline. source_fps_/source_frame_count_ stay fixed
-    // for the open file; only div changes at set_fps_div / open_session.
+    // Session fps/count: dense retimed timeline. source_fps_ stays fixed; source_frame_count_
+    // may grow when a segmented source reveals more pictures than its container declared.
     if (source_fps_ > 0.0)
         fps_ = source_fps_ / static_cast<double>(div);
     else

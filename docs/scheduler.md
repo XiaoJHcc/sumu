@@ -16,12 +16,15 @@ D「重写」清单），但它调用的每一个计算函数（`scene_clip.py` 
 播放器是主，AI 是仆（DESIGN.md）。`Scheduler` 跑在自己的 daemon 线程上，每一轮：
 
 1. 检查是否有 `notify_seek()` 挂起的seek，有则立即整体重置状态（I6）。
-2. 读 `player.current_frame()`（present 头），用启发式兜底检测未经 `notify_seek()` 的
+2. 检查 `player.timeline_generation()`：普通 seek 和流中重配置都会使其递增。变化时清空
+   scenes/frame_cache/pending_regions 并重新锚定 frontier，记 `config_resets`；显式 seek 已重置的
+   同一代际不重复计数。后续 CUDA pull/push 携带该代际，旧配置写入由 native 直接拒绝。
+3. 读 `player.current_frame()`（present 头），用启发式兜底检测未经 `notify_seek()` 的
    discontinuity（见下）。
-3. **frontier 闸门**：若 `ai_frontier < head`（AI 落后于播放头），立即把 frontier 拉到
+4. **frontier 闸门**：若 `ai_frontier < head`（AI 落后于播放头），立即把 frontier 拉到
    `head`，丢弃所有在制品（I9：降级不停顿，绝不逐帧追赶挖坑）。
-4. 若 `ai_frontier > head + lead`（AI 领先太多），`sleep(sleep_step_s)` 后重试。
-5. 否则处理 `n = ai_frontier` 这一帧：`get_cuda_nv12_by_frame(n)`（非阻塞，`ready=False` 就
+5. 若 `ai_frontier > head + lead`（AI 领先太多），`sleep(sleep_step_s)` 后重试。
+6. 否则处理 `n = ai_frontier` 这一帧：`get_cuda_nv12_by_frame(n)`（非阻塞，`ready=False` 就
    sleep 重试）→ NV12→BGR → 缓存 → YOLO → `append_or_create_scenes`/
    `materialize_completed_clips` → 对每个刚完成的 clip：`restore_clip` + 逐帧
    `blend_back_frame` → BGR→RGBA → `push_ai_frame`。`ai_frontier` 前进一帧。

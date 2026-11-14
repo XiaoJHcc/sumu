@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: sumu Authors
 // SPDX-License-Identifier: AGPL-3.0
 //
-// HeadlessDecode: a windowless, sequential d3d11va-hard-decode -> CUDA-NV12 source for the
+// HeadlessDecode: a windowless, sequential hardware/software decode -> CUDA-NV12 source for the
 // transcode / web-streaming / offline-export pipeline (python/sumu/webstream/). Reuses the
 // same Decoder (including its frame normalization to display-oriented BT.709 limited NV12) plus the AI-input-bridge blit technique already
 // validated in player.cpp (create_ai_input_bridge + get_cuda_nv12_by_frame, see
@@ -139,6 +139,7 @@ public:
         if (!decoder_.open(path, device_.Get(), err))
             throw std::runtime_error("HeadlessDecode.open: " + err);
 
+        decoder_config_generation_ = decoder_.config_generation();
         width_ = decoder_.width();
         height_ = decoder_.height();
         fps_ = decoder_.fps();
@@ -169,8 +170,24 @@ public:
             // can block on socket IO for seconds, which must not freeze the rest of the app (UI +
             // scheduler). The py::dict is built AFTER this scope, once the GIL is re-acquired.
             py::gil_scoped_release release;
-            if (!decoder_.next_frame(df)) {
+            DecodeResult decoded;
+            for (;;) {
+                decoded = decoder_.next_frame(df);
+                if (decoded.status != DecodeStatus::WouldBlock) break;
+                Sleep(5);
+            }
+            if (decoded.status == DecodeStatus::NeedReconfigure) {
+                release_bridge_resources();
+                width_ = decoder_.width();
+                height_ = decoder_.height();
+                create_bridge_resources();
+                decoder_config_generation_ = decoder_.config_generation();
+            }
+            if (decoded.status == DecodeStatus::Eof) {
                 eof = true;
+            } else if (decoded.status != DecodeStatus::Frame &&
+                       decoded.status != DecodeStatus::NeedReconfigure) {
+                throw std::runtime_error("HeadlessDecode.next_frame: " + decoded.error);
             } else {
                 // Decoder texture -> display-size NV12 intermediate (same nullptr-box full copy the
                 // validated decode_loop/scrub blit use), then identity-blit into the CUDA-registered
@@ -282,6 +299,13 @@ public:
         std::string err;
         if (!decoder_.seek_to_frame(target_frame, df, err))
             throw std::runtime_error("HeadlessDecode.seek_to_frame: " + err);
+        if (decoder_.config_generation() != decoder_config_generation_) {
+            release_bridge_resources();
+            width_ = decoder_.width();
+            height_ = decoder_.height();
+            create_bridge_resources();
+            decoder_config_generation_ = decoder_.config_generation();
+        }
         return static_cast<int64_t>(std::llround(df.pts_seconds * fps_));
     }
 
@@ -296,13 +320,7 @@ public:
 
     void close()
     {
-        if (cu_res_y_) { cuGraphicsUnregisterResource(cu_res_y_); cu_res_y_ = nullptr; }
-        if (cu_res_uv_) { cuGraphicsUnregisterResource(cu_res_uv_); cu_res_uv_ = nullptr; }
-        if (cu_buf_) { cuMemFree(cu_buf_); cu_buf_ = 0; }
-        y_rtv_.Reset(); uv_rtv_.Reset();
-        y_tex_.Reset(); uv_tex_.Reset();
-        srv_y_.Reset(); srv_uv_.Reset();
-        nv12_tex_.Reset();
+        release_bridge_resources();
         decoder_.close();
         width_ = 0; height_ = 0; fps_ = 60.0; frame_count_ = 0;
         opened_ = false;
@@ -321,6 +339,17 @@ public:
     }
 
 private:
+    void release_bridge_resources()
+    {
+        if (cu_res_y_) { cuGraphicsUnregisterResource(cu_res_y_); cu_res_y_ = nullptr; }
+        if (cu_res_uv_) { cuGraphicsUnregisterResource(cu_res_uv_); cu_res_uv_ = nullptr; }
+        if (cu_buf_) { cuMemFree(cu_buf_); cu_buf_ = 0; }
+        y_rtv_.Reset(); uv_rtv_.Reset();
+        y_tex_.Reset(); uv_tex_.Reset();
+        srv_y_.Reset(); srv_uv_.Reset();
+        nv12_tex_.Reset();
+    }
+
     void compile_blit_shaders()
     {
         ComPtr<ID3DBlob> vs_blob, ps_y_blob, ps_uv_blob, err_blob;
@@ -415,6 +444,7 @@ private:
     CUdevice cu_dev_ = 0; // L1: 构造函数 Retain 的设备，close() 配对 Release 用
 
     Decoder decoder_;
+    uint64_t decoder_config_generation_ = 0;
 
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> ps_y_;

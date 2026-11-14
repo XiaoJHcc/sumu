@@ -5,7 +5,7 @@
 
 ## 项目是什么
 
-sumu（澄む）是一个**时钟驱动、全程 GPU** 的实时去马赛克预览播放器。它由 lada 的实时化 fork `lada-realtime` 立项而来——**换掉「传输 + 呈现 + seek」这一层**，**照搬其 AI 计算核心**，从结构上根治旧架构的卡顿与 seek 冻屏。
+sumu（澄む）是一个**时钟驱动、GPU 优先** 的实时去马赛克预览播放器。它由 lada 的实时化 fork `lada-realtime` 立项而来——**换掉「传输 + 呈现 + seek」这一层**，**照搬其 AI 计算核心**，从结构上根治旧架构的卡顿与 seek 冻屏。
 
 **心智模型：播放器是主，AI 是仆。** present loop 每个 vblank 从 ready-map（帧号 → GPU 纹理）挑当前播放时间的最佳帧——AI 帧就绪就上去码，否则回退原片环缓冲。**present 永不阻塞在 AI 上，永不因 AI 慢而卡。**
 
@@ -19,7 +19,7 @@ sumu（澄む）是一个**时钟驱动、全程 GPU** 的实时去马赛克预�
 - **宿主**：极简 **Win32 窗口**，UI 覆盖层走 **Dear ImGui**（进度条 / scrub 缩略图 / 窗口 chrome / 设置旋钮 / 导出页 / 流媒体模态框）。
 - **网页**：URL 页内嵌 **WebView2**（系统 Evergreen Runtime，windowed child window 只覆盖地址栏以下；SDK 仅构建期，静态 loader，包内无 WebView2 DLL）。地址栏常驻（后退/前进/刷新/URL/收藏星标/播放，无关闭 X——页面内唯一退出口是首屏 Cancel；回车提交导航，星标收藏**已提交**的页面 URL，下拉列表用它自己的顶层弹出窗口画在网页之上），页面内容在 Home/Web/Loading/Native/Unavailable 间切换。**地址栏提交先导航**：普通网页从确认那刻起由 WebView2 渲染，不依赖 FFmpeg 探测；点击链接或提交地址后的顶层导航响应若确认为视频流，则自动带上请求上下文与 CookieManager 的 cookie 进入原生播放，保留 query/percent 转义及重定向后的 URL，并取消对应的浏览器媒体下载。网页内嵌 `<video>`、iframe、fetch 等子资源不会触发接管；HTML/失败响应不得仅凭视频后缀切 Native。地址栏右侧**播放按钮**仍是手动入口，把它当前持有的 URL（带 query/percent 转义/`.flv`/无后缀一律照收，不设扩展名门槛）连同页面 Referer 与 CookieManager 的 cookie 直接交给 FFmpeg，失败按普通打开错误报告、不回退网页；成功后是**页内的 Native 内容**（地址栏转为悬浮 chrome，仅顶部 reveal 区/正在输入时出现，不占布局）。设置面板**浮在活网页之上**（网页照常渲染/可点/有声）。网页视图是真实子窗口、会盖住主 swapchain，因此**弹出层**（`native/src/popup_layer.*`）把地址栏收藏下拉、按钮 tooltip、设置面板与面板/地址栏打开的任何 ImGui 弹出窗口（combo 列表、右键菜单）画进各自 owned 顶层窗口（同一个 ImGui context，present 线程 `Present(0,0)`），只在活网页视图可见时启用路由；层内按下鼠标把键盘焦点交回主窗口，弹出窗口本身永不激活。
 - **语言**：**C++（VS2022 BuildTools）+ pybind11**，原生内核编译为模块 `sumu_core`（类 `Player`）暴露给 Python。
-- **解码**：基线走 **D3D11 硬解**（FFmpeg d3d11va）→ NV12 纹理 → shader → present，**基线不碰 CUDA**；AI 路径 NVDEC → torch，靠 **D3D11↔CUDA 零拷贝互操作**接起来。
+- **解码**：基线走 **D3D11 硬解**（FFmpeg d3d11va）→ NV12 纹理 → shader → present，**基线不碰 CUDA**；硬解不可用或像素格式不支持时由 `VideoDecoder` 软件后端经 libswscale 转换并上传一次 NV12，之后仍复用同一 GPU ring / AI / present。AI 路径 NVDEC → torch，靠 **D3D11↔CUDA 零拷贝互操作**接起来。
 - **音频**：WASAPI，以 QPC 主时钟为准的**纯附加从属时钟**，不扰动 present 节奏。
 - **转码 / 流媒体**：无窗口 headless D3D11 硬解 → AI 去码 → **NVENC**（HLS / MP4），实现 Web 局域网串流与离线导出。带 NVENC 的 `ffmpeg.exe` 是这部分 + 缩略图的软依赖（`ffprobe.exe` 已是既有软依赖，用于读取视频元数据）。
 - **分工**：原生内核（decode + present + interop + ready-map + 音频 + UI 渲染）＋ Python 编排 AI（检测 / 修复 / 调度）与转码（`python/sumu/webstream`）。
@@ -36,8 +36,9 @@ native/                  C++ 原生内核，构建产物 sumu_core.cp313-win_amd
   CMakeLists.txt         目标/依赖/产物落位
   src/                   player_engine / player_audio（WASAPI 音频线程 + 端点恢复）/
                          player_session / player_window / player_pybind /
-                         player_ui_overlays / player_ui_bars / player_ui_export / decoder /
-                         video_normalizer（GPU 色彩/HDR/旋转归一化）/
+                         player_ui_overlays / player_ui_bars / player_ui_export /
+                         decoder（门面）/ media_source（解封装与 IO）/
+                         video_decoder（D3D11VA + 软件后端）/ video_normalizer（GPU 色彩/HDR/旋转归一化）/
                          headless_decode（Web 转码用无窗口解码）/
                          browser_view（内嵌 WebView2 页视图，SDK 头只在这里）
   src/ui/                ImGui 设计系统（theme / widgets / icons）
@@ -94,7 +95,8 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 | `scripts/verify_browser.py` | 浏览器页 e2e：真实 WebView2 加载本地页面；断言普通网页导航不触发原生 open、网页内媒体（`<video>` 与脚本 fetch）不会切 Native、顶层视频导航（带 query/percent 转义、无后缀、重定向和下载）及真实链接点击自动原生播放并传递 Cookie/Referer，HTML 伪视频后缀、失败响应与过时导航不接管；含 back/forward/reload、Native 内容与「开成功不关页」、设置（面板浮在活网页之上：页面视图仍可见、面板是重叠网页矩形的真实顶层窗口、面板内像素不是网页底色，开启中导航照常、关闭即恢复）/文件选择/Web 串流/导出都不离开页面，以及「导航作废在飞的 cookie 查询」「Native 地址栏 reveal」 |
 | `scripts/verify_browser_input.py` | 浏览器页真实输入：点击网页后点击地址栏 Ctrl+A 输入并回车真导航（无原生 open）；真实点击后退/前进/刷新按钮，且最左槽位是后退而非已删除的关闭 X；真实点击收藏星标（intent）、点开收藏下拉（弹出层是真实顶层窗口，行内屏幕像素不是网页底色，证明它在网页之上）、点行导航、点行尾 X 删除、Esc 关闭、hover 出 tooltip；真实点击播放按钮把地址栏 URL 交给原生 open（含把带 query 的 `.flv` 地址打字进去再点播放）；真实点击标题栏全屏键进出全屏、全屏下标题栏与地址栏同步隐藏/顶部唤起且 viewport 不动；真实点击设置键把面板抬到网页之上、点进网页夺焦后点面板数字框 Ctrl+A 输入并回车记录 `lead` intent、真实点开 target-fps combo（菜单层窗口在网页之上，像素取证后点行记录 `target_fps`）、地址栏右键菜单同样浮在网页之上、hover 设置行出 tooltip、再点设置键收起；网页显示时真实拖动左/右/下边缘改变窗口且页面视图 bounds 跟随，且「页内按下再拖到边缘」不得缩放 |
 | `scripts\verify_video_formats.py` | GPU 色彩/格式归一化：BT.601/709、limited/full、10-bit、PQ/HLG、旋转/镜像；CUDA 输出对照公式与独立 FFmpeg，`--ai` 检查 AI 输入/呈现桥 |
-| `scripts\verify_playback_timeline.py` | VFR 时间网格与持帧内容、seek、fps_div、CFR/短视频、拼接 TS 防回退覆盖边界 |
+| `scripts\verify_playback_timeline.py` | VFR 时间网格与持帧内容、seek、fps_div、CFR/短视频、拼接 TS 分段时间轴扩展与全段播放 |
+| `scripts\verify_decoder_compatibility.py` | 软解回退（MPEG-4、4:2:2、4:4:4、Hi10P）、流中尺寸变化与直接 seek 重配置、HLS VOD、滑动 live 冻结/503 恢复；`--dry-run` 仅校验素材与本地服务 |
 | `scripts\verify_network_recovery.py` | 本地 HTTP Range 主动断流/503 后恢复、真实 EOF 不重试、关窗打断挂起读取 |
 | `scripts\verify_audio_recovery.py` | 音频端点恢复：真实 WASAPI 初始化、显式重建后输出恢复、pause/seek/关闭重开；物理热插拔需人工（脚本不动默认设备） |
 | `verify_ai_core.py` / `verify_scene_clip_blend.py` | AI 核心：load_models/YOLO/BasicVSR 实测 fps；scene/clip + blend 端到端 |
@@ -153,7 +155,7 @@ test_video*.mp4          本地测试素材 1080p30 / 4K60 HEVC / 2.1GB 长片�
 
 - **帧号是唯一事实来源**，锚定真实解码 PTS（I5）；ready-map、frontier、进度、seek 全部以帧号为键。
 - **seek = reposition，不 teardown**（I6）：只重定位时钟 + decode-ahead + AI 前沿，绝不销毁重建线程/解码器/模型。
-- **全程 GPU，帧不下主存**（I3）：唯一文档化放宽是 Web 转码喂编码器前的**一次** D2H（`final_bgr.cpu()`），与 present 热路径无关（`docs/webstream.md`）。
+- **GPU 优先，热路径帧不下主存**（I3）：仅两个文档化兼容例外——硬解不可用时 CPU 软解/色转并上传一次 NV12，以及 Web 转码喂编码器前的**一次** D2H（`final_bgr.cpu()`）；不得扩成热路径往返。
 - **先埋点，再优化；实测推翻直觉**（I10）：任何 present / interop 优化先量后改，spike / 压测结果落 `docs/`。
 - **VRAM 是一等约束**（I8）：环缓冲存 NV12（减半），按显存上限动态压 lookahead。
 - `clip_size` 锁死 256，与 TRT 引擎编译 shape 绑定，不是运行时旋钮。

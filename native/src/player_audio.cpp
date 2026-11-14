@@ -4,7 +4,7 @@
 // WASAPI audio thread. Ownership: every COM/WASAPI object, SwrContext and AVAudioFifo below is
 // touched only by this thread, inside one CoInitializeEx lifetime; the endpoint is torn down and
 // re-opened in place on device loss, default-output switch or explicit rebuild request.
-// Cross-thread inputs are only player.h's relaxed atomics plus Decoder's own audio queue (its own
+// Cross-thread inputs are only player.h's relaxed atomics plus MediaSource's audio queue (its own
 // mutex); master time comes from compute_master_s() (player_engine.cpp) -- audio is a slave of
 // present's QPC clock and never the reverse. This thread never takes d3d_mutex_/ready_mutex_/
 // decoder_mutex_.

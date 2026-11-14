@@ -1,6 +1,6 @@
 # sumu — 设计要点与验证方案
 
-> **sumu**（澄む，日语「由浊转清、变透明」）—— 一个真正**时钟驱动、全程 GPU** 的实时去马赛克预览播放器。
+> **sumu**（澄む，日语「由浊转清、变透明」）—— 一个真正**时钟驱动、GPU 优先** 的实时去马赛克预览播放器。
 >
 > 前身是 [lada](https://codeberg.org/ladaapp/lada) 的实时化 fork（`lada-realtime`）。lada 的实时预览是「数据驱动」——模型跟不上就暂停缓冲；lada-realtime 在其架构上做了大量时钟驱动改造，但受制于「AI 管线自持解码 + seek 拆建 + GStreamer 软件 sink」三处结构选择，反复出现 **seek 卡死 / 上屏帧时间不稳 / 最大化软件渲染墙**。sumu 不再打补丁，而是**换掉传输+呈现+seek 这一层**（AI 计算核心照搬），从结构上让这些症状不再产生。
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | I1 | **时钟驱动，永不缓冲停顿** | 以显示墙钟为准前进；绝不为等 AI 而 pause/rebuffer。lada 上游的 buffer-first 是我们要彻底摆脱的行为。 |
 | I2 | **present loop 与 AI 完全解耦** | present 只读 ready-map + 原片环缓冲，非阻塞挑帧；AI 生产快慢完全不影响上屏节奏。 |
-| I3 | **全程 GPU，帧不下主存** | decode(NVDEC) → AI(torch/CUDA) → present，全链路留显存。**禁止**当前 lada 那种每帧 GPU→host→GPU 兜圈（D2H `cuda.synchronize` + 主存拷贝 + videoconvert），那是窗口化抖动和 GPU 争用的根源。 |
+| I3 | **GPU 优先，热路径帧不下主存** | decode(D3D11VA) → AI(torch/CUDA) → present，主链路留显存。**禁止**当前 lada 那种每帧 GPU→host→GPU 兜圈（D2H `cuda.synchronize` + 主存拷贝 + videoconvert），那是窗口化抖动和 GPU 争用的根源。仅有的兼容例外：硬解不可用/不支持的格式由 CPU 软解、色彩转换并上传一次 NV12，以及 Web 转码喂编码器前的一次 D2H；不得把例外扩成热路径往返。 |
 | I4 | **player-grade 是地基，也是第一道门** | 必须先做到 4K60 HEVC 硬解、上屏帧时间稳定、seek 顺滑——**在接任何 AI 之前**。player 不达标，一切免谈。 |
 | I5 | **帧号是唯一事实来源，锚定真实 PTS** | ready-map、frontier、进度、seek 全部以「真实解码 PTS 换算的帧号」为键。lada 曾因把关键帧硬标成标称帧号而整段丢弃——不再重犯。 |
 | I6 | **seek = reposition，不是 teardown** | seek 只把 present clock + decode-ahead 缓冲 + AI 前沿**重定位**到新帧号；**不销毁不重建**线程/解码器。这从根上消掉 lada 的 seek 多秒黑屏和解码器 churn 堆损坏。 |

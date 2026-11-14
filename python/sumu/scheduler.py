@@ -167,6 +167,9 @@ class SchedulerStats:
         self.frames_pushed = 0
         self.frame_cache_misses = 0
         self.seek_resets = 0
+        # Resets caused by a native timeline_generation() change that notify_seek() did not
+        # report (mid-stream configuration change, or a seek issued straight on the player).
+        self.config_resets = 0
         self.backlog_resyncs = 0
         self.started_at: Optional[float] = None
         self.first_push_at: Optional[float] = None
@@ -193,6 +196,7 @@ class SchedulerStats:
             "frames_pushed": self.frames_pushed,
             "frame_cache_misses": self.frame_cache_misses,
             "seek_resets": self.seek_resets,
+            "config_resets": self.config_resets,
             "backlog_resyncs": self.backlog_resyncs,
             "cold_start_s": cold_start_s,
             "restore_frames": self.restore_frames,
@@ -257,6 +261,10 @@ class Scheduler:
         self.ai_frontier = 0
         self._last_head = 0
         self._eof_flushed_at: Optional[int] = None
+        # Last observed native timeline generation (player.timeline_generation()). Seeded by
+        # start() before the thread exists, then owned by the producer thread. None means the
+        # binding is absent (older builds / test doubles), which keeps the check disabled.
+        self._known_timeline_gen: Optional[int] = None
         # P1: restore timing via CUDA event pairs instead of torch.cuda.synchronize()
         # (a device-wide sync per clip serializes YOLO/blend/push/next-clip submission and
         # breaks the GPU pipeline). One pair is in flight at a time; settled (read) lazily on
@@ -287,6 +295,9 @@ class Scheduler:
         # Anchor AI at landing + cold-start skip (same path as seek) so open/play also skips the
         # first ~cold_start_s of content instead of racing the playhead from frame 0.
         self._anchor_at(self.player.current_frame())
+        # Seed the known native timeline generation so the first producer iteration compares
+        # against this session's opening state instead of mistaking it for a newer timeline.
+        self._adopt_timeline_generation()
         self.stats.started_at = time.monotonic()
         # New session: bump the generation so a still-running thread orphaned by a previous
         # stop() join timeout can never push into this session, and clear the stop event so a
@@ -421,6 +432,43 @@ class Scheduler:
 
     # ---- internals ------------------------------------------------------------------------
 
+    def _timeline_generation(self) -> Optional[int]:
+        """player.timeline_generation() (uint64 the native Player bumps on every seek and on
+        mid-stream configuration changes that invalidate already-pushed frames), or None when
+        the binding is missing or raises - older builds and test doubles simply run without the
+        generation check instead of failing."""
+        getter = getattr(self.player, "timeline_generation", None)
+        if getter is None:
+            return None
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001 -- a probe must never kill the producer thread
+            return None
+
+    def _adopt_timeline_generation(self) -> None:
+        """Record the current native generation without treating the change as new. start() seeds
+        it that way, and so does the notify_seek() branch: that same seek bumped the native
+        generation, so counting it again would report one discontinuity twice."""
+        gen = self._timeline_generation()
+        if gen is not None:
+            self._known_timeline_gen = gen
+
+    def _timeline_generation_advanced(self) -> bool:
+        """Adopt the current native generation and report whether it moved past the known one.
+
+        A change means the native side rotated its timeline (seek or configuration change), so
+        everything in flight here - scenes, frame_cache, pending_regions, frontier - is keyed to
+        frames the native player now rejects (push_ai_frame/get_cuda_nv12_by_frame refuse the old
+        generation) and must be dropped (I6: reposition, never teardown). The first observation
+        only seeds the value; a missing binding keeps the check off entirely.
+        """
+        gen = self._timeline_generation()
+        if gen is None:
+            return False
+        prev = self._known_timeline_gen
+        self._known_timeline_gen = gen
+        return prev is not None and gen != prev
+
     def _anchor_at(self, frame_num: int) -> None:
         """Drop in-flight AI state and re-anchor frontier at frame_num + cold-start skip.
         Used on start and on every seek/discontinuity (I6). Mid-stream backlog resync does NOT
@@ -435,7 +483,9 @@ class Scheduler:
 
     def _reset_state(self, frame_num: int) -> None:
         """Seek/discontinuity handling (I6): drop every piece of in-flight AI state and
-        re-anchor the frontier with cold-start skip. Scenes reference frame numbers that assert
+        re-anchor the frontier with cold-start skip. Fired by notify_seek(), by the backup
+        head-jump heuristic, and by a native timeline_generation() rotation (same effect in all
+        three cases). Scenes reference frame numbers that assert
         strict +1 contiguity (Scene.add_frame), so any discontinuity invalidates them
         outright; frame_cache entries are keyed to frame numbers on the *old* timeline and are
         equally invalid. clip_counter is left monotonically increasing (it is only ever used
@@ -513,6 +563,16 @@ class Scheduler:
         if pending_seek is not None:
             self._reset_state(pending_seek)
             self.stats.seek_resets += 1
+            # Native bumps its timeline generation on this very seek: adopt it so the next
+            # iteration does not reset (and count) the same discontinuity a second time.
+            self._adopt_timeline_generation()
+            return
+
+        # Timeline rotated on the native side without an explicit notify_seek() this round
+        # (mid-stream configuration change, or a seek issued straight on the player).
+        if self._timeline_generation_advanced():
+            self._reset_state(int(self.player.current_frame()))
+            self.stats.config_resets += 1
             return
 
         head = self.player.current_frame()
@@ -548,7 +608,9 @@ class Scheduler:
         n = self.ai_frontier
         frame_count = self.player.frame_count()
 
-        g = self.player.get_cuda_nv12_by_frame(n)
+        native_generation = self._known_timeline_gen
+        g = (self.player.get_cuda_nv12_by_frame(n, generation=native_generation)
+             if native_generation is not None else self.player.get_cuda_nv12_by_frame(n))
         if not g["ready"]:
             # Decode head hasn't reached n yet (or it was overwritten - see
             # docs/native_ai_input.md's ring-overwrite caveat). Never block: just retry
@@ -742,7 +804,12 @@ class Scheduler:
                 self._capture_budget -= 1
 
             h, w = rgba.shape[0], rgba.shape[1]
-            self.player.push_ai_frame(fnum, rgba.data_ptr(), w, h, w * 4)
+            native_generation = self._known_timeline_gen
+            if native_generation is None:
+                self.player.push_ai_frame(fnum, rgba.data_ptr(), w, h, w * 4)
+            else:
+                self.player.push_ai_frame(fnum, rgba.data_ptr(), w, h, w * 4,
+                                          generation=native_generation)
             # Keep frame_cache until head advances so a later multi-region clip can re-blend
             # onto the already-restored frame and re-push (same fnum).
 
