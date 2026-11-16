@@ -586,6 +586,8 @@ def main():
         """Shared post-open bookkeeping after player.open/reopen succeeded (main thread)."""
         nonlocal opened, current_path, open_error_text, open_error_until, video_meta
         nonlocal sched_failed_path, seek_error_text, seek_error_until, browser_resume
+        nonlocal latest_seek_id
+        latest_seek_id = 0
         apply_target_fps_for_open()
         print(f"== player.{'reopen' if is_reopen else 'open'} == "
               f"fps={player.fps():.4f} frames={player.frame_count()} "
@@ -704,21 +706,38 @@ def main():
         except Exception as e:  # noqa: BLE001 -- keep playing on passthrough
             _degrade_scheduler(f"notify_seek failed: {e!r}", scheduler)
 
+    latest_seek_id = 0
+
     def _apply_seek(target):
-        """Seek, tolerating a partial file's undecodable tail: hint on failure, and notify the
-        scheduler only after the seek landed (with native's real frame, not the requested one)."""
-        nonlocal seek_error_text, seek_error_until
+        nonlocal latest_seek_id, seek_error_text, seek_error_until
+        latest_seek_id = 0
         try:
-            landed = player.seek(target)
-        except Exception as e:  # noqa: BLE001 -- undecodable tail: hint + stay on the old frame
+            latest_seek_id = int(player.request_seek(target))
+        except Exception as e:  # noqa: BLE001 -- session may be closing
             seek_error_text = i18n_mod.t("seek_unavailable_partial")
             seek_error_until = time.monotonic() + _SEEK_ERROR_HOLD_S
-            print(f"== seek failed == frame={target}: {e}", file=sys.stderr)
+            print(f"== seek request failed == frame={target}: {e}", file=sys.stderr)
             _sched_notify(player.current_frame())
-            return
-        seek_error_text = ""
-        seek_error_until = 0.0
-        _sched_notify(player.current_frame() if landed is None else landed)
+
+    def _reap_seek_results():
+        nonlocal seek_error_text, seek_error_until
+        while True:
+            result = player.take_seek_result()
+            result_id = int(result["id"])
+            if result_id == 0:
+                return
+            if result_id != latest_seek_id:
+                continue
+            if result["ok"]:
+                seek_error_text = ""
+                seek_error_until = 0.0
+                _sched_notify(int(result["landed"]))
+            else:
+                seek_error_text = i18n_mod.t("seek_unavailable_partial")
+                seek_error_until = time.monotonic() + _SEEK_ERROR_HOLD_S
+                print(f"== seek failed == frame={result['requested']}: {result['error']}",
+                      file=sys.stderr)
+                _sched_notify(player.current_frame())
 
     # Async network open: keeps pump_messages/ui_tick alive so the URL page can show loading.
     open_state = None
@@ -799,6 +818,8 @@ def main():
                             _finish_open_failed(os_path, os_err, is_reopen=os_reopen)
                 elif os_running:
                     pass  # still in flight
+
+            _reap_seek_results()
 
             now_mono = time.monotonic()
             if open_error_text and now_mono < open_error_until:

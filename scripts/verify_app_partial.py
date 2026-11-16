@@ -124,6 +124,8 @@ class _FakeNative:
         self.opened = False
         self.playing = False
         self.div = 1
+        self.next_seek_id = 1
+        self.seek_results = []
 
     def open(self, path):
         self.opened, self.head = True, 0
@@ -154,6 +156,21 @@ class _FakeNative:
         # Native returns the frame it really landed on, which off a GOP boundary is not the
         # requested one -- the app must notify the scheduler with THIS value.
         return n - 1 if n > 0 else 0
+
+    def request_seek(self, frame_num):
+        request_id = self.next_seek_id
+        self.next_seek_id += 1
+        result = {"id": request_id, "requested": int(frame_num), "landed": -1, "error": ""}
+        try:
+            result["landed"] = self.seek(frame_num)
+        except Exception as exc:  # noqa: BLE001 - mirrors the native async result channel
+            result["error"] = str(exc)
+        result["ok"] = not result["error"]
+        self.seek_results.append(result)
+        return request_id
+
+    def take_seek_result(self):
+        return self.seek_results.pop(0) if self.seek_results else {"id": 0}
 
     def current_frame(self):
         return self.head

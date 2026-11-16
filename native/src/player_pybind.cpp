@@ -88,11 +88,13 @@ PYBIND11_MODULE(sumu_core, m)
         .def("set_ui_strings", &Player::set_ui_strings, py::arg("strings")) // i18n label table
 
         .def("take_ui_intents", &Player::take_ui_intents) // M3: drains + clears ui_intents_
-        // gil_scoped_release: seek 要等 decoder_mutex_，decode 线程持锁可跨 15s 网络读
-        // （rw_timeout）—— 不释放 GIL 会冻结整个 Python 主线程（窗口"未响应"）。与
-        // open/reopen/close_current_session 同款。
+        // Synchronous seek remains for native smoke/stress drivers. The app uses request_seek()
+        // so its message pump never waits behind decoder_mutex_ and a blocked network read.
         .def("seek", &Player::seek, py::arg("frame_num"),
             py::call_guard<py::gil_scoped_release>())
+        .def("request_seek", &Player::request_seek, py::arg("frame_num"))
+        .def("seek_pending", &Player::seek_pending)
+        .def("take_seek_result", &Player::take_seek_result)
         .def("push_ai_frame", &Player::push_ai_frame,
             py::arg("frame_num"), py::arg("dev_ptr"), py::arg("width"), py::arg("height"),
             py::arg("pitch_bytes"), py::arg("generation") = 0)

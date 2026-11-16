@@ -488,6 +488,7 @@ void Player::close_session(){
     scrub_cv_.notify_one(); // wake scrub_thread_ out of its wait so it observes session_stop_
     if (decode_thread_.joinable()) decode_thread_.join();
     if (audio_thread_.joinable()) audio_thread_.join();
+    clear_async_seek_state();
     // scrub_thread_ takes d3d_mutex_ during its blit (like decode_thread_), so join it here
     // BEFORE the d3d_lock block below -- joining it under d3d_mutex_ would risk self-deadlock.
     if (scrub_thread_.joinable()) scrub_thread_.join();
@@ -1077,7 +1078,7 @@ void Player::set_fps_div(int v){
     invalidate_scrub_timeline();
     int64_t new_session = source_pos / std::max(1, v);
     try {
-        seek(new_session);
+        request_seek(new_session);
     } catch (...) {
         // Best-effort: rate already updated; next play tick uses new fps.
     }

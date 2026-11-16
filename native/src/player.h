@@ -612,6 +612,9 @@ public:
     py::dict take_ui_intents();
 
     int64_t seek(int64_t frame_num);
+    uint64_t request_seek(int64_t frame_num);
+    bool seek_pending() const;
+    py::dict take_seek_result();
 
     // ---- AI insertion point --------------------------------------------------------------
 
@@ -840,6 +843,9 @@ private:
     // ---- decode thread -----------------------------------------------------------------------
 
     void decode_loop();
+    int64_t seek_locked(int64_t frame_num);
+    bool process_async_seek_locked();
+    void clear_async_seek_state();
 
     // ---- present thread ------------------------------------------------------------------------
 
@@ -1376,6 +1382,22 @@ private:
     // each decode, between decode_loop() and seek() -- see the file header for the race this
     // closes (widened from spike2's narrower "just guard the Decoder object" scope).
     std::mutex decoder_mutex_;
+
+    struct AsyncSeekRequest {
+        uint64_t id = 0;
+        int64_t frame_num = 0;
+    };
+    struct AsyncSeekResult {
+        uint64_t id = 0;
+        int64_t requested_frame = 0;
+        int64_t landed_frame = -1;
+        std::string error;
+    };
+    mutable std::mutex async_seek_mutex_;
+    std::optional<AsyncSeekRequest> async_seek_request_;
+    std::optional<AsyncSeekResult> async_seek_result_;
+    uint64_t async_seek_next_id_ = 1;
+    uint64_t async_seek_active_id_ = 0;
 
     Decoder decoder_;
     uint64_t decoder_config_generation_ = 0;

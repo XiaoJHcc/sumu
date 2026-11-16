@@ -58,7 +58,11 @@ p.open(path, headers="", cookies="")   # 打开视频，探测 fps/宽高/帧数
                                        # 选项），本地/普通直链 open 一律留空
 p.reopen(path, headers="", cookies="") # 运行时换片（present/窗口不重建），参数同上
 p.play() / p.pause() / p.is_playing()
-actual_frame = p.seek(frame_num)   # 见下文，返回真正落地的帧号（锚定真实解码 PTS，I5）
+actual_frame = p.seek(frame_num)   # 同步接口，供原生冒烟/压测驱动；返回真正落地的帧号（I5）
+request_id = p.request_seek(frame_num)  # 主界面异步接口：只排队并立即返回，连续请求合并为最新目标
+p.seek_pending()                  # 是否有排队或执行中的异步 seek
+result = p.take_seek_result()      # 取走最近一次完成结果；无结果时 id=0，旧请求可被新结果覆盖
+                                  # result = {id, ok, requested, landed, error}
 p.push_ai_frame(frame_num, cuda_dev_ptr, width, height, pitch_bytes)
 p.current_frame() / p.frame_count() / p.fps() / p.dims()
 p.ai_hit_rate() / p.stats() / p.present_stats() / p.dump_present_trace(path)
@@ -409,7 +413,9 @@ limited range、8-bit NV12**。`Decoder::prepare_nv12_frame()` 是这个契约�
 
 ## seek() = reposition，不是 teardown（I6）
 
-`Player::seek(frame_num)` **绝不**销毁或重建 decode/present 线程、`Decoder` 对象或 swapchain。
+主界面使用 `request_seek()`：主线程只写入最新请求并立即返回，decode 线程在 `decoder_mutex_` 内执行与同步 `seek()` 共用的 `seek_locked()`，因此网络读取或重连占住解码器时，消息泵和 `ui_tick()` 仍照常运行。连续拖动只认最新请求 ID；完成结果由主线程通过 `take_seek_result()` 取走后再通知 Scheduler。暂停且 decode-ahead 已满时也会优先处理请求。目标帧率切换需要重映射到新的时间网格时也走同一异步入口。close/reopen 在 decode 线程退出后清除排队与完成状态，旧会话结果不会落到新会话。
+
+`Player::seek(frame_num)` 保留为同步底层接口，**绝不**销毁或重建 decode/present 线程、`Decoder` 对象或 swapchain。
 具体步骤：
 
 1. 夹紧 `frame_num` 到 `[0, frame_count()-1]`（若 `frame_count()` 未知则只夹下界）。

@@ -88,17 +88,23 @@ py::dict summarize(std::vector<double> samples_ms)
 // move the playhead backwards), otherwise the interval's own start is as close as the decoder
 // could get (GOP boundary / EOF / a grid gap with no picture).
 int64_t Player::seek(int64_t frame_num){
+    {
+        std::lock_guard<std::mutex> lk(async_seek_mutex_);
+        async_seek_request_.reset();
+    }
+    std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
+    return seek_locked(frame_num);
+}
+
+// Caller holds decoder_mutex_. The UI entry point is request_seek(), which lets decode_loop()
+// reach this same implementation without making the window thread wait behind network IO.
+int64_t Player::seek_locked(int64_t frame_num){
     require_open();
     if (frame_count_ > 0) {
         frame_num = std::max<int64_t>(0, std::min<int64_t>(frame_num, frame_count_ - 1));
     } else {
         frame_num = std::max<int64_t>(0, frame_num);
     }
-
-    // Widened lock: makes "seek the decoder, copy the landed frame into the ring, tag
-    // it ready" one atomic unit with respect to decode_loop()'s own "decode one frame,
-    // copy it, tag it" unit -- see the file header for the race this closes.
-    std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
 
     // Audio (spike->M-B, additive): discard whatever pre-seek audio packets decode_loop()
     // had queued, BEFORE seek_to_frame()'s own forward-decode-to-target loop (below, same
@@ -190,6 +196,76 @@ int64_t Player::seek(int64_t frame_num){
     timeline_generation_.fetch_add(1, std::memory_order_relaxed);
 
     return actual_frame;
+}
+
+uint64_t Player::request_seek(int64_t frame_num){
+    require_open();
+    if (!session_active_.load(std::memory_order_acquire) ||
+        session_stop_.load(std::memory_order_relaxed))
+        throw std::runtime_error("cannot seek while the session is closing");
+    std::lock_guard<std::mutex> lk(async_seek_mutex_);
+    const uint64_t id = async_seek_next_id_++;
+    async_seek_request_ = AsyncSeekRequest{id, frame_num};
+    return id;
+}
+
+bool Player::seek_pending() const{
+    std::lock_guard<std::mutex> lk(async_seek_mutex_);
+    return async_seek_request_.has_value() || async_seek_active_id_ != 0;
+}
+
+py::dict Player::take_seek_result(){
+    py::dict out;
+    std::lock_guard<std::mutex> lk(async_seek_mutex_);
+    if (!async_seek_result_) {
+        out["id"] = 0;
+        return out;
+    }
+    const AsyncSeekResult result = std::move(*async_seek_result_);
+    async_seek_result_.reset();
+    out["id"] = result.id;
+    out["ok"] = result.error.empty();
+    out["requested"] = result.requested_frame;
+    out["landed"] = result.landed_frame;
+    out["error"] = result.error;
+    return out;
+}
+
+void Player::clear_async_seek_state(){
+    std::lock_guard<std::mutex> lk(async_seek_mutex_);
+    async_seek_request_.reset();
+    async_seek_result_.reset();
+    async_seek_active_id_ = 0;
+}
+
+// decode_loop() calls this with decoder_mutex_ held. Only the decode thread executes the
+// potentially slow FFmpeg seek; Python receives a plain C++ result through take_seek_result().
+bool Player::process_async_seek_locked(){
+    AsyncSeekRequest request;
+    {
+        std::lock_guard<std::mutex> lk(async_seek_mutex_);
+        if (!async_seek_request_) return false;
+        request = *async_seek_request_;
+        async_seek_request_.reset();
+        async_seek_active_id_ = request.id;
+    }
+
+    AsyncSeekResult result;
+    result.id = request.id;
+    result.requested_frame = request.frame_num;
+    try {
+        result.landed_frame = seek_locked(request.frame_num);
+    } catch (const std::exception& e) {
+        result.error = e.what();
+    } catch (...) {
+        result.error = "unknown seek failure";
+    }
+    {
+        std::lock_guard<std::mutex> lk(async_seek_mutex_);
+        async_seek_active_id_ = 0;
+        async_seek_result_ = std::move(result);
+    }
+    return true;
 }
 
 // dev_ptr: CUdeviceptr (torch tensor's data_ptr()) for a contiguous uint8 RGBA8 (H,W,4)
@@ -1069,6 +1145,7 @@ void Player::decode_loop(){
     while (!(stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed))) {
         for (;;) {
             if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
+            if (seek_pending()) break;
             const int64_t head = present_head_frame_.load(std::memory_order_relaxed);
             const int64_t high = pt_high_water_.load(std::memory_order_relaxed);
             if (high - head < decode_ahead_max_) break;
@@ -1077,6 +1154,7 @@ void Player::decode_loop(){
         {
             std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
             if (stop_.load(std::memory_order_relaxed) || session_stop_.load(std::memory_order_relaxed)) return;
+            if (process_async_seek_locked()) continue;
             const uint64_t version = seek_version_.load(std::memory_order_relaxed);
             if (version != recovery_seek_version) {
                 recovery_seek_version = version;

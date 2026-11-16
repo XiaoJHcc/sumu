@@ -281,11 +281,10 @@ class Scheduler:
     # ---- public control surface --------------------------------------------------------
 
     def notify_seek(self, frame_num: int) -> None:
-        """Reliable seek notification: call this whenever the app calls player.seek(...) (in
-        either order relative to the actual seek() call - the producer thread reads this
-        before deciding anything else on its next iteration). This is the primary path;
-        the current_frame()-regression/jump heuristic in _run() is only a backup for cases
-        where a caller drives Player.seek() without going through this method."""
+        """Reliable seek notification with the native request's actual landed frame. The app
+        calls this after request_seek() completes; synchronous callers may notify around seek().
+        The current_frame()-regression/jump heuristic in _run() is only a backup for callers
+        that reposition the Player without going through this method."""
         with self._seek_lock:
             self._pending_seek = int(frame_num)
 

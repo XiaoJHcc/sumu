@@ -7,6 +7,7 @@
 #     2. 服务端看得到中断期间的 503 和恢复之后的新请求（不只靠脚本成功/导入）；
 #     3. 解码计数与 fresh 帧持续恢复，时钟与 present 自始至终不中止；
 #     4. 真实 EOF 不触发无限重试；close() 能打断阻塞住的网络读。
+#     5. 网络挂死时异步 seek 的提交、消息泵与 present 均不阻塞，恢复后最新请求落地。
 #     .venv\Scripts\python.exe scripts/verify_network_recovery.py
 #     .venv\Scripts\python.exe scripts/verify_network_recovery.py --dry-run  (只校验素材/服务)
 #
@@ -510,6 +511,90 @@ def case_recovery(player, trace, server, media):
     player.close_current_session()
 
 
+def wait_seek_result(player, request_id, timeout):
+    """轮询指定请求（None 表示下一个结果）；等待期间持续泵真实窗口消息。"""
+    until = time.monotonic() + timeout
+    last_present = int(player.stats()["present_count"])
+    last_present_change = time.monotonic()
+    while time.monotonic() < until:
+        player.pump_messages()
+        player.ui_tick()
+        while True:
+            result = player.take_seek_result()
+            result_id = int(result["id"])
+            if result_id == 0:
+                break
+            if request_id is None or result_id == request_id:
+                return result
+        present = int(player.stats()["present_count"])
+        if present != last_present:
+            last_present = present
+            last_present_change = time.monotonic()
+        assert time.monotonic() - last_present_change < 1.0, \
+            "present stopped while waiting for async seek"
+        time.sleep(0.01)
+    raise AssertionError(f"async seek {request_id} did not finish within {timeout:.1f}s")
+
+
+def case_seek_during_stall(player, trace, server, media):
+    """网络挂死时 seek 不得卡住主线程；恢复后最新请求落地。"""
+    player.open(server.url(media.long.name))
+    play = Play(player, "net seek during stall")
+    player.play()
+    assert play.until(lambda: play.frame >= 12, 20.0)
+    server.state.set_mode("stall")
+    time.sleep(1.5)
+    target = min(play.frame + 60, play.declared - 2)
+
+    t0 = time.monotonic()
+    player.request_seek(max(0, target - 10))
+    request_id = int(player.request_seek(target))
+    submit_s = time.monotonic() - t0
+    assert submit_s < 0.1, f"async seek submission blocked for {submit_s:.3f}s"
+
+    during = watch(play, trace, "seek during stall", 2.0, step=0.05)
+    during.assert_alive()
+    max_tick_gap = max(b[0] - a[0] for a, b in zip(during.samples, during.samples[1:]))
+    assert max_tick_gap < 0.5, f"UI message pump stopped for {max_tick_gap:.3f}s during seek"
+    assert player.seek_pending(), "stalled seek unexpectedly completed before the server recovered"
+
+    server.state.set_mode("ok")
+    result = wait_seek_result(player, request_id, 25.0)
+    assert result["ok"], result
+    assert int(result["requested"]) == target, result
+    assert int(result["landed"]) == target, result
+
+    player.pause()
+    settle_until = time.monotonic() + 2.0
+    while time.monotonic() < settle_until:
+        player.pump_messages()
+        player.ui_tick()
+        time.sleep(0.02)
+    paused_target = max(0, target - 30)
+    paused_id = int(player.request_seek(paused_target))
+    paused_result = wait_seek_result(player, paused_id, 5.0)
+    assert paused_result["ok"], paused_result
+    assert int(paused_result["landed"]) == paused_target, paused_result
+
+    source_pos = int(player.current_frame())
+    original_fps = float(player.fps())
+    player.set_fps_div(2)
+    div_result = wait_seek_result(player, None, 5.0)
+    assert div_result["ok"], div_result
+    assert int(div_result["landed"]) == source_pos // 2, (source_pos, div_result)
+    assert abs(float(player.fps()) - original_fps / 2) < 0.01, player.stats()
+    player.set_fps_div(1)
+    restore_result = wait_seek_result(player, None, 5.0)
+    assert restore_result["ok"], restore_result
+
+    print(f"PASS: stalled-network seek submission returned in {submit_s * 1000:.2f}ms; "
+          f"UI/present stayed alive (max UI tick gap {max_tick_gap:.3f}s, "
+          f"{during.stale()} stale ticks); latest request landed at {result['landed']} "
+          f"after recovery; paused/full-ring seek landed at {paused_result['landed']}; "
+          f"fps_div remap landed at {div_result['landed']}", flush=True)
+    player.close_current_session()
+
+
 def case_eof(player, trace, server, media):
     """真实 EOF 是正常结尾，不该被当成网络故障无限重试。"""
     url = server.url(media.short.name)
@@ -590,6 +675,7 @@ def main():
             try:
                 trace = Trace(player, tmp / "present.csv")
                 case_recovery(player, trace, server, media)
+                case_seek_during_stall(player, trace, server, media)
                 case_eof(player, trace, server, media)
                 case_close_interrupts(player, server, media)  # 破坏性，放最后
             finally:
