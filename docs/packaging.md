@@ -84,6 +84,13 @@ powershell -ExecutionPolicy Bypass -File scripts/build_dist.ps1 -FastFreeze
 - `build_dist.ps1` 会把仓库根的 `LICENSE.md` 拷进 `dist/sumu/LICENSE.md`，满足"向他人转让程序副本时一并给出许可证"（AGPL-3.0 §4）。自行打包分发（如打 zip）时保留这个文件。
 - 本管线**不**处理"提供对应源代码"义务（AGPL §6 的书面要约/网络访问等）——分发给仓库之外的人前，自行确认满足这部分。
 
+## 分发包 7z（最简规范）
+
+- 命令：`cd dist && 7z a -t7z -mx=9 -ms=on -v1400m sumu-<ver>.7z sumu -xr!*_sub_engines`，再 `sha256sum -b sumu-<ver>.7z.* > sumu-<ver>.sha256.txt`。
+- 应含：`sumu.exe`、`_internal/` 全量、`model_weights/` 的 `.pth` + `.pt`、`LICENSE.md`。
+- 应排除：`*_sub_engines/` 整个目录（内含 `*.engine` 与 `_engines_tmp` 重复拷贝，绑死本机 GPU 架构/TRT 版本，连空目录也别留）、`sumu.log`、`test_video*.mp4`。
+- 卷大小固定 1400 MiB（`-v1400m` → `.001/.002…`）；发布前 `7z t` 必须 Everything is Ok，sha256 用 `-b` 输出 `hash *file` 格式。
+
 ## 运行期额外依赖：WebView2 Runtime（Evergreen）
 
 URL 页的内嵌浏览器用系统 **Evergreen WebView2 Runtime**，不随包分发 Fixed Runtime，也不带
